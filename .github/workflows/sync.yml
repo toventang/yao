@@ -1,64 +1,89 @@
+name: Sync from Parent (Fork)
+
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时同步一次
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: '0 */24 * * *'    # runs daily at 02:00 UTC
+  workflow_dispatch: {}
 
 jobs:
-  sync-parent:
+  sync:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Check current repo info
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Gather repository and upstream info
         id: repo_info
         uses: actions/github-script@v6
         with:
           script: |
-            // 获取当前仓库信息（包含parent信息）
+            // Get current repo (the fork)
             const repo = await github.rest.repos.get({
               owner: context.repo.owner,
               repo: context.repo.repo
             });
 
             if (!repo.data.parent) {
-              throw new Error('This repository is not a fork');
+              throw new Error('This repository is not a fork.');
             }
 
-            // 获取父仓库的默认分支
+            // Get parent repo info
             const parentRepo = await github.rest.repos.get({
               owner: repo.data.parent.owner.login,
               repo: repo.data.parent.name
             });
 
-            // 获取父仓库最新提交（默认分支）
+            // Get latest commit on parent's default branch
             const latestCommit = await github.rest.repos.getCommit({
               owner: repo.data.parent.owner.login,
               repo: repo.data.parent.name,
               ref: parentRepo.data.default_branch
             });
 
-            // 返回对象，actions/github-script 会将其序列化到 steps.repo_info.outputs.result
             return {
               parent_repo: repo.data.parent.full_name,
               parent_branch: parentRepo.data.default_branch,
+              fork_default_branch: repo.data.default_branch,
               latest_commit_sha: latestCommit.data.sha.substring(0, 7),
               latest_commit_msg: latestCommit.data.commit.message.split('\n')[0]
-            };
+            }
 
-      - name: Sync files
-        uses: champ-oss/file-sync@main
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repo: ${{ fromJson(steps.repo_info.outputs.result).parent_repo }}
-          repo-branch: ${{ fromJson(steps.repo_info.outputs.result).parent_branch }}
-          commit-message: "chore: sync from parent (${{ fromJson(steps.repo_info.outputs.result).latest_commit_sha }})"
-
-      - name: Create summary
-        if: always()
+      - name: Add upstream remote and fetch
         run: |
-          echo "从父仓库同步完成：" > summary.md
-          echo "- 父仓库: ${{ fromJson(steps.repo_info.outputs.result).parent_repo }}" >> summary.md
-          echo "- 分支: ${{ fromJson(steps.repo_info.outputs.result).parent_branch }}" >> summary.md
-          echo "- 基于提交: ${{ fromJson(steps.repo_info.outputs.result).latest_commit_sha }}" >> summary.md
-          cat summary.md >> $GITHUB_STEP_SUMMARY
+          parent_repo=$(echo '${{ steps.repo_info.outputs.result }}' | jq -r .parent_repo)
+          echo "Adding upstream remote: $parent_repo"
+          git remote add upstream "https://github.com/${parent_repo}.git" || true
+          git fetch upstream --prune
+
+      - name: Merge upstream into fork default branch
+        run: |
+          fork_default_branch=$(echo '${{ steps.repo_info.outputs.result }}' | jq -r .fork_default_branch)
+          parent_branch=$(echo '${{ steps.repo_info.outputs.result }}' | jq -r .parent_branch)
+          echo "Checking out fork default branch: ${fork_default_branch}"
+          git checkout "${fork_default_branch}"
+          echo "Merging upstream/${parent_branch} into ${fork_default_branch}"
+          git merge --no-edit "upstream/${parent_branch}"
+
+      - name: Push merged changes to origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          fork_default_branch=$(echo '${{ steps.repo_info.outputs.result }}' | jq -r .fork_default_branch)
+          echo "Pushing changes to origin ${fork_default_branch}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}" HEAD:"${fork_default_branch}"
+
+      - name: Summary
+        run: |
+          echo "Parent: $(echo '${{ steps.repo_info.outputs.result }}' | jq -r .parent_repo)"
+          echo "Parent branch: $(echo '${{ steps.repo_info.outputs.result }}' | jq -r .parent_branch)"
+          echo "Fork default branch: $(echo '${{ steps.repo_info.outputs.result }}' | jq -r .fork_default_branch)"
+          echo "Latest upstream commit: $(echo '${{ steps.repo_info.outputs.result }}' | jq -r .latest_commit_sha) - $(echo '${{ steps.repo_info.outputs.result }}' | jq -r .latest_commit_msg)"
