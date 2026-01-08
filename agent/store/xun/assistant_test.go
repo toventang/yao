@@ -1,24 +1,30 @@
-package xun
+package xun_test
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yaoapp/xun/dbal/query"
+	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
+	searchTypes "github.com/yaoapp/yao/agent/search/types"
 	"github.com/yaoapp/yao/agent/store/types"
+	"github.com/yaoapp/yao/agent/store/xun"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/test"
 )
 
 func TestMain(m *testing.M) {
 	// Setup will be done in each test via test.Prepare
-	// Run tests and exit
 	test.Prepare(nil, config.Conf)
 	defer test.Clean()
-	m.Run()
+
+	// Run tests and exit with appropriate exit code
+	code := m.Run()
+	os.Exit(code)
 }
 
 // TestSaveAssistant tests creating and updating assistants
@@ -27,13 +33,12 @@ func TestSaveAssistant(t *testing.T) {
 	defer test.Clean()
 
 	// Create a new xun store
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("CreateNewAssistant", func(t *testing.T) {
 		assistant := &types.AssistantModel{
@@ -99,8 +104,8 @@ func TestSaveAssistant(t *testing.T) {
 			t.Errorf("Expected ID %s, got %s", id, updatedID)
 		}
 
-		// Verify update
-		retrieved, err := store.GetAssistant(id)
+		// Verify update - request all fields to see the update
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve updated assistant: %v", err)
 		}
@@ -179,8 +184,8 @@ func TestSaveAssistant(t *testing.T) {
 			t.Fatalf("Failed to save complex assistant: %v", err)
 		}
 
-		// Retrieve and verify
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify - request all fields for complex data
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve complex assistant: %v", err)
 		}
@@ -198,6 +203,137 @@ func TestSaveAssistant(t *testing.T) {
 		}
 	})
 
+	t.Run("SaveWithMCPServers", func(t *testing.T) {
+		// Test creating assistant with MCP servers directly
+		// This will test that:
+		// - server1 (no tools/resources) serializes as "server1"
+		// - server2 (with tools) serializes as {"server_id":"server2","tools":[...]}
+		// - server3 (with both) serializes as {"server_id":"server3","resources":[...],"tools":[...]}
+		assistant := &types.AssistantModel{
+			Name:      "MCP Save Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			MCP: &types.MCPServers{
+				Servers: []types.MCPServerConfig{
+					{ServerID: "server1"},
+					{
+						ServerID: "server2",
+						Tools:    []string{"tool1", "tool2"},
+					},
+					{
+						ServerID:  "server3",
+						Resources: []string{"res1", "res2"},
+						Tools:     []string{"tool3", "tool4"},
+					},
+				},
+				Options: map[string]interface{}{
+					"timeout": 30,
+				},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with MCP: %v", err)
+		}
+
+		// Retrieve and verify MCP configuration - mcp is in default fields
+		retrieved, err := store.GetAssistant(id, []string{})
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.MCP == nil {
+			t.Fatal("Expected MCP to be set")
+		}
+
+		if len(retrieved.MCP.Servers) != 3 {
+			t.Errorf("Expected 3 MCP servers, got %d", len(retrieved.MCP.Servers))
+		}
+
+		// Verify server1 (simple format)
+		if retrieved.MCP.Servers[0].ServerID != "server1" {
+			t.Errorf("Expected server1, got '%s'", retrieved.MCP.Servers[0].ServerID)
+		}
+
+		// Verify server2 (with tools)
+		if retrieved.MCP.Servers[1].ServerID != "server2" {
+			t.Errorf("Expected server2, got '%s'", retrieved.MCP.Servers[1].ServerID)
+		}
+		if len(retrieved.MCP.Servers[1].Tools) != 2 {
+			t.Errorf("Expected 2 tools for server2, got %d", len(retrieved.MCP.Servers[1].Tools))
+		}
+
+		// Verify server3 (with resources and tools)
+		if retrieved.MCP.Servers[2].ServerID != "server3" {
+			t.Errorf("Expected server3, got '%s'", retrieved.MCP.Servers[2].ServerID)
+		}
+		if len(retrieved.MCP.Servers[2].Resources) != 2 {
+			t.Errorf("Expected 2 resources for server3, got %d", len(retrieved.MCP.Servers[2].Resources))
+		}
+		if len(retrieved.MCP.Servers[2].Tools) != 2 {
+			t.Errorf("Expected 2 tools for server3, got %d", len(retrieved.MCP.Servers[2].Tools))
+		}
+
+		// Verify options
+		if retrieved.MCP.Options == nil {
+			t.Error("Expected MCP options to be set")
+		}
+		if timeout, ok := retrieved.MCP.Options["timeout"].(float64); !ok || timeout != 30 {
+			t.Errorf("Expected timeout 30, got %v", retrieved.MCP.Options["timeout"])
+		}
+
+		t.Logf("Successfully verified MCP configuration for assistant %s", id)
+	})
+
+	t.Run("UpdateWithMCPServers", func(t *testing.T) {
+		// Create assistant without MCP
+		assistant := &types.AssistantModel{
+			Name:      "MCP Update Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update assistant with MCP
+		assistant.MCP = &types.MCPServers{
+			Servers: []types.MCPServerConfig{
+				{ServerID: "new-server1"},
+				{
+					ServerID: "new-server2",
+					Tools:    []string{"newtool1"},
+				},
+			},
+		}
+
+		_, err = store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to update assistant with MCP: %v", err)
+		}
+
+		// Retrieve and verify - mcp is in default fields
+		retrieved, err := store.GetAssistant(id, []string{})
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.MCP == nil || len(retrieved.MCP.Servers) != 2 {
+			t.Errorf("Expected 2 MCP servers, got %v", retrieved.MCP)
+		}
+
+		if retrieved.MCP.Servers[0].ServerID != "new-server1" {
+			t.Errorf("Expected new-server1, got '%s'", retrieved.MCP.Servers[0].ServerID)
+		}
+
+		t.Logf("Successfully updated and verified MCP for assistant %s", id)
+	})
+
 	t.Run("UsesConfiguration", func(t *testing.T) {
 		// Test assistant with Uses configuration
 		assistant := &types.AssistantModel{
@@ -205,7 +341,7 @@ func TestSaveAssistant(t *testing.T) {
 			Type:      "assistant",
 			Connector: "openai",
 			Share:     "private",
-			Uses: &types.Uses{
+			Uses: &context.Uses{
 				Vision: "mcp:vision-server",
 				Audio:  "agent",
 				Search: "mcp:search-server",
@@ -218,8 +354,8 @@ func TestSaveAssistant(t *testing.T) {
 			t.Fatalf("Failed to save assistant with uses: %v", err)
 		}
 
-		// Retrieve and verify uses configuration
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify uses configuration - uses is NOT in default fields, need to request all
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -261,8 +397,8 @@ func TestSaveAssistant(t *testing.T) {
 			t.Fatalf("Failed to save assistant without uses: %v", err)
 		}
 
-		// Retrieve and verify uses is nil
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify uses is nil - request all fields to check uses
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -279,7 +415,7 @@ func TestSaveAssistant(t *testing.T) {
 			Type:      "assistant",
 			Connector: "openai",
 			Share:     "private",
-			Uses: &types.Uses{
+			Uses: &context.Uses{
 				Vision: "mcp:vision-only",
 				// Audio, Search, Fetch not set
 			},
@@ -290,8 +426,8 @@ func TestSaveAssistant(t *testing.T) {
 			t.Fatalf("Failed to save assistant with partial uses: %v", err)
 		}
 
-		// Retrieve and verify
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify - request all fields for uses
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -316,6 +452,388 @@ func TestSaveAssistant(t *testing.T) {
 			t.Errorf("Expected fetch to be empty, got '%s'", retrieved.Uses.Fetch)
 		}
 	})
+
+	t.Run("SearchConfiguration", func(t *testing.T) {
+		// Test assistant with Search configuration
+		assistant := &types.AssistantModel{
+			Name:      "Search Config Test Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Search: &searchTypes.Config{
+				Web: &searchTypes.WebConfig{
+					Provider:   "tavily",
+					MaxResults: 15,
+				},
+				KB: &searchTypes.KBConfig{
+					Collections: []string{"docs", "faq"},
+					Threshold:   0.8,
+					Graph:       true,
+				},
+				DB: &searchTypes.DBConfig{
+					Models:     []string{"user", "product"},
+					MaxResults: 50,
+				},
+				Citation: &searchTypes.CitationConfig{
+					Format:           "#ref:{id}",
+					AutoInjectPrompt: true,
+				},
+				Weights: &searchTypes.WeightsConfig{
+					User: 1.0,
+					Hook: 0.9,
+					Auto: 0.7,
+				},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with search config: %v", err)
+		}
+
+		// Retrieve and verify search configuration - search is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Search == nil {
+			t.Fatal("Expected search to be set")
+		}
+
+		// Verify Web config
+		if retrieved.Search.Web == nil {
+			t.Fatal("Expected search.web to be set")
+		}
+		if retrieved.Search.Web.Provider != "tavily" {
+			t.Errorf("Expected web provider 'tavily', got '%s'", retrieved.Search.Web.Provider)
+		}
+		if retrieved.Search.Web.MaxResults != 15 {
+			t.Errorf("Expected web max_results 15, got %d", retrieved.Search.Web.MaxResults)
+		}
+
+		// Verify KB config
+		if retrieved.Search.KB == nil {
+			t.Fatal("Expected search.kb to be set")
+		}
+		if len(retrieved.Search.KB.Collections) != 2 {
+			t.Errorf("Expected 2 KB collections, got %d", len(retrieved.Search.KB.Collections))
+		}
+		if retrieved.Search.KB.Collections[0] != "docs" {
+			t.Errorf("Expected first collection 'docs', got '%s'", retrieved.Search.KB.Collections[0])
+		}
+		if retrieved.Search.KB.Threshold != 0.8 {
+			t.Errorf("Expected KB threshold 0.8, got %f", retrieved.Search.KB.Threshold)
+		}
+		if !retrieved.Search.KB.Graph {
+			t.Error("Expected KB graph to be true")
+		}
+
+		// Verify DB config
+		if retrieved.Search.DB == nil {
+			t.Fatal("Expected search.db to be set")
+		}
+		if len(retrieved.Search.DB.Models) != 2 {
+			t.Errorf("Expected 2 DB models, got %d", len(retrieved.Search.DB.Models))
+		}
+		if retrieved.Search.DB.MaxResults != 50 {
+			t.Errorf("Expected DB max_results 50, got %d", retrieved.Search.DB.MaxResults)
+		}
+
+		// Verify Citation config
+		if retrieved.Search.Citation == nil {
+			t.Fatal("Expected search.citation to be set")
+		}
+		if retrieved.Search.Citation.Format != "#ref:{id}" {
+			t.Errorf("Expected citation format '#ref:{id}', got '%s'", retrieved.Search.Citation.Format)
+		}
+		if !retrieved.Search.Citation.AutoInjectPrompt {
+			t.Error("Expected citation auto_inject_prompt to be true")
+		}
+
+		// Verify Weights config
+		if retrieved.Search.Weights == nil {
+			t.Fatal("Expected search.weights to be set")
+		}
+		if retrieved.Search.Weights.User != 1.0 {
+			t.Errorf("Expected weights.user 1.0, got %f", retrieved.Search.Weights.User)
+		}
+		if retrieved.Search.Weights.Hook != 0.9 {
+			t.Errorf("Expected weights.hook 0.9, got %f", retrieved.Search.Weights.Hook)
+		}
+		if retrieved.Search.Weights.Auto != 0.7 {
+			t.Errorf("Expected weights.auto 0.7, got %f", retrieved.Search.Weights.Auto)
+		}
+
+		t.Logf("Successfully saved and retrieved assistant with search configuration")
+	})
+
+	t.Run("NilSearchConfiguration", func(t *testing.T) {
+		// Test assistant without Search configuration
+		assistant := &types.AssistantModel{
+			Name:      "No Search Config Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant without search: %v", err)
+		}
+
+		// Retrieve and verify search is nil - request all fields to check search
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Search != nil {
+			t.Errorf("Expected search to be nil, got %+v", retrieved.Search)
+		}
+	})
+
+	t.Run("PartialSearchConfiguration", func(t *testing.T) {
+		// Test assistant with partial Search configuration
+		assistant := &types.AssistantModel{
+			Name:      "Partial Search Config Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Search: &searchTypes.Config{
+				Web: &searchTypes.WebConfig{
+					Provider: "serper",
+				},
+				// KB, DB, Citation, Weights not set
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with partial search: %v", err)
+		}
+
+		// Retrieve and verify - request all fields for search
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Search == nil {
+			t.Fatal("Expected search to be set")
+		}
+
+		if retrieved.Search.Web == nil {
+			t.Fatal("Expected search.web to be set")
+		}
+		if retrieved.Search.Web.Provider != "serper" {
+			t.Errorf("Expected web provider 'serper', got '%s'", retrieved.Search.Web.Provider)
+		}
+
+		// Other fields should be nil
+		if retrieved.Search.KB != nil {
+			t.Errorf("Expected search.kb to be nil, got %+v", retrieved.Search.KB)
+		}
+		if retrieved.Search.DB != nil {
+			t.Errorf("Expected search.db to be nil, got %+v", retrieved.Search.DB)
+		}
+		if retrieved.Search.Citation != nil {
+			t.Errorf("Expected search.citation to be nil, got %+v", retrieved.Search.Citation)
+		}
+		if retrieved.Search.Weights != nil {
+			t.Errorf("Expected search.weights to be nil, got %+v", retrieved.Search.Weights)
+		}
+	})
+
+	t.Run("ConnectorOptions", func(t *testing.T) {
+		// Test assistant with connector options
+		optionalTrue := true
+		assistant := &types.AssistantModel{
+			Name:      "Connector Options Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			ConnectorOptions: &types.ConnectorOptions{
+				Optional:   &optionalTrue,
+				Connectors: []string{"openai", "anthropic"},
+				Filters:    []types.ModelCapability{types.CapVision, types.CapToolCalls},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with connector options: %v", err)
+		}
+
+		// Retrieve and verify - connector_options is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.ConnectorOptions == nil {
+			t.Fatal("Expected connector options to be set")
+		}
+
+		if retrieved.ConnectorOptions.Optional == nil || !*retrieved.ConnectorOptions.Optional {
+			t.Error("Expected optional to be true")
+		}
+
+		if len(retrieved.ConnectorOptions.Connectors) != 2 {
+			t.Errorf("Expected 2 connectors, got %d", len(retrieved.ConnectorOptions.Connectors))
+		}
+
+		if len(retrieved.ConnectorOptions.Filters) != 2 {
+			t.Errorf("Expected 2 filters, got %d", len(retrieved.ConnectorOptions.Filters))
+		}
+
+		if retrieved.ConnectorOptions.Filters[0] != types.CapVision {
+			t.Errorf("Expected first filter to be vision, got '%s'", retrieved.ConnectorOptions.Filters[0])
+		}
+
+		t.Logf("Successfully saved and retrieved connector options for assistant %s", id)
+	})
+
+	t.Run("PromptPresets", func(t *testing.T) {
+		// Test assistant with prompt presets
+		assistant := &types.AssistantModel{
+			Name:      "Prompt Presets Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			PromptPresets: map[string][]types.Prompt{
+				"chat": {
+					{Role: "system", Content: "You are a friendly chatbot"},
+					{Role: "user", Content: "Hello!"},
+				},
+				"task": {
+					{Role: "system", Content: "You are a task executor"},
+				},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with prompt presets: %v", err)
+		}
+
+		// Retrieve and verify - prompt_presets is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.PromptPresets == nil {
+			t.Fatal("Expected prompt presets to be set")
+		}
+
+		if len(retrieved.PromptPresets) != 2 {
+			t.Errorf("Expected 2 preset groups, got %d", len(retrieved.PromptPresets))
+		}
+
+		chatPrompts, ok := retrieved.PromptPresets["chat"]
+		if !ok {
+			t.Fatal("Expected 'chat' preset to exist")
+		}
+
+		if len(chatPrompts) != 2 {
+			t.Errorf("Expected 2 chat prompts, got %d", len(chatPrompts))
+		}
+
+		if chatPrompts[0].Role != "system" {
+			t.Errorf("Expected system role, got '%s'", chatPrompts[0].Role)
+		}
+
+		taskPrompts, ok := retrieved.PromptPresets["task"]
+		if !ok {
+			t.Fatal("Expected 'task' preset to exist")
+		}
+
+		if len(taskPrompts) != 1 {
+			t.Errorf("Expected 1 task prompt, got %d", len(taskPrompts))
+		}
+
+		t.Logf("Successfully saved and retrieved prompt presets for assistant %s", id)
+	})
+
+	t.Run("SourceField", func(t *testing.T) {
+		// Test assistant with source code
+		sourceCode := `function onMessage(msg) {
+  console.log("Received:", msg);
+  return { status: "ok" };
+}`
+		assistant := &types.AssistantModel{
+			Name:      "Source Field Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Source:    sourceCode,
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with source: %v", err)
+		}
+
+		// Retrieve and verify - source is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Source != sourceCode {
+			t.Errorf("Expected source code to match, got '%s'", retrieved.Source)
+		}
+
+		t.Logf("Successfully saved and retrieved source code for assistant %s", id)
+	})
+
+	t.Run("AllNewFieldsTogether", func(t *testing.T) {
+		// Test assistant with all new fields together
+		optionalFalse := false
+		assistant := &types.AssistantModel{
+			Name:      "All New Fields Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			ConnectorOptions: &types.ConnectorOptions{
+				Optional:   &optionalFalse,
+				Connectors: []string{"openai"},
+				Filters:    []types.ModelCapability{types.CapVision},
+			},
+			PromptPresets: map[string][]types.Prompt{
+				"default": {
+					{Role: "system", Content: "Default system prompt"},
+				},
+			},
+			Source: "// Hook code here",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with all new fields: %v", err)
+		}
+
+		// Retrieve and verify all new fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.ConnectorOptions == nil {
+			t.Error("Expected connector options to be set")
+		}
+
+		if retrieved.PromptPresets == nil {
+			t.Error("Expected prompt presets to be set")
+		}
+
+		if retrieved.Source == "" {
+			t.Error("Expected source to be set")
+		}
+
+		t.Logf("Successfully saved and retrieved all new fields for assistant %s", id)
+	})
 }
 
 // TestDeleteAssistant tests deleting a single assistant
@@ -323,13 +841,12 @@ func TestDeleteAssistant(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("DeleteExistingAssistant", func(t *testing.T) {
 		// Create assistant
@@ -352,7 +869,7 @@ func TestDeleteAssistant(t *testing.T) {
 		}
 
 		// Verify deletion
-		_, err = store.GetAssistant(id)
+		_, err = store.GetAssistant(id, nil)
 		if err == nil {
 			t.Error("Expected error when getting deleted assistant")
 		}
@@ -371,13 +888,12 @@ func TestGetAssistant(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("GetExistingAssistant", func(t *testing.T) {
 		// Create assistant
@@ -399,8 +915,8 @@ func TestGetAssistant(t *testing.T) {
 			t.Fatalf("Failed to create assistant: %v", err)
 		}
 
-		// Retrieve it
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve it with default fields (tags are now in default fields)
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to get assistant: %v", err)
 		}
@@ -427,7 +943,7 @@ func TestGetAssistant(t *testing.T) {
 	})
 
 	t.Run("GetNonExistentAssistant", func(t *testing.T) {
-		_, err := store.GetAssistant("nonexistent-id")
+		_, err := store.GetAssistant("nonexistent-id", nil)
 		if err == nil {
 			t.Error("Expected error when getting non-existent assistant")
 		}
@@ -439,13 +955,12 @@ func TestGetAssistants(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	// Clean up existing data before creating test assistants
 	deleted, err := store.DeleteAssistants(types.AssistantFilter{})
@@ -753,13 +1268,12 @@ func TestDeleteAssistants(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("DeleteByTag", func(t *testing.T) {
 		// Create assistants with specific tag
@@ -880,13 +1394,12 @@ func TestGetAssistantTags(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("GetUniqueTags", func(t *testing.T) {
 		// Create assistants with various tags
@@ -1108,57 +1621,17 @@ func TestGetAssistantTags(t *testing.T) {
 	})
 }
 
-// TestGenerateAssistantID tests the ID generation function
-func TestGenerateAssistantID(t *testing.T) {
-	test.Prepare(t, config.Conf)
-	defer test.Clean()
-
-	store, err := NewXun(types.Setting{
-		Connector: "default",
-	})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	xunStore := store.(*Xun)
-
-	t.Run("GenerateUniqueIDs", func(t *testing.T) {
-		ids := make(map[string]bool)
-		for i := 0; i < 10; i++ {
-			id, err := xunStore.GenerateAssistantID()
-			if err != nil {
-				t.Fatalf("Failed to generate ID: %v", err)
-			}
-
-			// Verify ID format (6 digits)
-			if len(id) != 6 {
-				t.Errorf("Expected 6-digit ID, got %s (length %d)", id, len(id))
-			}
-
-			// Verify ID is unique
-			if ids[id] {
-				t.Errorf("Generated duplicate ID: %s", id)
-			}
-			ids[id] = true
-		}
-
-		t.Logf("Generated %d unique IDs", len(ids))
-	})
-}
-
 // TestAssistantPermissionFields tests permission management fields
 func TestAssistantPermissionFields(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("SaveWithPermissionFields", func(t *testing.T) {
 		assistant := &types.AssistantModel{
@@ -1178,8 +1651,8 @@ func TestAssistantPermissionFields(t *testing.T) {
 			t.Fatalf("Failed to save assistant with permission fields: %v", err)
 		}
 
-		// Retrieve and verify
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify - default fields include permission fields
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to get assistant: %v", err)
 		}
@@ -1226,8 +1699,8 @@ func TestAssistantPermissionFields(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Verify update
-		retrieved, err := store.GetAssistant(id)
+		// Verify update - default fields include permission fields
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to get updated assistant: %v", err)
 		}
@@ -1258,7 +1731,7 @@ func TestAssistantPermissionFields(t *testing.T) {
 		}
 
 		// Retrieve and verify fields are empty
-		retrieved, err := store.GetAssistant(id)
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to get assistant: %v", err)
 		}
@@ -1283,13 +1756,12 @@ func TestEmptyStringAsNull(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("EmptyStringsStoredAsNull", func(t *testing.T) {
 		// Create assistant with empty strings for nullable fields
@@ -1313,7 +1785,7 @@ func TestEmptyStringAsNull(t *testing.T) {
 		}
 
 		// Retrieve and verify empty strings are returned (not stored as empty strings)
-		retrieved, err := store.GetAssistant(id)
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to get assistant: %v", err)
 		}
@@ -1358,8 +1830,8 @@ func TestEmptyStringAsNull(t *testing.T) {
 			t.Fatalf("Failed to save assistant: %v", err)
 		}
 
-		// Retrieve and verify values are preserved
-		retrieved, err := store.GetAssistant(id)
+		// Retrieve and verify values are preserved - path is sensitive, need full fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to get assistant: %v", err)
 		}
@@ -1386,13 +1858,12 @@ func TestGetAssistantWithLocale(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("GetAssistantWithLocaleTranslation", func(t *testing.T) {
 		// Create assistant with i18n locales
@@ -1441,8 +1912,8 @@ func TestGetAssistantWithLocale(t *testing.T) {
 			},
 		}
 
-		// Test English locale
-		retrievedEN, err := store.GetAssistant(id, "en")
+		// Test English locale - request all fields for placeholder
+		retrievedEN, err := store.GetAssistant(id, types.AssistantFullFields, "en")
 		if err != nil {
 			t.Fatalf("Failed to get assistant with EN locale: %v", err)
 		}
@@ -1469,8 +1940,8 @@ func TestGetAssistantWithLocale(t *testing.T) {
 			t.Errorf("Expected first prompt 'How can I help you?', got '%s'", retrievedEN.Placeholder.Prompts[0])
 		}
 
-		// Test Chinese locale
-		retrievedZH, err := store.GetAssistant(id, "zh-cn")
+		// Test Chinese locale - request all fields for placeholder
+		retrievedZH, err := store.GetAssistant(id, types.AssistantFullFields, "zh-cn")
 		if err != nil {
 			t.Fatalf("Failed to get assistant with ZH locale: %v", err)
 		}
@@ -1488,8 +1959,8 @@ func TestGetAssistantWithLocale(t *testing.T) {
 			t.Errorf("Expected placeholder title '与我聊天', got '%s'", retrievedZH.Placeholder.Title)
 		}
 
-		// Test without locale (should return original {{...}} values)
-		retrievedNoLocale, err := store.GetAssistant(id)
+		// Test without locale (should return original {{...}} values) - request all fields for placeholder
+		retrievedNoLocale, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to get assistant without locale: %v", err)
 		}
@@ -1512,13 +1983,12 @@ func TestGetAssistantsWithLocale(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("GetAssistantsWithLocaleTranslation", func(t *testing.T) {
 		// Create assistant with i18n locales
@@ -1625,13 +2095,12 @@ func TestGetAssistantsWithQueryFilter(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	// Create test assistants with different permission settings
 	assistants := []types.AssistantModel{
@@ -1870,13 +2339,12 @@ func TestUpdateAssistant(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("UpdateSingleField", func(t *testing.T) {
 		// Create assistant
@@ -1904,8 +2372,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Verify update
-		retrieved, err := store.GetAssistant(id)
+		// Verify update - need full fields to see tags
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -1952,8 +2420,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Verify all updates
-		retrieved, err := store.GetAssistant(id)
+		// Verify all updates - use default fields (includes name, description, sort, mentionable)
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2009,8 +2477,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update JSON fields: %v", err)
 		}
 
-		// Verify updates
-		retrieved, err := store.GetAssistant(id)
+		// Verify updates - need full fields for tags, options, prompts
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2058,8 +2526,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update KB and MCP: %v", err)
 		}
 
-		// Verify updates
-		retrieved, err := store.GetAssistant(id)
+		// Verify updates - KB and MCP are in default fields
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2070,6 +2538,285 @@ func TestUpdateAssistant(t *testing.T) {
 		if retrieved.MCP == nil || len(retrieved.MCP.Servers) != 2 {
 			t.Errorf("Expected 2 MCP servers, got %v", retrieved.MCP)
 		}
+		if retrieved.MCP.Servers[0].ServerID != "server1" {
+			t.Errorf("Expected first server 'server1', got '%s'", retrieved.MCP.Servers[0].ServerID)
+		}
+	})
+
+	t.Run("UpdateKBDBAndMCP", func(t *testing.T) {
+		// Create assistant
+		assistant := &types.AssistantModel{
+			Name:      "KB DB MCP Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update KB, DB and MCP
+		updates := map[string]interface{}{
+			"kb": map[string]interface{}{
+				"collections": []string{"collection1", "collection2"},
+			},
+			"db": map[string]interface{}{
+				"models": []string{"model1", "model2"},
+			},
+			"mcp": map[string]interface{}{
+				"servers": []string{"server1", "server2"},
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update KB, DB and MCP: %v", err)
+		}
+
+		// Verify updates - KB, DB and MCP are in default fields
+		retrieved, err := store.GetAssistant(id, nil)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.KB == nil || len(retrieved.KB.Collections) != 2 {
+			t.Errorf("Expected 2 KB collections, got %v", retrieved.KB)
+		}
+		if retrieved.DB == nil || len(retrieved.DB.Models) != 2 {
+			t.Errorf("Expected 2 DB models, got %v", retrieved.DB)
+		}
+		if retrieved.DB.Models[0] != "model1" {
+			t.Errorf("Expected first model 'model1', got '%s'", retrieved.DB.Models[0])
+		}
+		if retrieved.MCP == nil || len(retrieved.MCP.Servers) != 2 {
+			t.Errorf("Expected 2 MCP servers, got %v", retrieved.MCP)
+		}
+		if retrieved.MCP.Servers[0].ServerID != "server1" {
+			t.Errorf("Expected first server 'server1', got '%s'", retrieved.MCP.Servers[0].ServerID)
+		}
+	})
+
+	t.Run("UpdateDBWithOptions", func(t *testing.T) {
+		// Create assistant
+		assistant := &types.AssistantModel{
+			Name:      "DB Advanced Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update with DB using advanced configuration
+		updates := map[string]interface{}{
+			"db": map[string]interface{}{
+				"models": []string{"user", "product", "order"},
+				"options": map[string]interface{}{
+					"limit":  100,
+					"offset": 0,
+				},
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update DB: %v", err)
+		}
+
+		// Verify updates - DB is in default fields
+		retrieved, err := store.GetAssistant(id, nil)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.DB == nil {
+			t.Fatal("Expected DB to be set")
+		}
+		if len(retrieved.DB.Models) != 3 {
+			t.Errorf("Expected 3 DB models, got %d", len(retrieved.DB.Models))
+		}
+		if retrieved.DB.Models[0] != "user" {
+			t.Errorf("Expected first model 'user', got '%s'", retrieved.DB.Models[0])
+		}
+		if retrieved.DB.Options == nil {
+			t.Error("Expected DB options to be set")
+		} else {
+			if limit, ok := retrieved.DB.Options["limit"].(float64); !ok || limit != 100 {
+				t.Errorf("Expected DB limit 100, got %v", retrieved.DB.Options["limit"])
+			}
+		}
+	})
+
+	t.Run("UpdateModesAndDefaultMode", func(t *testing.T) {
+		// Create assistant
+		assistant := &types.AssistantModel{
+			Name:      "Modes Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update with modes and default_mode
+		updates := map[string]interface{}{
+			"modes":        []string{"chat", "task", "analyze"},
+			"default_mode": "chat",
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update modes: %v", err)
+		}
+
+		// Verify updates - modes and default_mode are in default fields
+		retrieved, err := store.GetAssistant(id, nil)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Modes == nil || len(retrieved.Modes) != 3 {
+			t.Errorf("Expected 3 modes, got %v", retrieved.Modes)
+		}
+		if retrieved.Modes[0] != "chat" {
+			t.Errorf("Expected first mode 'chat', got '%s'", retrieved.Modes[0])
+		}
+		if retrieved.DefaultMode != "chat" {
+			t.Errorf("Expected default_mode 'chat', got '%s'", retrieved.DefaultMode)
+		}
+	})
+
+	t.Run("UpdateModesOnly", func(t *testing.T) {
+		// Create assistant with default_mode
+		assistant := &types.AssistantModel{
+			Name:        "Modes Only Test",
+			Type:        "assistant",
+			Connector:   "openai",
+			Share:       "private",
+			DefaultMode: "task",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update only modes
+		updates := map[string]interface{}{
+			"modes": []string{"chat", "task"},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update modes: %v", err)
+		}
+
+		// Verify updates - default_mode should remain unchanged
+		retrieved, err := store.GetAssistant(id, nil)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if len(retrieved.Modes) != 2 {
+			t.Errorf("Expected 2 modes, got %d", len(retrieved.Modes))
+		}
+		if retrieved.DefaultMode != "task" {
+			t.Errorf("Expected default_mode to remain 'task', got '%s'", retrieved.DefaultMode)
+		}
+	})
+
+	t.Run("UpdateMCPWithToolsAndResources", func(t *testing.T) {
+		// Create assistant
+		assistant := &types.AssistantModel{
+			Name:      "MCP Advanced Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update with MCP servers using advanced configuration
+		updates := map[string]interface{}{
+			"mcp": map[string]interface{}{
+				"servers": []interface{}{
+					"server1", // Simple format
+					map[string]interface{}{
+						"server2": []string{"tool1", "tool2"}, // Tools only
+					},
+					map[string]interface{}{
+						"server3": map[string]interface{}{
+							"resources": []string{"res1", "res2"},
+							"tools":     []string{"tool3", "tool4"},
+						},
+					},
+				},
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update MCP: %v", err)
+		}
+
+		// Verify updates - MCP is in default fields
+		retrieved, err := store.GetAssistant(id, nil)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.MCP == nil || len(retrieved.MCP.Servers) != 3 {
+			t.Fatalf("Expected 3 MCP servers, got %d", len(retrieved.MCP.Servers))
+		}
+
+		// Verify server1 (simple format)
+		if retrieved.MCP.Servers[0].ServerID != "server1" {
+			t.Errorf("Expected server1, got '%s'", retrieved.MCP.Servers[0].ServerID)
+		}
+		if len(retrieved.MCP.Servers[0].Tools) != 0 {
+			t.Errorf("Expected no tools for server1, got %v", retrieved.MCP.Servers[0].Tools)
+		}
+
+		// Verify server2 (tools only)
+		if retrieved.MCP.Servers[1].ServerID != "server2" {
+			t.Errorf("Expected server2, got '%s'", retrieved.MCP.Servers[1].ServerID)
+		}
+		if len(retrieved.MCP.Servers[1].Tools) != 2 {
+			t.Errorf("Expected 2 tools for server2, got %d", len(retrieved.MCP.Servers[1].Tools))
+		}
+		if retrieved.MCP.Servers[1].Tools[0] != "tool1" {
+			t.Errorf("Expected tool1, got '%s'", retrieved.MCP.Servers[1].Tools[0])
+		}
+
+		// Verify server3 (full config)
+		if retrieved.MCP.Servers[2].ServerID != "server3" {
+			t.Errorf("Expected server3, got '%s'", retrieved.MCP.Servers[2].ServerID)
+		}
+		if len(retrieved.MCP.Servers[2].Resources) != 2 {
+			t.Errorf("Expected 2 resources for server3, got %d", len(retrieved.MCP.Servers[2].Resources))
+		}
+		if len(retrieved.MCP.Servers[2].Tools) != 2 {
+			t.Errorf("Expected 2 tools for server3, got %d", len(retrieved.MCP.Servers[2].Tools))
+		}
+		if retrieved.MCP.Servers[2].Resources[0] != "res1" {
+			t.Errorf("Expected res1, got '%s'", retrieved.MCP.Servers[2].Resources[0])
+		}
+		if retrieved.MCP.Servers[2].Tools[0] != "tool3" {
+			t.Errorf("Expected tool3, got '%s'", retrieved.MCP.Servers[2].Tools[0])
+		}
+
+		t.Logf("Successfully verified MCP advanced configuration for assistant %s", id)
 	})
 
 	t.Run("UpdateUses", func(t *testing.T) {
@@ -2088,7 +2835,7 @@ func TestUpdateAssistant(t *testing.T) {
 
 		// Update with uses configuration
 		updates := map[string]interface{}{
-			"uses": &types.Uses{
+			"uses": &context.Uses{
 				Vision: "mcp:new-vision",
 				Audio:  "mcp:new-audio",
 				Search: "agent",
@@ -2101,8 +2848,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update uses: %v", err)
 		}
 
-		// Verify updates
-		retrieved, err := store.GetAssistant(id)
+		// Verify updates - uses is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2126,7 +2873,7 @@ func TestUpdateAssistant(t *testing.T) {
 
 		// Update to change uses
 		updates2 := map[string]interface{}{
-			"uses": &types.Uses{
+			"uses": &context.Uses{
 				Vision: "agent",
 				Audio:  "agent",
 			},
@@ -2137,8 +2884,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update uses again: %v", err)
 		}
 
-		// Verify second update
-		retrieved2, err := store.GetAssistant(id)
+		// Verify second update - uses is NOT in default fields
+		retrieved2, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2160,14 +2907,136 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to set uses to nil: %v", err)
 		}
 
-		// Verify uses is nil
-		retrieved3, err := store.GetAssistant(id)
+		// Verify uses is nil - uses is NOT in default fields
+		retrieved3, err := store.GetAssistant(id, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
 
 		if retrieved3.Uses != nil {
 			t.Errorf("Expected uses to be nil, got %+v", retrieved3.Uses)
+		}
+	})
+
+	t.Run("UpdateSearch", func(t *testing.T) {
+		// Create assistant without search
+		assistant := &types.AssistantModel{
+			Name:      "Search Update Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update with search configuration
+		updates := map[string]interface{}{
+			"search": &searchTypes.Config{
+				Web: &searchTypes.WebConfig{
+					Provider:   "tavily",
+					MaxResults: 20,
+				},
+				KB: &searchTypes.KBConfig{
+					Collections: []string{"knowledge"},
+					Threshold:   0.75,
+				},
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update search: %v", err)
+		}
+
+		// Verify updates - search is NOT in default fields
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Search == nil {
+			t.Fatal("Expected search to be set")
+		}
+
+		if retrieved.Search.Web == nil {
+			t.Fatal("Expected search.web to be set")
+		}
+		if retrieved.Search.Web.Provider != "tavily" {
+			t.Errorf("Expected web provider 'tavily', got '%s'", retrieved.Search.Web.Provider)
+		}
+		if retrieved.Search.Web.MaxResults != 20 {
+			t.Errorf("Expected web max_results 20, got %d", retrieved.Search.Web.MaxResults)
+		}
+
+		if retrieved.Search.KB == nil {
+			t.Fatal("Expected search.kb to be set")
+		}
+		if len(retrieved.Search.KB.Collections) != 1 {
+			t.Errorf("Expected 1 KB collection, got %d", len(retrieved.Search.KB.Collections))
+		}
+		if retrieved.Search.KB.Threshold != 0.75 {
+			t.Errorf("Expected KB threshold 0.75, got %f", retrieved.Search.KB.Threshold)
+		}
+
+		// Update to change search configuration
+		updates2 := map[string]interface{}{
+			"search": &searchTypes.Config{
+				Web: &searchTypes.WebConfig{
+					Provider:   "serper",
+					MaxResults: 30,
+				},
+				Citation: &searchTypes.CitationConfig{
+					Format:           "#cite:{id}",
+					AutoInjectPrompt: false,
+				},
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates2)
+		if err != nil {
+			t.Fatalf("Failed to update search again: %v", err)
+		}
+
+		// Verify second update - search is NOT in default fields
+		retrieved2, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved2.Search.Web.Provider != "serper" {
+			t.Errorf("Expected web provider 'serper', got '%s'", retrieved2.Search.Web.Provider)
+		}
+		if retrieved2.Search.Web.MaxResults != 30 {
+			t.Errorf("Expected web max_results 30, got %d", retrieved2.Search.Web.MaxResults)
+		}
+		if retrieved2.Search.Citation == nil {
+			t.Fatal("Expected search.citation to be set")
+		}
+		if retrieved2.Search.Citation.Format != "#cite:{id}" {
+			t.Errorf("Expected citation format '#cite:{id}', got '%s'", retrieved2.Search.Citation.Format)
+		}
+
+		// Update to remove search (set to nil)
+		updates3 := map[string]interface{}{
+			"search": nil,
+		}
+
+		err = store.UpdateAssistant(id, updates3)
+		if err != nil {
+			t.Fatalf("Failed to set search to nil: %v", err)
+		}
+
+		// Verify search is nil - search is NOT in default fields
+		retrieved3, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved3.Search != nil {
+			t.Errorf("Expected search to be nil, got %+v", retrieved3.Search)
 		}
 	})
 
@@ -2198,8 +3067,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update permission fields: %v", err)
 		}
 
-		// Verify updates
-		retrieved, err := store.GetAssistant(id)
+		// Verify updates - permission fields are in default fields
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2243,8 +3112,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update with empty strings: %v", err)
 		}
 
-		// Verify empty strings are stored as NULL
-		retrieved, err := store.GetAssistant(id)
+		// Verify empty strings are stored as NULL - default fields include avatar, description
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2329,8 +3198,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to create assistant: %v", err)
 		}
 
-		// Get original updated_at
-		original, err := store.GetAssistant(id)
+		// Get original updated_at - default fields include updated_at
+		original, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2348,8 +3217,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Get updated assistant
-		updated, err := store.GetAssistant(id)
+		// Get updated assistant - default fields include description, updated_at
+		updated, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve updated assistant: %v", err)
 		}
@@ -2383,8 +3252,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to create assistant: %v", err)
 		}
 
-		// Get original
-		original, err := store.GetAssistant(id)
+		// Get original - default fields
+		original, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2401,8 +3270,8 @@ func TestUpdateAssistant(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Verify system fields unchanged, but name updated
-		retrieved, err := store.GetAssistant(id)
+		// Verify system fields unchanged, but name updated - default fields
+		retrieved, err := store.GetAssistant(id, nil)
 		if err != nil {
 			t.Fatalf("Failed to retrieve assistant: %v", err)
 		}
@@ -2424,13 +3293,12 @@ func TestAssistantCompleteWorkflow(t *testing.T) {
 	test.Prepare(t, config.Conf)
 	defer test.Clean()
 
-	store, err := NewXun(types.Setting{
+	store, err := xun.NewXun(types.Setting{
 		Connector: "default",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create store: %v", err)
 	}
-	defer store.Close()
 
 	t.Run("CompleteWorkflow", func(t *testing.T) {
 		// Step 1: Create multiple assistants
@@ -2469,9 +3337,9 @@ func TestAssistantCompleteWorkflow(t *testing.T) {
 			t.Errorf("Expected at least 3 assistants, got %d", len(response.Data))
 		}
 
-		// Step 3: Update one assistant
+		// Step 3: Update one assistant - need full fields for tags
 		updatedID := assistantIDs[1]
-		updatedAssistant, err := store.GetAssistant(updatedID)
+		updatedAssistant, err := store.GetAssistant(updatedID, types.AssistantFullFields)
 		if err != nil {
 			t.Fatalf("Failed to get assistant for update: %v", err)
 		}
@@ -2484,8 +3352,8 @@ func TestAssistantCompleteWorkflow(t *testing.T) {
 			t.Fatalf("Failed to update assistant: %v", err)
 		}
 
-		// Verify update
-		verifyAssistant, err := store.GetAssistant(updatedID)
+		// Verify update - default fields include description
+		verifyAssistant, err := store.GetAssistant(updatedID, nil)
 		if err != nil {
 			t.Fatalf("Failed to verify update: %v", err)
 		}
@@ -2501,7 +3369,7 @@ func TestAssistantCompleteWorkflow(t *testing.T) {
 		}
 
 		// Verify deletion
-		_, err = store.GetAssistant(assistantIDs[0])
+		_, err = store.GetAssistant(assistantIDs[0], nil)
 		if err == nil {
 			t.Error("Expected error when getting deleted assistant")
 		}

@@ -2,9 +2,12 @@ package chat
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yaoapp/kun/log"
 	"github.com/yaoapp/yao/agent"
+	"github.com/yaoapp/yao/agent/assistant"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/openapi/response"
 )
@@ -22,9 +25,8 @@ func GinCreateCompletions(c *gin.Context) {
 		return
 	}
 
-	completionReq, ctx, err := context.GetCompletionRequest(c, cache)
+	completionReq, ctx, opts, err := context.GetCompletionRequest(c, cache)
 	if err != nil {
-
 		fmt.Println("-----------------------------------------------")
 		fmt.Println("Error: ", err.Error())
 		fmt.Println("-----------------------------------------------")
@@ -36,31 +38,46 @@ func GinCreateCompletions(c *gin.Context) {
 		return
 	}
 
-	defer ctx.Release() // Release the context after the request is complete
+	defer func() {
+		log.Trace("[HTTP] Handler defer: calling ctx.Release()")
+		ctx.Release()
+	}()
 
-	fmt.Println("-----------------------------------------------")
-	fmt.Println("Chat ID: ", ctx.ChatID)
-	fmt.Println("Assistant ID: ", ctx.AssistantID)
-	fmt.Println("Model: ", completionReq.Model)
-	fmt.Println("Messages count: ", len(completionReq.Messages))
-	if completionReq.Temperature != nil {
-		fmt.Println("Temperature: ", *completionReq.Temperature)
+	ast, err := assistant.Get(ctx.AssistantID)
+	if err != nil {
+		response.RespondWithError(c, response.StatusInternalServerError, &response.ErrorResponse{
+			Code:             response.ErrServerError.Code,
+			ErrorDescription: "Failed to get assistant: " + err.Error(),
+		})
+		return
 	}
-	if completionReq.Stream != nil {
-		fmt.Println("Stream: ", *completionReq.Stream)
-	}
-	if completionReq.Metadata != nil {
-		fmt.Println("Metadata: ", completionReq.Metadata)
-	}
-	fmt.Println("-----------------------------------------------")
 
-	c.JSON(response.StatusOK, gin.H{
-		"message":        "Create Completions",
-		"chat_id":        ctx.ChatID,
-		"assistant_id":   ctx.AssistantID,
-		"model":          completionReq.Model,
-		"messages_count": len(completionReq.Messages),
-	})
+	// Set SSE headers for streaming response
+	c.Header("Content-Type", "text/event-stream;charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // Disable buffering in nginx
+
+	// Stream the completion (uses default handler which sends to ctx.Writer)
+	// The Stream method will automatically close the writer and send [DONE] marker
+	log.Trace("[HTTP] Calling ast.Stream()")
+	_, err = ast.Stream(ctx, completionReq.Messages, opts)
+	log.Trace("[HTTP] ast.Stream() returned, err=%v", err)
+	if err != nil {
+		response.RespondWithError(c, response.StatusInternalServerError, &response.ErrorResponse{
+			Code:             response.ErrServerError.Code,
+			ErrorDescription: "Failed to stream: " + err.Error(),
+		})
+		return
+	}
+
+	// c.JSON(response.StatusOK, gin.H{
+	// 	"message":        "Create Completions",
+	// 	"chat_id":        ctx.ChatID,
+	// 	"assistant_id":   ctx.AssistantID,
+	// 	"model":          completionReq.Model,
+	// 	"messages_count": len(completionReq.Messages),
+	// })
 
 	// // Print headers
 	// fmt.Println("\n--- Headers ---")
@@ -144,3 +161,72 @@ func GinCreateCompletions(c *gin.Context) {
 
 // GinUpdateCompletions handles PUT /chat/:assistant_id/completions - Update a chat completion metadata
 func GinUpdateCompletions(c *gin.Context) {}
+
+// GinAppendMessages handles POST /chat/:assistant_id/completions/:context_id/append
+// Appends messages to a running completion (for user pre-input while AI is still generating)
+func GinAppendMessages(c *gin.Context) {
+	// Get context_id from URL parameter
+	contextID := c.Param("context_id")
+	if contextID == "" {
+		response.RespondWithError(c, response.StatusBadRequest, &response.ErrorResponse{
+			Code:             response.ErrInvalidRequest.Code,
+			ErrorDescription: "context_id is required",
+		})
+		return
+	}
+
+	// Parse request body
+	var req AppendMessagesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.RespondWithError(c, response.StatusBadRequest, &response.ErrorResponse{
+			Code:             response.ErrInvalidRequest.Code,
+			ErrorDescription: "Invalid request body: " + err.Error(),
+		})
+		return
+	}
+
+	// Validate interrupt type
+	if req.Type != context.InterruptGraceful && req.Type != context.InterruptForce {
+		response.RespondWithError(c, response.StatusBadRequest, &response.ErrorResponse{
+			Code:             response.ErrInvalidRequest.Code,
+			ErrorDescription: "Invalid interrupt type. Must be 'graceful' or 'force'",
+		})
+		return
+	}
+
+	// Validate messages
+	// Allow empty messages for force interrupt (pure cancellation without appending)
+	if len(req.Messages) == 0 && req.Type != context.InterruptForce {
+		response.RespondWithError(c, response.StatusBadRequest, &response.ErrorResponse{
+			Code:             response.ErrInvalidRequest.Code,
+			ErrorDescription: "At least one message is required (unless force interrupt for cancellation)",
+		})
+		return
+	}
+
+	// Create interrupt signal
+	signal := &context.InterruptSignal{
+		Type:      req.Type,
+		Messages:  req.Messages,
+		Timestamp: time.Now().UnixMilli(),
+		Metadata:  req.Metadata,
+	}
+
+	// Send interrupt signal to the context
+	if err := context.SendInterrupt(contextID, signal); err != nil {
+		log.Trace("[INTERRUPT] Failed to send interrupt signal: context_id=%s, error=%v", contextID, err)
+		response.RespondWithError(c, response.StatusInternalServerError, &response.ErrorResponse{
+			Code:             response.ErrServerError.Code,
+			ErrorDescription: "Failed to send interrupt: " + err.Error(),
+		})
+		return
+	}
+
+	// Return success response
+	response.RespondWithSuccess(c, response.StatusOK, gin.H{
+		"message":    "Messages appended successfully",
+		"context_id": contextID,
+		"type":       req.Type,
+		"timestamp":  signal.Timestamp,
+	})
+}

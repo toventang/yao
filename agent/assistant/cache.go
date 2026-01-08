@@ -75,6 +75,13 @@ func (c *Cache) Remove(id string) {
 	defer c.mu.Unlock()
 
 	if element, exists := c.items[id]; exists {
+		item := element.Value.(*cacheItem)
+
+		// Unregister scripts before removing from cache
+		if item.value != nil && len(item.value.Scripts) > 0 {
+			item.value.UnregisterScripts()
+		}
+
 		c.list.Remove(element)
 		delete(c.items, id)
 	}
@@ -87,19 +94,76 @@ func (c *Cache) Len() int {
 	return c.list.Len()
 }
 
+// All returns all assistants in the cache
+func (c *Cache) All() []*Assistant {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	assistants := make([]*Assistant, 0, c.list.Len())
+	for element := c.list.Front(); element != nil; element = element.Next() {
+		item := element.Value.(*cacheItem)
+		assistants = append(assistants, item.value)
+	}
+	return assistants
+}
+
 // Clear removes all items from the cache
 func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Unregister all scripts before clearing cache
+	for element := c.list.Front(); element != nil; element = element.Next() {
+		item := element.Value.(*cacheItem)
+		if item.value != nil && len(item.value.Scripts) > 0 {
+			item.value.UnregisterScripts()
+		}
+	}
+
 	c.list.Init()
 	c.items = make(map[string]*list.Element)
+}
+
+// ClearExcept removes items from the cache except those matching the keep function
+// keep function returns true for items that should be preserved
+func (c *Cache) ClearExcept(keep func(id string) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Collect items to remove
+	var toRemove []*list.Element
+	for element := c.list.Front(); element != nil; element = element.Next() {
+		item := element.Value.(*cacheItem)
+		if !keep(item.key) {
+			toRemove = append(toRemove, element)
+		}
+	}
+
+	// Remove collected items
+	for _, element := range toRemove {
+		item := element.Value.(*cacheItem)
+
+		// Unregister scripts before removing
+		if item.value != nil && len(item.value.Scripts) > 0 {
+			item.value.UnregisterScripts()
+		}
+
+		c.list.Remove(element)
+		delete(c.items, item.key)
+	}
 }
 
 // removeOldest removes the least recently used item from the cache
 func (c *Cache) removeOldest() {
 	if element := c.list.Back(); element != nil {
+		item := element.Value.(*cacheItem)
+
+		// Unregister scripts before removing from cache
+		if item.value != nil && len(item.value.Scripts) > 0 {
+			item.value.UnregisterScripts()
+		}
+
 		c.list.Remove(element)
-		delete(c.items, element.Value.(*cacheItem).key)
+		delete(c.items, item.key)
 	}
 }

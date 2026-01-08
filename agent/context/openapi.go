@@ -9,27 +9,27 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/yaoapp/gou/plan"
+	"github.com/yaoapp/gou/connector"
 	"github.com/yaoapp/gou/store"
 	"github.com/yaoapp/yao/openapi/oauth/authorized"
 )
 
 // GetCompletionRequest parse completion request and create context from openapi request
-// Returns: *CompletionRequest, *Context, error
-func GetCompletionRequest(c *gin.Context, cache store.Store) (*CompletionRequest, *Context, error) {
+// Returns: *CompletionRequest, *Context, *Options, error
+func GetCompletionRequest(c *gin.Context, cache store.Store) (*CompletionRequest, *Context, *Options, error) {
 	// Get authorized information
 	authInfo := authorized.GetInfo(c)
 
 	// Parse completion request from payload or query first
 	completionReq, err := parseCompletionRequestData(c)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse completion request: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to parse completion request: %w", err)
 	}
 
 	// Extract assistant ID using completionReq (can extract from model field)
 	assistantID, err := GetAssistantID(c, completionReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get assistant ID: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to get assistant ID: %w", err)
 	}
 
 	// Extract chat ID (may generate from messages if not provided)
@@ -44,29 +44,61 @@ func GetCompletionRequest(c *gin.Context, cache store.Store) (*CompletionRequest
 	clientType := getClientType(userAgent)
 	clientIP := c.ClientIP()
 
-	// Set cache in context
-	ctx := &Context{
-		Context:     c.Request.Context(),
-		Space:       plan.NewMemorySharedSpace(),
-		Cache:       cache,
-		Writer:      c.Writer,
-		Authorized:  authInfo,
-		ChatID:      chatID,
-		AssistantID: assistantID,
-		Locale:      GetLocale(c, completionReq),
-		Theme:       GetTheme(c, completionReq),
-		Referer:     GetReferer(c, completionReq),
-		Accept:      GetAccept(c, completionReq),
-		Client: Client{
-			Type:      clientType,
-			UserAgent: userAgent,
-			IP:        clientIP,
-		},
-		Route:    GetRoute(c, completionReq),
-		Metadata: GetMetadata(c, completionReq),
+	// Create context with unique ID using New() to ensure proper initialization
+	ctx := New(c.Request.Context(), authInfo, chatID)
+
+	// Set context fields (session-level state)
+	ctx.Cache = cache
+	ctx.Writer = c.Writer
+	ctx.AssistantID = assistantID
+	ctx.Locale = GetLocale(c, completionReq)
+	ctx.Theme = GetTheme(c, completionReq)
+	ctx.Referer = GetReferer(c, completionReq)
+	ctx.Accept = GetAccept(c, completionReq)
+	ctx.Client = Client{
+		Type:      clientType,
+		UserAgent: userAgent,
+		IP:        clientIP,
+	}
+	ctx.Route = GetRoute(c, completionReq)
+	ctx.Metadata = GetMetadata(c, completionReq)
+
+	// Create Options (call-level parameters)
+	opts := &Options{
+		Context: c.Request.Context(),
+		Skip:    GetSkip(c, completionReq),
+		Mode:    GetMode(c, completionReq),
 	}
 
-	return completionReq, ctx, nil
+	// Try to extract custom connector from model field
+	// If model is a valid connector ID, set it to opts.Connector
+	// Otherwise, keep the standard OpenAI-compatible behavior (model as assistant ID)
+	if completionReq != nil && completionReq.Model != "" {
+		// Check if model is a valid connector (not containing "-yao_" which indicates assistant ID format)
+		if !strings.Contains(completionReq.Model, "-yao_") {
+			// Try to validate if it's a real connector
+			if _, err := connector.Select(completionReq.Model); err == nil {
+				// It's a valid connector, use it
+				opts.Connector = completionReq.Model
+			}
+			// If not a valid connector, ignore it (keep opts.Connector empty to use assistant's default)
+		}
+	}
+
+	// Initialize interrupt controller
+	ctx.Interrupt = NewInterruptController()
+
+	// Register context to global registry first (required for interrupt handler callback)
+	if err := Register(ctx); err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to register context: %w", err)
+	}
+
+	// Start interrupt listener after registration
+	// Only monitors interrupt signals (user stop button for appending messages)
+	// HTTP context cancellation is handled by LLM/Agent layers naturally
+	ctx.Interrupt.Start(ctx.ID)
+
+	return completionReq, ctx, opts, nil
 }
 
 // getClientType parses the client type from User-Agent header
@@ -122,13 +154,12 @@ func GetAssistantID(c *gin.Context, req *CompletionRequest) (string, error) {
 	}
 
 	if model != "" {
-		// Split by "-" and get the last field
-		parts := strings.Split(model, "-")
-		lastField := strings.TrimSpace(parts[len(parts)-1])
-
-		// Check if it has yao_ prefix
-		if strings.HasPrefix(lastField, "yao_") {
-			assistantID := strings.TrimPrefix(lastField, "yao_")
+		// Parse model ID using the same logic as ParseModelID
+		// Expected format: [prefix-]assistantName-model-yao_assistantID
+		// Find the last occurrence of "-yao_"
+		parts := strings.Split(model, "-yao_")
+		if len(parts) >= 2 {
+			assistantID := parts[len(parts)-1]
 			if assistantID != "" {
 				return assistantID, nil
 			}
@@ -254,7 +285,7 @@ func GetReferer(c *gin.Context, req *CompletionRequest) string {
 // 1. Query parameter "accept"
 // 2. Header "X-Yao-Accept"
 // 3. CompletionRequest metadata "accept" (from payload)
-// 4. Parse from client type (User-Agent)
+// 4. Default to "standard" (OpenAI-compatible format)
 func GetAccept(c *gin.Context, req *CompletionRequest) Accept {
 	// Priority 1: Query parameter
 	if accept := c.Query("accept"); accept != "" {
@@ -275,10 +306,13 @@ func GetAccept(c *gin.Context, req *CompletionRequest) Accept {
 		}
 	}
 
-	// Priority 4: Parse from User-Agent
-	userAgent := c.GetHeader("User-Agent")
-	clientType := getClientType(userAgent)
-	return parseAccept(clientType)
+	// Priority 4: Default to "standard" (OpenAI-compatible format)
+	return AcceptStandard
+
+	// // Future: Parse from User-Agent if needed
+	// userAgent := c.GetHeader("User-Agent")
+	// clientType := getClientType(userAgent)
+	// return parseAccept(clientType)
 }
 
 // GetChatID get the chat ID from the request
@@ -344,6 +378,57 @@ func GetRoute(c *gin.Context, req *CompletionRequest) string {
 	return ""
 }
 
+// GetMode extracts mode from request with priority:
+// 1. Query parameter "mode"
+// 2. Header "X-Yao-Mode"
+// 3. CompletionRequest metadata "mode" (from payload)
+func GetMode(c *gin.Context, req *CompletionRequest) string {
+	// Priority 1: Query parameter
+	if mode := c.Query("mode"); mode != "" {
+		return mode
+	}
+
+	// Priority 2: Header
+	if mode := c.GetHeader("X-Yao-Mode"); mode != "" {
+		return mode
+	}
+
+	// Priority 3: From CompletionRequest metadata
+	if req != nil && req.Metadata != nil {
+		if mode, ok := req.Metadata["mode"]; ok {
+			if modeStr, ok := mode.(string); ok && modeStr != "" {
+				return modeStr
+			}
+		}
+	}
+
+	return ""
+}
+
+// GetSkip extracts skip configuration from request with priority:
+// 1. CompletionRequest.Skip (from payload body) - Priority
+// 2. Individual query parameters: "skip_history", "skip_trace"
+func GetSkip(c *gin.Context, req *CompletionRequest) *Skip {
+	// Priority 1: From CompletionRequest body (most direct)
+	if req != nil && req.Skip != nil {
+		return req.Skip
+	}
+
+	// Priority 2: Individual query parameters (recommended for query usage)
+	skipHistory := c.Query("skip_history") == "true" || c.Query("skip_history") == "1"
+	skipTrace := c.Query("skip_trace") == "true" || c.Query("skip_trace") == "1"
+
+	// Check if any skip parameter is set
+	if c.Query("skip_history") != "" || c.Query("skip_trace") != "" {
+		return &Skip{
+			History: skipHistory,
+			Trace:   skipTrace,
+		}
+	}
+
+	return nil
+}
+
 // GetMetadata extracts metadata from request with priority:
 // 1. Query parameter "metadata" (JSON string)
 // 2. Header "X-Yao-Metadata" (Base64 encoded JSON string)
@@ -405,18 +490,16 @@ func parseCompletionRequestData(c *gin.Context) (*CompletionRequest, error) {
 			}
 
 			// If we got valid data from body, validate and return
-			if req.Model != "" && len(req.Messages) > 0 {
+			// Model is optional if assistant_id can be extracted later
+			if len(req.Messages) > 0 {
 				return &req, nil
 			}
 		}
 	}
 
 	// Fallback: Try to parse from query parameters
-	// Required fields
+	// Model is optional (can be extracted from assistant_id)
 	model := c.Query("model")
-	if model == "" {
-		return nil, fmt.Errorf("model field is required")
-	}
 	req.Model = model
 
 	// Messages (required, must be JSON string in query)

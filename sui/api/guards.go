@@ -15,6 +15,8 @@ import (
 	"github.com/yaoapp/gou/runtime/v8/bridge"
 	"github.com/yaoapp/kun/log"
 	"github.com/yaoapp/yao/helper"
+	"github.com/yaoapp/yao/openapi/oauth"
+	"github.com/yaoapp/yao/openapi/oauth/authorized"
 	"rogchap.com/v8go"
 )
 
@@ -24,6 +26,7 @@ var Guards = map[string]func(c *Request) error{
 	"query-jwt":    guardQueryJWT,    // Get JWT Token from query string  "__tk"
 	"cookie-jwt":   guardCookieJWT,   // Get JWT Token from cookie "__tk"
 	"cookie-trace": guardCookieTrace, // Set sid cookie
+	"oauth":        guardOAuth,       // OAuth 2.1 authentication (ACL check done in Run for API calls)
 }
 
 // JWT Bearer JWT
@@ -88,6 +91,35 @@ func guardCookieTrace(r *Request) error {
 	}
 	c.Set("__sid", sid)
 	r.Sid = sid
+	return nil
+}
+
+// OAuth 2.1 guard - authentication only
+// This guard validates the token and sets authorized info
+// ACL checks are performed separately in Run() for API calls
+func guardOAuth(r *Request) error {
+	if r.context == nil {
+		return fmt.Errorf("Context is nil")
+	}
+
+	if oauth.OAuth == nil {
+		return fmt.Errorf("OAuth service not initialized")
+	}
+
+	c := r.context
+
+	// Authenticate only (validates token and sets authorized info)
+	if !oauth.OAuth.Authenticate(c) {
+		return fmt.Errorf("Not authenticated")
+	}
+
+	// Get authorized info from context
+	info := authorized.GetInfo(c)
+	if info != nil {
+		r.Sid = info.SessionID
+		r.Authorized = info.AuthorizedToMap()
+	}
+
 	return nil
 }
 

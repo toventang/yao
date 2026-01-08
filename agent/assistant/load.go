@@ -4,38 +4,39 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
-	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/spf13/cast"
 	"github.com/yaoapp/gou/application"
+	gouOpenAI "github.com/yaoapp/gou/connector/openai"
 	"github.com/yaoapp/gou/fs"
-	v8 "github.com/yaoapp/gou/runtime/v8"
-	"github.com/yaoapp/yao/agent/assistant/hook"
+	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
+	searchTypes "github.com/yaoapp/yao/agent/search/types"
 	store "github.com/yaoapp/yao/agent/store/types"
-	agentvision "github.com/yaoapp/yao/agent/vision"
 	"github.com/yaoapp/yao/openai"
-	"github.com/yaoapp/yao/share"
 	"gopkg.in/yaml.v3"
 )
 
 // loaded the loaded assistant
 var loaded = NewCache(200) // 200 is the default capacity
 var storage store.Store = nil
-var search interface{} = nil
-var connectorSettings map[string]ConnectorSetting = map[string]ConnectorSetting{}
-var vision *agentvision.Vision = nil
-var defaultConnector string = "" // default connector
-var globalUses *store.Uses = nil // global uses configuration from agent.yml
+var storeSetting *store.Setting = nil // store setting from agent.yml
+var modelCapabilities map[string]gouOpenAI.Capabilities = map[string]gouOpenAI.Capabilities{}
+var defaultConnector string = ""                 // default connector
+var globalUses *context.Uses = nil               // global uses configuration from agent.yml
+var globalPrompts []store.Prompt = nil           // global prompts from agent/prompts.yml
+var globalKBSetting *store.KBSetting = nil       // global KB setting from agent/kb.yml
+var globalSearchConfig *searchTypes.Config = nil // global search config from agent/search.yml
 
 // LoadBuiltIn load the built-in assistants
 func LoadBuiltIn() error {
 
-	// Clear the cache
-	loaded.Clear()
+	// Clear non-system agents from cache (preserve system agents loaded by LoadSystemAgents)
+	loaded.ClearExcept(func(id string) bool {
+		return strings.HasPrefix(id, "__yao.") // Keep system agents
+	})
 
 	root := `/assistants`
 	app, err := fs.Get("app")
@@ -46,7 +47,7 @@ func LoadBuiltIn() error {
 	// Get all existing built-in assistants
 	deletedBuiltIn := map[string]bool{}
 
-	// Remove the built-in assistants
+	// Remove the built-in assistants (exclude system agents with __yao. prefix)
 	if storage != nil {
 
 		builtIn := true
@@ -55,8 +56,12 @@ func LoadBuiltIn() error {
 			return err
 		}
 
-		// Get all existing built-in assistants
+		// Get all existing built-in assistants (exclude system agents)
 		for _, assistant := range res.Data {
+			// Skip system agents (they are managed by LoadSystemAgents)
+			if strings.HasPrefix(assistant.ID, "__yao.") {
+				continue
+			}
 			deletedBuiltIn[assistant.ID] = true
 		}
 	}
@@ -131,14 +136,14 @@ func SetStorage(s store.Store) {
 	storage = s
 }
 
-// SetVision set the vision
-func SetVision(v *agentvision.Vision) {
-	vision = v
+// GetStorage returns the storage (for testing purposes)
+func GetStorage() store.Store {
+	return storage
 }
 
-// SetConnectorSettings set the connector settings
-func SetConnectorSettings(settings map[string]ConnectorSetting) {
-	connectorSettings = settings
+// SetModelCapabilities set the model capabilities configuration
+func SetModelCapabilities(capabilities map[string]gouOpenAI.Capabilities) {
+	modelCapabilities = capabilities
 }
 
 // SetConnector set the connector
@@ -147,8 +152,52 @@ func SetConnector(c string) {
 }
 
 // SetGlobalUses set the global uses configuration
-func SetGlobalUses(uses *store.Uses) {
+func SetGlobalUses(uses *context.Uses) {
 	globalUses = uses
+}
+
+// SetGlobalPrompts set the global prompts from agent/prompts.yml
+func SetGlobalPrompts(prompts []store.Prompt) {
+	globalPrompts = prompts
+}
+
+// SetStoreSetting set the store setting from agent.yml
+func SetStoreSetting(setting *store.Setting) {
+	storeSetting = setting
+}
+
+// GetStoreSetting returns the store setting
+func GetStoreSetting() *store.Setting {
+	return storeSetting
+}
+
+// GetGlobalPrompts returns the global prompts with variables parsed
+// ctx: context variables for parsing $CTX.* variables
+func GetGlobalPrompts(ctx map[string]string) []store.Prompt {
+	if len(globalPrompts) == 0 {
+		return nil
+	}
+	return store.Prompts(globalPrompts).Parse(ctx)
+}
+
+// SetGlobalKBSetting set the global KB setting from agent/kb.yml
+func SetGlobalKBSetting(kbSetting *store.KBSetting) {
+	globalKBSetting = kbSetting
+}
+
+// GetGlobalKBSetting returns the global KB setting
+func GetGlobalKBSetting() *store.KBSetting {
+	return globalKBSetting
+}
+
+// SetGlobalSearchConfig set the global search config from agent/search.yml
+func SetGlobalSearchConfig(config *searchTypes.Config) {
+	globalSearchConfig = config
+}
+
+// GetGlobalSearchConfig returns the global search config
+func GetGlobalSearchConfig() *searchTypes.Config {
+	return globalSearchConfig
 }
 
 // SetCache set the cache
@@ -186,7 +235,8 @@ func LoadStore(id string) (*Assistant, error) {
 		return nil, fmt.Errorf("storage is not set")
 	}
 
-	storeModel, err := storage.GetAssistant(id)
+	// Request all fields when loading assistant from store
+	storeModel, err := storage.GetAssistant(id, store.AssistantFullFields)
 	if err != nil {
 		return nil, err
 	}
@@ -203,6 +253,15 @@ func LoadStore(id string) (*Assistant, error) {
 
 	// Create assistant from store model
 	assistant = &Assistant{AssistantModel: *storeModel}
+
+	// Load script from source field if present
+	if assistant.Source != "" {
+		script, err := loadSource(assistant.Source, assistant.ID)
+		if err != nil {
+			return nil, err
+		}
+		assistant.HookScript = script
+	}
 
 	// Initialize the assistant
 	err = assistant.initialize()
@@ -272,10 +331,10 @@ func LoadPath(path string) (*Assistant, error) {
 
 	updatedAt := int64(0)
 
-	// prompts
+	// prompts (default prompts from prompts.yml)
 	promptsfile := filepath.Join(path, "prompts.yml")
 	if has, _ := app.Exists(promptsfile); has {
-		prompts, ts, err := loadPrompts(promptsfile, path)
+		prompts, ts, err := store.LoadPrompts(promptsfile, path)
 		if err != nil {
 			return nil, err
 		}
@@ -284,27 +343,42 @@ func LoadPath(path string) (*Assistant, error) {
 		updatedAt = ts
 	}
 
-	// load script
-	scriptfile := filepath.Join(path, "src", "index.ts")
-	if has, _ := app.Exists(scriptfile); has {
-		script, ts, err := loadScript(scriptfile, path)
+	// prompt_presets (from prompts directory, key is filename without extension)
+	promptsDir := filepath.Join(path, "prompts")
+	if has, _ := app.Exists(promptsDir); has {
+		presets, ts, err := store.LoadPromptPresets(promptsDir, path)
 		if err != nil {
 			return nil, err
 		}
-		data["script"] = script
-		data["updated_at"] = max(updatedAt, ts)
+		if len(presets) > 0 {
+			data["prompt_presets"] = presets
+			updatedAt = max(updatedAt, ts)
+		}
 	}
 
-	// load tools, deprecated, use mcp instead
-	// toolsfile := filepath.Join(path, "tools.yao")
-	// if has, _ := app.Exists(toolsfile); has {
-	// 	tools, ts, err := loadTools(toolsfile)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	data["tools"] = tools
-	// 	updatedAt = max(updatedAt, ts)
-	// }
+	// load scripts (hook script and other scripts) from src directory
+	srcDir := filepath.Join(path, "src")
+	if has, _ := app.Exists(srcDir); has {
+		hookScript, scripts, err := LoadScripts(srcDir)
+		if err != nil {
+			return nil, err
+		}
+
+		// Set hook script and update timestamp
+		if hookScript != nil {
+			data["script"] = hookScript
+			// Get timestamp from index.ts if exists
+			scriptfile := filepath.Join(srcDir, "index.ts")
+			if ts, err := app.ModTime(scriptfile); err == nil {
+				data["updated_at"] = max(updatedAt, ts.UnixNano())
+			}
+		}
+
+		// Set other scripts
+		if len(scripts) > 0 {
+			data["scripts"] = scripts
+		}
+	}
 
 	// i18ns
 	locales, err := i18n.GetLocales(path)
@@ -388,6 +462,25 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 		assistant.Automated = v
 	}
 
+	// modes
+	if v, has := data["modes"]; has {
+		modes, err := store.ToModes(v)
+		if err != nil {
+			return nil, err
+		}
+		assistant.Modes = modes
+	}
+
+	// default_mode
+	if v, ok := data["default_mode"].(string); ok {
+		assistant.DefaultMode = v
+	}
+
+	// DisableGlobalPrompts
+	if v, ok := data["disable_global_prompts"].(bool); ok {
+		assistant.DisableGlobalPrompts = v
+	}
+
 	// Readonly
 	if v, ok := data["readonly"].(bool); ok {
 		assistant.Readonly = v
@@ -421,6 +514,15 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 	// connector
 	if connector, ok := data["connector"].(string); ok {
 		assistant.Connector = connector
+	}
+
+	// connector_options
+	if connOpts, has := data["connector_options"]; has {
+		opts, err := store.ToConnectorOptions(connOpts)
+		if err != nil {
+			return nil, err
+		}
+		assistant.ConnectorOptions = opts
 	}
 
 	// tags
@@ -466,22 +568,70 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 	// locales
 	if locales, ok := data["locales"].(i18n.Map); ok {
 		assistant.Locales = locales
-		i18n.Locales[id] = locales.FlattenWithGlobal()
+		flattened := locales.FlattenWithGlobal()
+
+		// Auto-inject assistant name and description into all locales
+		// so that {{name}} and {{description}} templates can be resolved
+		for locale, i18nObj := range flattened {
+			if i18nObj.Messages == nil {
+				i18nObj.Messages = make(map[string]any)
+			}
+			// Add name and description if not already present
+			if _, exists := i18nObj.Messages["name"]; !exists && assistant.Name != "" {
+				i18nObj.Messages["name"] = assistant.Name
+			}
+			if _, exists := i18nObj.Messages["description"]; !exists && assistant.Description != "" {
+				i18nObj.Messages["description"] = assistant.Description
+			}
+			flattened[locale] = i18nObj
+		}
+
+		i18n.Locales[id] = flattened
+	} else {
+		// No locales defined, create default with name and description for all common locales
+		if assistant.Name != "" || assistant.Description != "" {
+			defaultLocales := make(map[string]i18n.I18n)
+			// Create entries for all common locales so {{name}} can be resolved
+			commonLocales := []string{"en", "en-us", "zh", "zh-cn", "zh-tw"}
+			for _, locale := range commonLocales {
+				defaultLocales[locale] = i18n.I18n{
+					Locale: locale,
+					Messages: map[string]any{
+						"name":        assistant.Name,
+						"description": assistant.Description,
+					},
+				}
+			}
+			i18n.Locales[id] = defaultLocales
+		}
 	}
 
-	// Search options
-	if v, ok := data["search"].(map[string]interface{}); ok {
-		assistant.Search = &SearchOption{}
+	// Search configuration (from package.yao search block)
+	// This contains search options like web.max_results, kb.threshold, citation.format, etc.
+	// Merge hierarchy: global config < assistant config
+	switch v := data["search"].(type) {
+
+	case *searchTypes.Config:
+		assistant.Search = v
+
+	case searchTypes.Config:
+		assistant.Search = &v
+
+	case map[string]interface{}:
+		var assistantSearch searchTypes.Config
 		raw, err := jsoniter.Marshal(v)
 		if err != nil {
 			return nil, err
 		}
-
-		// Unmarshal the raw data
-		err = jsoniter.Unmarshal(raw, assistant.Search)
+		err = jsoniter.Unmarshal(raw, &assistantSearch)
 		if err != nil {
 			return nil, err
 		}
+		// Merge with global search config
+		assistant.Search = mergeSearchConfig(globalSearchConfig, &assistantSearch)
+
+	default:
+		assistant.Search = globalSearchConfig
 	}
 
 	// prompts
@@ -514,31 +664,18 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 		}
 	}
 
-	// tools
-	if tools, has := data["tools"]; has {
-		switch vv := tools.(type) {
-		case []store.Tool:
-			assistant.Tools = &store.ToolCalls{
-				Tools:   vv,
-				Prompts: assistant.Prompts,
-			}
-
-		case store.ToolCalls:
-			assistant.Tools = &vv
-
-		default:
-			raw, err := jsoniter.Marshal(tools)
-			if err != nil {
-				return nil, fmt.Errorf("tools format error %s", err.Error())
-			}
-
-			var tools store.ToolCalls
-			err = jsoniter.Unmarshal(raw, &tools)
-			if err != nil {
-				return nil, fmt.Errorf("tools format error %s", err.Error())
-			}
-			assistant.Tools = &tools
+	// prompt_presets
+	if presets, has := data["prompt_presets"]; has {
+		promptPresets, err := store.ToPromptPresets(presets)
+		if err != nil {
+			return nil, err
 		}
+		assistant.PromptPresets = promptPresets
+	}
+
+	// source (hook script code) - store the source code
+	if source, ok := data["source"].(string); ok {
+		assistant.Source = source
 	}
 
 	// kb
@@ -548,6 +685,15 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 			return nil, err
 		}
 		assistant.KB = knowledgeBase
+	}
+
+	// db
+	if db, has := data["db"]; has {
+		database, err := store.ToDatabase(db)
+		if err != nil {
+			return nil, err
+		}
+		assistant.DB = database
 	}
 
 	// mcp
@@ -568,22 +714,41 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 		assistant.Workflow = wf
 	}
 
-	// script
-	if data["script"] != nil {
-		switch v := data["script"].(type) {
-		case string:
-			file := fmt.Sprintf("assistants/%s/src/index.ts", assistant.ID)
-			script, err := loadScriptSource(v, file)
+	// uses (wrapper configurations for vision, audio, etc.)
+	// Merge hierarchy: global uses < assistant uses
+	if uses, has := data["uses"]; has {
+		var assistantUses *context.Uses
+		switch v := uses.(type) {
+		case *context.Uses:
+			assistantUses = v
+		case context.Uses:
+			assistantUses = &v
+		default:
+			raw, err := jsoniter.Marshal(v)
 			if err != nil {
 				return nil, err
 			}
-			assistant.Script = &hook.Script{Script: script}
-		case *hook.Script:
-			assistant.Script = v
-		case *v8.Script:
-			assistant.Script = &hook.Script{Script: v}
+			var usesConfig context.Uses
+			err = jsoniter.Unmarshal(raw, &usesConfig)
+			if err != nil {
+				return nil, err
+			}
+			assistantUses = &usesConfig
 		}
+		// Merge with global uses
+		assistant.Uses = mergeUses(globalUses, assistantUses)
+	} else if globalUses != nil {
+		// No assistant-specific uses, use global
+		assistant.Uses = globalUses
 	}
+
+	// Load scripts (hook script and other scripts)
+	hookScript, scripts, scriptErr := LoadScriptsFromData(data, assistant.ID)
+	if scriptErr != nil {
+		return nil, scriptErr
+	}
+	assistant.HookScript = hookScript
+	assistant.Scripts = scripts
 
 	// created_at
 	if v, has := data["created_at"]; has {
@@ -612,71 +777,6 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 	return assistant, nil
 }
 
-func loadPrompts(file string, root string) (string, int64, error) {
-
-	app, err := fs.Get("app")
-	if err != nil {
-		return "", 0, err
-	}
-
-	ts, err := app.ModTime(file)
-	if err != nil {
-		return "", 0, err
-	}
-
-	prompts, err := app.ReadFile(file)
-	if err != nil {
-		return "", 0, err
-	}
-
-	re := regexp.MustCompile(`@assets/([^\s]+\.(md|yml|yaml|json|txt))`)
-	prompts = re.ReplaceAllFunc(prompts, func(s []byte) []byte {
-		asset := re.FindStringSubmatch(string(s))[1]
-		assetFile := filepath.Join(root, "assets", asset)
-		assetContent, err := app.ReadFile(assetFile)
-		if err != nil {
-			return []byte("")
-		}
-		// Add proper YAML formatting for content
-		lines := strings.Split(string(assetContent), "\n")
-		formattedContent := "|\n"
-		for _, line := range lines {
-			formattedContent += "    " + line + "\n"
-		}
-		return []byte(formattedContent)
-	})
-
-	return string(prompts), ts.UnixNano(), nil
-}
-
-func loadScript(file string, root string) (*hook.Script, int64, error) {
-
-	app, err := fs.Get("app")
-	if err != nil {
-		return nil, 0, err
-	}
-
-	ts, err := app.ModTime(file)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	script, err := v8.Load(file, share.ID(root, file))
-	if err != nil {
-		return nil, 0, err
-	}
-
-	return &hook.Script{Script: script}, ts.UnixNano(), nil
-}
-
-func loadScriptSource(source string, file string) (*v8.Script, error) {
-	script, err := v8.MakeScript([]byte(source), file, 5*time.Second, true)
-	if err != nil {
-		return nil, err
-	}
-	return script, nil
-}
-
 // Init init the assistant
 // Choose the connector and initialize the assistant
 func (ast *Assistant) initialize() error {
@@ -693,54 +793,213 @@ func (ast *Assistant) initialize() error {
 	}
 	ast.openai = api
 
-	// Check if the assistant supports vision
-	model := api.Model()
-	if v, ok := ast.Options["model"].(string); ok {
-		model = strings.TrimLeft(v, "moapi:")
-	}
-	if _, ok := VisionCapableModels[model]; ok {
-		ast.vision = true
-	}
-
-	// Check if the assistant has an init hook
-	if ast.Script != nil {
-		scriptCtx, err := ast.Script.NewContext("", nil)
-		if err != nil {
-			return err
+	// Register scripts as process handlers
+	if len(ast.Scripts) > 0 {
+		if err := ast.RegisterScripts(); err != nil {
+			return fmt.Errorf("failed to register scripts: %w", err)
 		}
-		defer scriptCtx.Close()
-		ast.initHook = scriptCtx.Global().Has("init")
 	}
 
 	return nil
 }
 
-func loadTools(file string) (*store.ToolCalls, int64, error) {
-
-	app, err := fs.Get("app")
-	if err != nil {
-		return nil, 0, err
+// mergeUses merges two Uses configs (base < override)
+func mergeUses(base, override *context.Uses) *context.Uses {
+	if base == nil {
+		return override
+	}
+	if override == nil {
+		return base
 	}
 
-	content, err := app.ReadFile(file)
-	if err != nil {
-		return nil, 0, err
+	result := *base // Copy base
+
+	// Override with non-empty values
+	if override.Vision != "" {
+		result.Vision = override.Vision
+	}
+	if override.Audio != "" {
+		result.Audio = override.Audio
+	}
+	if override.Search != "" {
+		result.Search = override.Search
+	}
+	if override.Fetch != "" {
+		result.Fetch = override.Fetch
+	}
+	if override.Web != "" {
+		result.Web = override.Web
+	}
+	if override.Keyword != "" {
+		result.Keyword = override.Keyword
+	}
+	if override.QueryDSL != "" {
+		result.QueryDSL = override.QueryDSL
+	}
+	if override.Rerank != "" {
+		result.Rerank = override.Rerank
 	}
 
-	ts, err := app.ModTime(file)
-	if err != nil {
-		return nil, 0, err
+	return &result
+}
+
+// mergeSearchConfig merges two search configs (base < override)
+func mergeSearchConfig(base, override *searchTypes.Config) *searchTypes.Config {
+	if base == nil {
+		return override
+	}
+	if override == nil {
+		return base
 	}
 
-	if len(content) == 0 {
-		return &store.ToolCalls{Tools: []store.Tool{}, Prompts: []store.Prompt{}}, ts.UnixNano(), nil
+	result := *base // Copy base
+
+	// Merge Web config
+	if override.Web != nil {
+		if result.Web == nil {
+			result.Web = override.Web
+		} else {
+			merged := *result.Web
+			if override.Web.Provider != "" {
+				merged.Provider = override.Web.Provider
+			}
+			if override.Web.APIKeyEnv != "" {
+				merged.APIKeyEnv = override.Web.APIKeyEnv
+			}
+			if override.Web.MaxResults > 0 {
+				merged.MaxResults = override.Web.MaxResults
+			}
+			result.Web = &merged
+		}
 	}
 
-	var tools store.ToolCalls
-	err = application.Parse(file, content, &tools)
-	if err != nil {
-		return nil, 0, err
+	// Merge KB config
+	if override.KB != nil {
+		if result.KB == nil {
+			result.KB = override.KB
+		} else {
+			merged := *result.KB
+			if len(override.KB.Collections) > 0 {
+				merged.Collections = override.KB.Collections
+			}
+			if override.KB.Threshold > 0 {
+				merged.Threshold = override.KB.Threshold
+			}
+			if override.KB.Graph {
+				merged.Graph = override.KB.Graph
+			}
+			result.KB = &merged
+		}
 	}
 
-	return &tools, ts.UnixNano(), nil
+	// Merge DB config
+	if override.DB != nil {
+		if result.DB == nil {
+			result.DB = override.DB
+		} else {
+			merged := *result.DB
+			if len(override.DB.Models) > 0 {
+				merged.Models = override.DB.Models
+			}
+			if override.DB.MaxResults > 0 {
+				merged.MaxResults = override.DB.MaxResults
+			}
+			result.DB = &merged
+		}
+	}
+
+	// Merge Keyword config
+	if override.Keyword != nil {
+		if result.Keyword == nil {
+			result.Keyword = override.Keyword
+		} else {
+			merged := *result.Keyword
+			if override.Keyword.MaxKeywords > 0 {
+				merged.MaxKeywords = override.Keyword.MaxKeywords
+			}
+			if override.Keyword.Language != "" {
+				merged.Language = override.Keyword.Language
+			}
+			result.Keyword = &merged
+		}
+	}
+
+	// Merge QueryDSL config
+	if override.QueryDSL != nil {
+		if result.QueryDSL == nil {
+			result.QueryDSL = override.QueryDSL
+		} else {
+			merged := *result.QueryDSL
+			if override.QueryDSL.Strict {
+				merged.Strict = override.QueryDSL.Strict
+			}
+			result.QueryDSL = &merged
+		}
+	}
+
+	// Merge Rerank config
+	if override.Rerank != nil {
+		if result.Rerank == nil {
+			result.Rerank = override.Rerank
+		} else {
+			merged := *result.Rerank
+			if override.Rerank.TopN > 0 {
+				merged.TopN = override.Rerank.TopN
+			}
+			result.Rerank = &merged
+		}
+	}
+
+	// Merge Citation config
+	if override.Citation != nil {
+		if result.Citation == nil {
+			result.Citation = override.Citation
+		} else {
+			merged := *result.Citation
+			if override.Citation.Format != "" {
+				merged.Format = override.Citation.Format
+			}
+			// AutoInjectPrompt is a bool, so we check if it's explicitly set
+			// by checking if the whole Citation block was provided
+			merged.AutoInjectPrompt = override.Citation.AutoInjectPrompt
+			if override.Citation.CustomPrompt != "" {
+				merged.CustomPrompt = override.Citation.CustomPrompt
+			}
+			result.Citation = &merged
+		}
+	}
+
+	// Merge Weights config
+	if override.Weights != nil {
+		if result.Weights == nil {
+			result.Weights = override.Weights
+		} else {
+			merged := *result.Weights
+			if override.Weights.User > 0 {
+				merged.User = override.Weights.User
+			}
+			if override.Weights.Hook > 0 {
+				merged.Hook = override.Weights.Hook
+			}
+			if override.Weights.Auto > 0 {
+				merged.Auto = override.Weights.Auto
+			}
+			result.Weights = &merged
+		}
+	}
+
+	// Merge Options config
+	if override.Options != nil {
+		if result.Options == nil {
+			result.Options = override.Options
+		} else {
+			merged := *result.Options
+			if override.Options.SkipThreshold > 0 {
+				merged.SkipThreshold = override.Options.SkipThreshold
+			}
+			result.Options = &merged
+		}
+	}
+
+	return &result
 }

@@ -4,7 +4,6 @@ import (
 	stdContext "context"
 	"testing"
 
-	"github.com/yaoapp/gou/plan"
 	"github.com/yaoapp/yao/agent/assistant"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/testutils"
@@ -14,45 +13,42 @@ import (
 // newTestContext creates a Context for testing with commonly used fields pre-populated.
 // You can override any fields after creation as needed for specific test scenarios.
 func newTestContext(chatID, assistantID string) *context.Context {
-	return &context.Context{
-		Context:     stdContext.Background(),
-		Space:       plan.NewMemorySharedSpace(),
-		ChatID:      chatID,
-		AssistantID: assistantID,
-		Connector:   "",
-		Locale:      "en-us",
-		Theme:       "light",
-		Client: context.Client{
-			Type:      "web",
-			UserAgent: "TestAgent/1.0",
-			IP:        "127.0.0.1",
-		},
-		Referer:  context.RefererAPI,
-		Accept:   context.AcceptWebCUI,
-		Route:    "",
-		Metadata: make(map[string]interface{}),
-		Authorized: &types.AuthorizedInfo{
-			Subject:    "test-user",
-			ClientID:   "test-client-id",
-			Scope:      "openid profile email",
-			SessionID:  "test-session-id",
-			UserID:     "test-user-123",
-			TeamID:     "test-team-456",
-			TenantID:   "test-tenant-789",
-			RememberMe: true,
-			Constraints: types.DataConstraints{
-				OwnerOnly:   false,
-				CreatorOnly: false,
-				EditorOnly:  false,
-				TeamOnly:    true,
-				Extra: map[string]interface{}{
-					"department": "engineering",
-					"region":     "us-west",
-					"project":    "yao",
-				},
+	authorized := &types.AuthorizedInfo{
+		Subject:    "test-user",
+		ClientID:   "test-client-id",
+		Scope:      "openid profile email",
+		SessionID:  "test-session-id",
+		UserID:     "test-user-123",
+		TeamID:     "test-team-456",
+		TenantID:   "test-tenant-789",
+		RememberMe: true,
+		Constraints: types.DataConstraints{
+			OwnerOnly:   false,
+			CreatorOnly: false,
+			EditorOnly:  false,
+			TeamOnly:    true,
+			Extra: map[string]interface{}{
+				"department": "engineering",
+				"region":     "us-west",
+				"project":    "yao",
 			},
 		},
 	}
+
+	ctx := context.New(stdContext.Background(), authorized, chatID)
+	ctx.AssistantID = assistantID
+	ctx.Locale = "en-us"
+	ctx.Theme = "light"
+	ctx.Client = context.Client{
+		Type:      "web",
+		UserAgent: "TestAgent/1.0",
+		IP:        "127.0.0.1",
+	}
+	ctx.Referer = context.RefererAPI
+	ctx.Accept = context.AcceptWebCUI
+	ctx.Route = ""
+	ctx.Metadata = make(map[string]interface{})
+	return ctx
 }
 
 // TestCreate test the create hook
@@ -65,7 +61,7 @@ func TestCreate(t *testing.T) {
 		t.Fatalf("Failed to get the tests.create assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		t.Fatalf("The tests.create assistant has no script")
 	}
 
@@ -74,7 +70,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 1: Return null (should get nil response)
 	t.Run("ReturnNull", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_null"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_null"}})
 		if err != nil {
 			t.Fatalf("Failed to create with null return: %s", err.Error())
 		}
@@ -85,7 +81,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 2: Return undefined (should get nil response)
 	t.Run("ReturnUndefined", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_undefined"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_undefined"}})
 		if err != nil {
 			t.Fatalf("Failed to create with undefined return: %s", err.Error())
 		}
@@ -96,7 +92,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 3: Return empty object (should get empty HookCreateResponse)
 	t.Run("ReturnEmpty", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_empty"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_empty"}})
 		if err != nil {
 			t.Fatalf("Failed to create with empty return: %s", err.Error())
 		}
@@ -110,7 +106,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 4: Return full response with all fields
 	t.Run("ReturnFull", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_full"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_full"}})
 		if err != nil {
 			t.Fatalf("Failed to create with full return: %s", err.Error())
 		}
@@ -166,7 +162,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 5: Return partial response
 	t.Run("ReturnPartial", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_partial"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_partial"}})
 		if err != nil {
 			t.Fatalf("Failed to create with partial return: %s", err.Error())
 		}
@@ -197,7 +193,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 6: Process call - calls models.__yao.role.Get and adds to messages
 	t.Run("ReturnProcess", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "return_process"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "return_process"}})
 		if err != nil {
 			t.Fatalf("Failed to create with process return: %s", err.Error())
 		}
@@ -225,7 +221,7 @@ func TestCreate(t *testing.T) {
 	// Test scenario 7: Default response
 	t.Run("ReturnDefault", func(t *testing.T) {
 		testContent := "Hello, how are you?"
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: testContent}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: testContent}})
 		if err != nil {
 			t.Fatalf("Failed to create with default return: %s", err.Error())
 		}
@@ -252,7 +248,7 @@ func TestCreate(t *testing.T) {
 
 	// Test scenario 8: Verify context fields - validates all context fields in JavaScript
 	t.Run("VerifyContext", func(t *testing.T) {
-		res, err := agent.Script.Create(ctx, []context.Message{{Role: "user", Content: "verify_context"}})
+		res, _, err := agent.HookScript.Create(ctx, []context.Message{{Role: "user", Content: "verify_context"}})
 		if err != nil {
 			t.Fatalf("Failed to create with verify_context: %s", err.Error())
 		}
@@ -304,7 +300,7 @@ func TestCreate(t *testing.T) {
 		adjustCtx := newTestContext("chat-test-adjust", "tests.create")
 
 		// Call the hook which should adjust context fields
-		res, err := agent.Script.Create(adjustCtx, []context.Message{{Role: "user", Content: "adjust_context"}})
+		res, _, err := agent.HookScript.Create(adjustCtx, []context.Message{{Role: "user", Content: "adjust_context"}})
 		if err != nil {
 			t.Fatalf("Failed to create with adjust_context: %s", err.Error())
 		}
@@ -313,9 +309,7 @@ func TestCreate(t *testing.T) {
 		}
 
 		// Verify the response contains adjusted fields
-		if res.AssistantID != "adjusted.assistant" {
-			t.Errorf("Expected adjusted assistant_id 'adjusted.assistant', got: %s", res.AssistantID)
-		}
+		// Note: AssistantID cannot be overridden by hooks, removed from HookCreateResponse
 		if res.Connector != "adjusted-connector" {
 			t.Errorf("Expected adjusted connector 'adjusted-connector', got: %s", res.Connector)
 		}
@@ -338,12 +332,8 @@ func TestCreate(t *testing.T) {
 		}
 
 		// Verify context fields were actually updated
-		if adjustCtx.AssistantID != "adjusted.assistant" {
-			t.Errorf("Context assistant_id not updated. Expected 'adjusted.assistant', got: %s", adjustCtx.AssistantID)
-		}
-		if adjustCtx.Connector != "adjusted-connector" {
-			t.Errorf("Context connector not updated. Expected 'adjusted-connector', got: %s", adjustCtx.Connector)
-		}
+		// Note: AssistantID is immutable and cannot be overridden
+		// Note: Connector is now in Options, not in Context
 		if adjustCtx.Locale != "zh-cn" {
 			t.Errorf("Context locale not updated. Expected 'zh-cn', got: %s", adjustCtx.Locale)
 		}
@@ -358,5 +348,131 @@ func TestCreate(t *testing.T) {
 		}
 
 		t.Log("✓ Context fields successfully adjusted by hook")
+	})
+
+	// Test scenario 10: Adjust uses configuration - tests that uses can be modified by the hook
+	t.Run("AdjustUses", func(t *testing.T) {
+		// Create a fresh context for this test
+		usesCtx := newTestContext("chat-test-uses", "tests.create")
+
+		// Call the hook which should adjust uses configuration
+		res, _, err := agent.HookScript.Create(usesCtx, []context.Message{{Role: "user", Content: "adjust_uses"}})
+		if err != nil {
+			t.Fatalf("Failed to create with adjust_uses: %s", err.Error())
+		}
+		if res == nil {
+			t.Fatalf("Expected non-nil response, got nil")
+		}
+
+		// Verify the response contains uses configuration
+		if res.Uses == nil {
+			t.Fatalf("Expected uses configuration, got nil")
+		}
+
+		// Verify each uses field
+		if res.Uses.Vision != "mcp:vision-server" {
+			t.Errorf("Expected vision 'mcp:vision-server', got: %s", res.Uses.Vision)
+		}
+		if res.Uses.Audio != "mcp:audio-server" {
+			t.Errorf("Expected audio 'mcp:audio-server', got: %s", res.Uses.Audio)
+		}
+		if res.Uses.Search != "agent" {
+			t.Errorf("Expected search 'agent', got: %s", res.Uses.Search)
+		}
+		if res.Uses.Fetch != "mcp:fetch-server" {
+			t.Errorf("Expected fetch 'mcp:fetch-server', got: %s", res.Uses.Fetch)
+		}
+
+		// Verify metadata
+		if res.Metadata == nil {
+			t.Fatalf("Expected metadata, got nil")
+		}
+		if usesAdjusted, ok := res.Metadata["uses_adjusted"].(bool); !ok || !usesAdjusted {
+			t.Errorf("Expected metadata['uses_adjusted'] = true, got: %v", res.Metadata["uses_adjusted"])
+		}
+
+		// Now test that BuildRequest properly applies the uses configuration
+		inputMessages := []context.Message{{Role: "user", Content: "test uses"}}
+		_, options, err := agent.BuildRequest(usesCtx, inputMessages, res)
+		if err != nil {
+			t.Fatalf("Failed to build request: %s", err.Error())
+		}
+
+		// Verify that options.Uses has the values from createResponse
+		if options.Uses == nil {
+			t.Fatalf("Expected options.Uses to be set, got nil")
+		}
+		if options.Uses.Vision != "mcp:vision-server" {
+			t.Errorf("Expected options.Uses.Vision 'mcp:vision-server', got: %s", options.Uses.Vision)
+		}
+		if options.Uses.Audio != "mcp:audio-server" {
+			t.Errorf("Expected options.Uses.Audio 'mcp:audio-server', got: %s", options.Uses.Audio)
+		}
+		if options.Uses.Search != "agent" {
+			t.Errorf("Expected options.Uses.Search 'agent', got: %s", options.Uses.Search)
+		}
+		if options.Uses.Fetch != "mcp:fetch-server" {
+			t.Errorf("Expected options.Uses.Fetch 'mcp:fetch-server', got: %s", options.Uses.Fetch)
+		}
+
+		t.Log("✓ Uses configuration successfully adjusted by hook and applied to options")
+	})
+
+	// Test scenario 11: Adjust uses configuration with force_uses flag
+	t.Run("AdjustUsesForce", func(t *testing.T) {
+		// Create a fresh context for this test
+		usesCtx := newTestContext("chat-test-uses-force", "tests.create")
+
+		// Call the hook which should adjust uses configuration and set force_uses
+		res, _, err := agent.HookScript.Create(usesCtx, []context.Message{{Role: "user", Content: "adjust_uses_force"}})
+		if err != nil {
+			t.Fatalf("Failed to create with adjust_uses_force: %s", err.Error())
+		}
+		if res == nil {
+			t.Fatalf("Expected non-nil response, got nil")
+		}
+
+		// Verify the response contains uses configuration
+		if res.Uses == nil {
+			t.Fatalf("Expected uses configuration, got nil")
+		}
+
+		// Verify uses fields
+		if res.Uses.Vision != "tests.vision-helper" {
+			t.Errorf("Expected vision 'tests.vision-helper', got: %s", res.Uses.Vision)
+		}
+		if res.Uses.Audio != "mcp:audio-server" {
+			t.Errorf("Expected audio 'mcp:audio-server', got: %s", res.Uses.Audio)
+		}
+
+		// Verify force_uses flag
+		if res.ForceUses == nil {
+			t.Fatalf("Expected force_uses to be set, got nil")
+		}
+		if !*res.ForceUses {
+			t.Errorf("Expected force_uses to be true, got: %v", *res.ForceUses)
+		}
+
+		// Verify metadata
+		if res.Metadata == nil {
+			t.Fatalf("Expected metadata, got nil")
+		}
+		if usesForced, ok := res.Metadata["uses_forced"].(bool); !ok || !usesForced {
+			t.Errorf("Expected metadata['uses_forced'] = true, got: %v", res.Metadata["uses_forced"])
+		}
+
+		// Now test that BuildRequest properly applies the force_uses flag
+		inputMessages := []context.Message{{Role: "user", Content: "test force uses"}}
+		_, options, err := agent.BuildRequest(usesCtx, inputMessages, res)
+		if err != nil {
+			t.Fatalf("Failed to build request: %s", err.Error())
+		}
+
+		// Verify that options.ForceUses is true
+		if !options.ForceUses {
+			t.Errorf("Expected options.ForceUses to be true, got: %v", options.ForceUses)
+		}
+
+		t.Log("✓ Uses configuration with force_uses flag successfully adjusted by hook and applied to options")
 	})
 }

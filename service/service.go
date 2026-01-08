@@ -6,7 +6,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/yaoapp/gou/api"
 	"github.com/yaoapp/gou/server/http"
-	agent "github.com/yaoapp/yao/agent/api"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/openapi"
 	"github.com/yaoapp/yao/share"
@@ -26,25 +25,38 @@ func Start(cfg config.Config) (*http.Server, error) {
 
 	router := gin.New()
 	router.Use(Middlewares...)
-	api.SetGuards(Guards)
-	api.SetRoutes(router, "/api", cfg.AllowFrom...)
+
+	var apiRoot string
+	if openapi.Server != nil {
+		// OpenAPI mode: use OAuth guards and dynamic routing
+		apiRoot = openapi.Server.Config.BaseURL
+		api.SetGuards(OpenAPIGuards())
+
+		// Developer APIs: use dynamic proxy (supports hot-reload)
+		router.Any(apiRoot+"/api/*path", DynamicAPIHandler)
+
+		// Widgets and system APIs: static registration
+		api.SetRoutes(router, apiRoot, cfg.AllowFrom...)
+
+		// Build route table for dynamic lookup
+		api.BuildRouteTable()
+
+		// Attach OpenAPI built-in features
+		openapi.Server.Attach(router)
+	} else {
+		// Traditional mode: unchanged
+		apiRoot = "/api"
+		api.SetGuards(Guards)
+		api.SetRoutes(router, "/api", cfg.AllowFrom...)
+	}
+
 	srv := http.New(router, http.Option{
 		Host:    cfg.Host,
 		Port:    cfg.Port,
-		Root:    "/api",
+		Root:    apiRoot,
 		Allows:  cfg.AllowFrom,
 		Timeout: 5 * time.Second,
 	})
-
-	// Agent API
-	if agent.Agent != nil {
-		agent.Agent.API(router, "/api/__yao/agent")
-	}
-
-	// OpenAPI Server
-	if openapi.Server != nil {
-		openapi.Server.Attach(router)
-	}
 
 	go func() {
 		err = srv.Start()
@@ -57,8 +69,21 @@ func Start(cfg config.Config) (*http.Server, error) {
 func Restart(srv *http.Server, cfg config.Config) error {
 	router := gin.New()
 	router.Use(Middlewares...)
-	api.SetGuards(Guards)
-	api.SetRoutes(router, "/api", cfg.AllowFrom...)
+
+	if openapi.Server != nil {
+		// OpenAPI mode
+		baseURL := openapi.Server.Config.BaseURL
+		api.SetGuards(OpenAPIGuards())
+		router.Any(baseURL+"/api/*path", DynamicAPIHandler)
+		api.SetRoutes(router, baseURL, cfg.AllowFrom...)
+		api.BuildRouteTable()
+		openapi.Server.Attach(router)
+	} else {
+		// Traditional mode: unchanged
+		api.SetGuards(Guards)
+		api.SetRoutes(router, "/api", cfg.AllowFrom...)
+	}
+
 	srv.Reset(router)
 	return srv.Restart()
 }

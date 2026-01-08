@@ -7,6 +7,7 @@ import (
 	"github.com/yaoapp/gou/application"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/openapi/agent"
+	"github.com/yaoapp/yao/openapi/app"
 	"github.com/yaoapp/yao/openapi/captcha"
 	"github.com/yaoapp/yao/openapi/chat"
 	"github.com/yaoapp/yao/openapi/dsl"
@@ -21,6 +22,7 @@ import (
 	"github.com/yaoapp/yao/openapi/oauth/acl"
 	"github.com/yaoapp/yao/openapi/oauth/types"
 	"github.com/yaoapp/yao/openapi/team"
+	openapiTrace "github.com/yaoapp/yao/openapi/trace"
 	"github.com/yaoapp/yao/openapi/user"
 )
 
@@ -145,6 +147,12 @@ func (openapi *OpenAPI) Attach(router *gin.Engine) {
 
 	// MCP Server handlers
 	mcp.Attach(group.Group("/mcp"), openapi.OAuth)
+
+	// Trace handlers
+	openapiTrace.Attach(group.Group("/trace"), openapi.OAuth)
+
+	// App handlers (menu, etc.)
+	app.Attach(group.Group("/app"), openapi.OAuth)
 
 	// Custom handlers (Defined by developer)
 

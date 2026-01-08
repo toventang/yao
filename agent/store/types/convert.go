@@ -9,7 +9,9 @@ import (
 	"github.com/spf13/cast"
 	"github.com/yaoapp/gou/connector"
 	"github.com/yaoapp/kun/log"
+	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
+	searchTypes "github.com/yaoapp/yao/agent/search/types"
 )
 
 // ToKnowledgeBase converts various types to KnowledgeBase
@@ -50,6 +52,44 @@ func ToKnowledgeBase(v interface{}) (*KnowledgeBase, error) {
 	}
 }
 
+// ToDatabase converts various types to Database
+func ToDatabase(v interface{}) (*Database, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch db := v.(type) {
+	case *Database:
+		return db, nil
+
+	case Database:
+		return &db, nil
+
+	case []string:
+		return &Database{Models: db}, nil
+
+	case []interface{}:
+		var models []string
+		for _, item := range db {
+			models = append(models, cast.ToString(item))
+		}
+		return &Database{Models: models}, nil
+
+	default:
+		raw, err := jsoniter.Marshal(db)
+		if err != nil {
+			return nil, fmt.Errorf("db format error: %s", err.Error())
+		}
+
+		var database Database
+		err = jsoniter.Unmarshal(raw, &database)
+		if err != nil {
+			return nil, fmt.Errorf("db format error: %s", err.Error())
+		}
+		return &database, nil
+	}
+}
+
 // ToMCPServers converts various types to MCPServers
 func ToMCPServers(v interface{}) (*MCPServers, error) {
 	if v == nil {
@@ -63,17 +103,9 @@ func ToMCPServers(v interface{}) (*MCPServers, error) {
 	case MCPServers:
 		return &mcp, nil
 
-	case []string:
-		return &MCPServers{Servers: mcp}, nil
-
-	case []interface{}:
-		var servers []string
-		for _, item := range mcp {
-			servers = append(servers, cast.ToString(item))
-		}
-		return &MCPServers{Servers: servers}, nil
-
 	default:
+		// For any type (including []string, []interface{}, map[string]interface{}),
+		// marshal and unmarshal to MCPServers using custom UnmarshalJSON
 		raw, err := jsoniter.Marshal(mcp)
 		if err != nil {
 			return nil, fmt.Errorf("mcp format error: %s", err.Error())
@@ -173,15 +205,6 @@ func ToMySQLTime(v interface{}) string {
 	}
 }
 
-// Uses the wrapper configurations for assistant
-// Used to specify which assistant or MCP server to use for vision, audio, etc.
-type Uses struct {
-	Vision string `json:"vision,omitempty"` // Vision processing wrapper. Format: "agent" or "mcp:mcp_server_id"
-	Audio  string `json:"audio,omitempty"`  // Audio processing wrapper. Format: "agent" or "mcp:mcp_server_id"
-	Search string `json:"search,omitempty"` // Search wrapper. Format: "agent" or "mcp:mcp_server_id"
-	Fetch  string `json:"fetch,omitempty"`  // Fetch wrapper. Format: "agent" or "mcp:mcp_server_id"
-}
-
 // ToAssistantModel converts various types to AssistantModel
 func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 	if v == nil {
@@ -234,6 +257,9 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 	if path, ok := data["path"].(string); ok {
 		model.Path = path
 	}
+	if source, ok := data["source"].(string); ok {
+		model.Source = source
+	}
 	if description, ok := data["description"].(string); ok {
 		model.Description = description
 	}
@@ -278,6 +304,22 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 		}
 	}
 
+	// Modes (string array)
+	if modes, ok := data["modes"]; ok && modes != nil {
+		raw, err := jsoniter.Marshal(modes)
+		if err == nil {
+			var m []string
+			if err := jsoniter.Unmarshal(raw, &m); err == nil {
+				model.Modes = m
+			}
+		}
+	}
+
+	// DefaultMode (string)
+	if defaultMode, ok := data["default_mode"].(string); ok {
+		model.DefaultMode = defaultMode
+	}
+
 	// Options (map)
 	if options, ok := data["options"].(map[string]interface{}); ok {
 		model.Options = options
@@ -294,11 +336,44 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 		}
 	}
 
+	// PromptPresets
+	if promptPresets, ok := data["prompt_presets"]; ok && promptPresets != nil {
+		raw, err := jsoniter.Marshal(promptPresets)
+		if err == nil {
+			var pp map[string][]Prompt
+			if err := jsoniter.Unmarshal(raw, &pp); err == nil {
+				model.PromptPresets = pp
+			}
+		}
+	}
+
+	// DisableGlobalPrompts
+	model.DisableGlobalPrompts = getBoolValue(data, "disable_global_prompts")
+
+	// ConnectorOptions
+	if connectorOptions, ok := data["connector_options"]; ok && connectorOptions != nil {
+		raw, err := jsoniter.Marshal(connectorOptions)
+		if err == nil {
+			var co ConnectorOptions
+			if err := jsoniter.Unmarshal(raw, &co); err == nil {
+				model.ConnectorOptions = &co
+			}
+		}
+	}
+
 	// KB
 	if kb, ok := data["kb"]; ok && kb != nil {
 		kbConverted, err := ToKnowledgeBase(kb)
 		if err == nil {
 			model.KB = kbConverted
+		}
+	}
+
+	// DB
+	if db, ok := data["db"]; ok && db != nil {
+		dbConverted, err := ToDatabase(db)
+		if err == nil {
+			model.DB = dbConverted
 		}
 	}
 
@@ -315,17 +390,6 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 		wf, err := ToWorkflow(workflow)
 		if err == nil {
 			model.Workflow = wf
-		}
-	}
-
-	// Tools
-	if tools, ok := data["tools"]; ok && tools != nil {
-		raw, err := jsoniter.Marshal(tools)
-		if err == nil {
-			var tc ToolCalls
-			if err := jsoniter.Unmarshal(raw, &tc); err == nil {
-				model.Tools = &tc
-			}
 		}
 	}
 
@@ -464,4 +528,149 @@ func ParseModelID(modelID string) string {
 		return ""
 	}
 	return parts[len(parts)-1]
+}
+
+// ToConnectorOptions converts various types to ConnectorOptions
+func ToConnectorOptions(v interface{}) (*ConnectorOptions, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch opts := v.(type) {
+	case *ConnectorOptions:
+		return opts, nil
+
+	case ConnectorOptions:
+		return &opts, nil
+
+	default:
+		raw, err := jsoniter.Marshal(opts)
+		if err != nil {
+			return nil, fmt.Errorf("connector_options format error: %s", err.Error())
+		}
+
+		var connOpts ConnectorOptions
+		err = jsoniter.Unmarshal(raw, &connOpts)
+		if err != nil {
+			return nil, fmt.Errorf("connector_options format error: %s", err.Error())
+		}
+		return &connOpts, nil
+	}
+}
+
+// ToModes converts various types to []string for modes
+func ToModes(v interface{}) ([]string, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch modes := v.(type) {
+	case []string:
+		return modes, nil
+
+	case []interface{}:
+		var result []string
+		for _, item := range modes {
+			result = append(result, cast.ToString(item))
+		}
+		return result, nil
+
+	case string:
+		// Single string becomes a slice with one element
+		return []string{modes}, nil
+
+	default:
+		raw, err := jsoniter.Marshal(modes)
+		if err != nil {
+			return nil, fmt.Errorf("modes format error: %s", err.Error())
+		}
+
+		var result []string
+		err = jsoniter.Unmarshal(raw, &result)
+		if err != nil {
+			return nil, fmt.Errorf("modes format error: %s", err.Error())
+		}
+		return result, nil
+	}
+}
+
+// ToPromptPresets converts various types to map[string][]Prompt
+func ToPromptPresets(v interface{}) (map[string][]Prompt, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch presets := v.(type) {
+	case map[string][]Prompt:
+		return presets, nil
+
+	default:
+		raw, err := jsoniter.Marshal(presets)
+		if err != nil {
+			return nil, fmt.Errorf("prompt_presets format error: %s", err.Error())
+		}
+
+		var result map[string][]Prompt
+		err = jsoniter.Unmarshal(raw, &result)
+		if err != nil {
+			return nil, fmt.Errorf("prompt_presets format error: %s", err.Error())
+		}
+		return result, nil
+	}
+}
+
+// ToUses converts various types to context.Uses
+func ToUses(v interface{}) (*context.Uses, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch uses := v.(type) {
+	case *context.Uses:
+		return uses, nil
+
+	case context.Uses:
+		return &uses, nil
+
+	default:
+		raw, err := jsoniter.Marshal(uses)
+		if err != nil {
+			return nil, fmt.Errorf("uses format error: %s", err.Error())
+		}
+
+		var result context.Uses
+		err = jsoniter.Unmarshal(raw, &result)
+		if err != nil {
+			return nil, fmt.Errorf("uses format error: %s", err.Error())
+		}
+		return &result, nil
+	}
+}
+
+// ToSearchConfig converts various types to searchTypes.Config
+func ToSearchConfig(v interface{}) (*searchTypes.Config, error) {
+	if v == nil {
+		return nil, nil
+	}
+
+	switch cfg := v.(type) {
+	case *searchTypes.Config:
+		return cfg, nil
+
+	case searchTypes.Config:
+		return &cfg, nil
+
+	default:
+		raw, err := jsoniter.Marshal(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("search config format error: %s", err.Error())
+		}
+
+		var result searchTypes.Config
+		err = jsoniter.Unmarshal(raw, &result)
+		if err != nil {
+			return nil, fmt.Errorf("search config format error: %s", err.Error())
+		}
+		return &result, nil
+	}
 }

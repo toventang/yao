@@ -172,6 +172,7 @@ import (
 	"github.com/yaoapp/gou/api"
 	"github.com/yaoapp/gou/application"
 	"github.com/yaoapp/gou/connector"
+	"github.com/yaoapp/gou/mcp"
 	"github.com/yaoapp/gou/model"
 	"github.com/yaoapp/gou/query"
 	"github.com/yaoapp/gou/query/gou"
@@ -196,7 +197,9 @@ var testServer *http.Server = nil
 var testSystemModels = map[string]string{
 	"__yao.agent.assistant":    "yao/models/agent/assistant.mod.yao",
 	"__yao.agent.chat":         "yao/models/agent/chat.mod.yao",
-	"__yao.agent.history":      "yao/models/agent/history.mod.yao",
+	"__yao.agent.message":      "yao/models/agent/message.mod.yao",
+	"__yao.agent.resume":       "yao/models/agent/resume.mod.yao",
+	"__yao.agent.search":       "yao/models/agent/search.mod.yao",
 	"__yao.attachment":         "yao/models/attachment.mod.yao",
 	"__yao.audit":              "yao/models/audit.mod.yao",
 	"__yao.config":             "yao/models/config.mod.yao",
@@ -217,15 +220,18 @@ var testSystemModels = map[string]string{
 }
 
 var testSystemStores = map[string]string{
-	"__yao.store":        "yao/stores/store.badger.yao",
-	"__yao.cache":        "yao/stores/cache.lru.yao",
-	"__yao.oauth.store":  "yao/stores/oauth/store.badger.yao",
-	"__yao.oauth.client": "yao/stores/oauth/client.badger.yao",
-	"__yao.oauth.cache":  "yao/stores/oauth/cache.lru.yao",
-	"__yao.agent.memory": "yao/stores/agent/memory.badger.yao",
-	"__yao.agent.cache":  "yao/stores/agent/cache.lru.yao",
-	"__yao.kb.store":     "yao/stores/kb/store.badger.yao",
-	"__yao.kb.cache":     "yao/stores/kb/cache.lru.yao",
+	"__yao.store":                "yao/stores/store.xun.yao",
+	"__yao.cache":                "yao/stores/cache.lru.yao",
+	"__yao.oauth.store":          "yao/stores/oauth/store.xun.yao",
+	"__yao.oauth.client":         "yao/stores/oauth/client.xun.yao",
+	"__yao.oauth.cache":          "yao/stores/oauth/cache.lru.yao",
+	"__yao.agent.memory.user":    "yao/stores/agent/memory/user.xun.yao",
+	"__yao.agent.memory.team":    "yao/stores/agent/memory/team.xun.yao",
+	"__yao.agent.memory.chat":    "yao/stores/agent/memory/chat.xun.yao",
+	"__yao.agent.memory.context": "yao/stores/agent/memory/context.xun.yao",
+	"__yao.agent.cache":          "yao/stores/agent/cache.lru.yao",
+	"__yao.kb.store":             "yao/stores/kb/store.xun.yao",
+	"__yao.kb.cache":             "yao/stores/kb/cache.lru.yao",
 }
 
 func loadSystemStores(t *testing.T, cfg config.Config) error {
@@ -248,24 +254,6 @@ func loadSystemStores(t *testing.T, cfg config.Config) error {
 				"YAO_DATA_ROOT": cfg.DataRoot,
 			}
 			source = replaceVars(source, vars)
-		}
-
-		// Parse store config to check if we need to create directories (for badger stores)
-		var storeConfig map[string]interface{}
-		if err := application.Parse(path, []byte(source), &storeConfig); err == nil {
-			// Check if this is a badger store
-			if storeType, ok := storeConfig["type"].(string); ok && storeType == "badger" {
-				// Extract the path from option.path
-				if option, ok := storeConfig["option"].(map[string]interface{}); ok {
-					if storePath, ok := option["path"].(string); ok {
-						// Create directory for badger store
-						if err := os.MkdirAll(storePath, 0755); err != nil {
-							log.Error("failed to create directory for store %s at %s: %s", id, storePath, err.Error())
-							return fmt.Errorf("failed to create directory for store %s: %w", id, err)
-						}
-					}
-				}
-			}
 		}
 
 		// Load store with the processed source
@@ -571,10 +559,8 @@ func dbconnect(t *testing.T, cfg config.Config) {
 	switch cfg.DB.Driver {
 	case "sqlite3":
 		capsule.AddConn("primary", "sqlite3", cfg.DB.Primary[0]).SetAsGlobal()
-		break
 	default:
 		capsule.AddConn("primary", "mysql", cfg.DB.Primary[0]).SetAsGlobal()
-		break
 	}
 
 }
@@ -592,6 +578,7 @@ func load(t *testing.T, cfg config.Config) {
 	loadScript(t, cfg)
 	loadModel(t, cfg)
 	loadConnector(t, cfg)
+	loadMCP(t, cfg)
 	loadMessenger(t, cfg)
 	loadQuery(t, cfg)
 }
@@ -612,6 +599,27 @@ func loadConnector(t *testing.T, cfg config.Config) {
 		_, err := connector.Load(file, share.ID(root, file))
 		return err
 	}, exts...)
+}
+
+func loadMCP(t *testing.T, cfg config.Config) {
+	// Check if mcps directory exists
+	exists, err := application.App.Exists("mcps")
+	if err != nil || !exists {
+		return
+	}
+
+	exts := []string{"*.mcp.yao", "*.mcp.json", "*.mcp.jsonc"}
+	err = application.App.Walk("mcps", func(root, file string, isdir bool) error {
+		if isdir {
+			return nil
+		}
+		_, err := mcp.LoadClient(file, share.ID(root, file))
+		return err
+	}, exts...)
+
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func loadScript(t *testing.T, cfg config.Config) {
@@ -791,4 +799,71 @@ func GuardBearerJWT(c *gin.Context) {
 
 	claims := helper.JwtValidate(tokenString)
 	c.Set("__sid", claims.SID)
+}
+
+// LoadAgentTestScripts loads all *_test.ts/js scripts from an agent's src directory.
+// This is useful for testing agent hooks (before/after scripts) and other agent-specific test scripts.
+//
+// Usage:
+//
+//	test.Prepare(t, config.Conf)
+//	defer test.Clean()
+//	scripts := test.LoadAgentTestScripts(t, "assistants/tests/hooks-test")
+//
+// Parameters:
+//   - t: testing.T instance
+//   - agentRelPath: relative path to agent directory from app root (e.g., "assistants/tests/hooks-test")
+//
+// Returns:
+//   - []string: list of loaded script IDs (e.g., ["hook.env_test"])
+func LoadAgentTestScripts(t *testing.T, agentRelPath string) []string {
+	srcDir := filepath.Join(agentRelPath, "src")
+
+	// Check if src directory exists
+	exists, err := application.App.Exists(srcDir)
+	if err != nil {
+		t.Fatalf("Failed to check src directory: %v", err)
+	}
+	if !exists {
+		t.Logf("No src directory found at %s, skipping", srcDir)
+		return nil
+	}
+
+	var loadedScripts []string
+	exts := []string{"*_test.ts", "*_test.js"}
+
+	err = application.App.Walk(srcDir, func(root, file string, isdir bool) error {
+		if isdir {
+			return nil
+		}
+
+		// Only load *_test.ts/js files
+		base := filepath.Base(file)
+		if !strings.HasSuffix(base, "_test.ts") && !strings.HasSuffix(base, "_test.js") {
+			return nil
+		}
+
+		// Generate script ID: hook.{relative_path_without_ext}
+		// e.g., assistants/tests/hooks-test/src/env_test.ts -> hook.env_test
+		relPath := strings.TrimPrefix(file, srcDir+"/")
+		relPath = strings.TrimPrefix(relPath, "/")
+		relPath = strings.TrimSuffix(relPath, filepath.Ext(relPath))
+		scriptID := "hook." + strings.ReplaceAll(relPath, "/", ".")
+
+		// Load the script
+		_, err := v8.Load(file, scriptID)
+		if err != nil {
+			t.Logf("Warning: Failed to load hook script %s: %v", base, err)
+			return nil // Continue loading other scripts
+		}
+
+		loadedScripts = append(loadedScripts, scriptID)
+		return nil
+	}, exts...)
+
+	if err != nil {
+		t.Fatalf("Failed to walk src directory: %v", err)
+	}
+
+	return loadedScripts
 }

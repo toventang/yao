@@ -8,12 +8,14 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/yaoapp/kun/log"
 	"github.com/yaoapp/xun/dbal/query"
+	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
+	searchTypes "github.com/yaoapp/yao/agent/search/types"
 	"github.com/yaoapp/yao/agent/store/types"
 )
 
 // SaveAssistant saves assistant information
-func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) {
+func (store *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) {
 	if assistant == nil {
 		return "", fmt.Errorf("assistant cannot be nil")
 	}
@@ -32,15 +34,15 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 	// Generate assistant_id if not provided
 	if assistant.ID == "" {
 		var err error
-		assistant.ID, err = conv.GenerateAssistantID()
+		assistant.ID, err = store.GenerateAssistantID()
 		if err != nil {
 			return "", err
 		}
 	}
 
 	// Check if assistant exists
-	exists, err := conv.query.New().
-		Table(conv.getAssistantTable()).
+	exists, err := store.query.New().
+		Table(store.getAssistantTable()).
 		Where("assistant_id", assistant.ID).
 		Exists()
 	if err != nil {
@@ -58,6 +60,7 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 	data["public"] = assistant.Public
 	data["mentionable"] = assistant.Mentionable
 	data["automated"] = assistant.Automated
+	data["disable_global_prompts"] = assistant.DisableGlobalPrompts
 
 	// Set timestamps
 	now := time.Now().UnixNano()
@@ -100,6 +103,11 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 		data["path"] = assistant.Path
 	} else {
 		data["path"] = nil
+	}
+	if assistant.Source != "" {
+		data["source"] = assistant.Source
+	} else {
+		data["source"] = nil
 	}
 
 	// Share field: nullable: false with default "private"
@@ -149,16 +157,34 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 		data["tags"] = jsonStr
 	}
 
+	if assistant.Modes != nil {
+		jsonStr, err := jsoniter.MarshalToString(assistant.Modes)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal modes: %w", err)
+		}
+		data["modes"] = jsonStr
+	}
+
+	// DefaultMode is a simple string field
+	if assistant.DefaultMode != "" {
+		data["default_mode"] = assistant.DefaultMode
+	} else {
+		data["default_mode"] = nil
+	}
+
 	// Handle interface{} fields - they should already be in the correct format
 	jsonFields := map[string]interface{}{
-		"prompts":     assistant.Prompts,
-		"kb":          assistant.KB,
-		"mcp":         assistant.MCP,
-		"workflow":    assistant.Workflow,
-		"tools":       assistant.Tools,
-		"placeholder": assistant.Placeholder,
-		"locales":     assistant.Locales,
-		"uses":        assistant.Uses,
+		"prompts":           assistant.Prompts,
+		"prompt_presets":    assistant.PromptPresets,
+		"connector_options": assistant.ConnectorOptions,
+		"kb":                assistant.KB,
+		"db":                assistant.DB,
+		"mcp":               assistant.MCP,
+		"workflow":          assistant.Workflow,
+		"placeholder":       assistant.Placeholder,
+		"locales":           assistant.Locales,
+		"uses":              assistant.Uses,
+		"search":            assistant.Search,
 	}
 
 	for field, value := range jsonFields {
@@ -173,8 +199,8 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 
 	// Update or insert
 	if exists {
-		_, err := conv.query.New().
-			Table(conv.getAssistantTable()).
+		_, err := store.query.New().
+			Table(store.getAssistantTable()).
 			Where("assistant_id", assistant.ID).
 			Update(data)
 		if err != nil {
@@ -183,8 +209,8 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 		return assistant.ID, nil
 	}
 
-	err = conv.query.New().
-		Table(conv.getAssistantTable()).
+	err = store.query.New().
+		Table(store.getAssistantTable()).
 		Insert(data)
 	if err != nil {
 		return "", err
@@ -193,7 +219,7 @@ func (conv *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error) 
 }
 
 // UpdateAssistant updates specific fields of an assistant
-func (conv *Xun) UpdateAssistant(assistantID string, updates map[string]interface{}) error {
+func (store *Xun) UpdateAssistant(assistantID string, updates map[string]interface{}) error {
 	if assistantID == "" {
 		return fmt.Errorf("assistant_id is required")
 	}
@@ -202,8 +228,8 @@ func (conv *Xun) UpdateAssistant(assistantID string, updates map[string]interfac
 	}
 
 	// Check if assistant exists
-	exists, err := conv.query.New().
-		Table(conv.getAssistantTable()).
+	exists, err := store.query.New().
+		Table(store.getAssistantTable()).
 		Where("assistant_id", assistantID).
 		Exists()
 	if err != nil {
@@ -217,14 +243,14 @@ func (conv *Xun) UpdateAssistant(assistantID string, updates map[string]interfac
 	data := make(map[string]interface{})
 
 	// List of fields that need JSON marshaling
-	jsonFields := []string{"options", "tags", "prompts", "kb", "mcp", "workflow", "tools", "placeholder", "locales", "uses"}
+	jsonFields := []string{"options", "tags", "modes", "prompts", "prompt_presets", "connector_options", "kb", "db", "mcp", "workflow", "placeholder", "locales", "uses", "search"}
 	jsonFieldSet := make(map[string]bool)
 	for _, field := range jsonFields {
 		jsonFieldSet[field] = true
 	}
 
 	// List of nullable string fields
-	nullableStringFields := []string{"name", "avatar", "description", "path", "__yao_created_by", "__yao_updated_by", "__yao_team_id", "__yao_tenant_id"}
+	nullableStringFields := []string{"name", "avatar", "description", "path", "source", "default_mode", "__yao_created_by", "__yao_updated_by", "__yao_team_id", "__yao_tenant_id"}
 	nullableFieldSet := make(map[string]bool)
 	for _, field := range nullableStringFields {
 		nullableFieldSet[field] = true
@@ -267,8 +293,8 @@ func (conv *Xun) UpdateAssistant(assistantID string, updates map[string]interfac
 	}
 
 	// Perform update
-	_, err = conv.query.New().
-		Table(conv.getAssistantTable()).
+	_, err = store.query.New().
+		Table(store.getAssistantTable()).
 		Where("assistant_id", assistantID).
 		Update(data)
 
@@ -276,10 +302,10 @@ func (conv *Xun) UpdateAssistant(assistantID string, updates map[string]interfac
 }
 
 // DeleteAssistant deletes an assistant by assistant_id
-func (conv *Xun) DeleteAssistant(assistantID string) error {
+func (store *Xun) DeleteAssistant(assistantID string) error {
 	// Check if assistant exists
-	exists, err := conv.query.New().
-		Table(conv.getAssistantTable()).
+	exists, err := store.query.New().
+		Table(store.getAssistantTable()).
 		Where("assistant_id", assistantID).
 		Exists()
 	if err != nil {
@@ -290,17 +316,17 @@ func (conv *Xun) DeleteAssistant(assistantID string) error {
 		return fmt.Errorf("assistant %s not found", assistantID)
 	}
 
-	_, err = conv.query.New().
-		Table(conv.getAssistantTable()).
+	_, err = store.query.New().
+		Table(store.getAssistantTable()).
 		Where("assistant_id", assistantID).
 		Delete()
 	return err
 }
 
 // GetAssistants retrieves assistants with pagination and filtering
-func (conv *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (*types.AssistantList, error) {
-	qb := conv.query.New().
-		Table(conv.getAssistantTable())
+func (store *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (*types.AssistantList, error) {
+	qb := store.query.New().
+		Table(store.getAssistantTable())
 
 	// Apply tag filter if provided
 	if len(filter.Tags) > 0 {
@@ -417,7 +443,7 @@ func (conv *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (
 
 	// Convert rows to types.AssistantModel slice
 	assistants := make([]*types.AssistantModel, 0, len(rows))
-	jsonFields := []string{"tags", "options", "prompts", "workflow", "kb", "mcp", "tools", "placeholder", "locales", "uses"}
+	jsonFields := []string{"tags", "options", "prompts", "prompt_presets", "connector_options", "workflow", "kb", "mcp", "placeholder", "locales", "uses", "search"}
 
 	for _, row := range rows {
 		data := row.ToMap()
@@ -426,7 +452,7 @@ func (conv *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (
 		}
 
 		// Parse JSON fields
-		conv.parseJSONFields(data, jsonFields)
+		store.parseJSONFields(data, jsonFields)
 
 		// Convert map to types.AssistantModel using existing helper function
 		model, err := types.ToAssistantModel(data)
@@ -437,7 +463,7 @@ func (conv *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (
 
 		// Apply i18n translations if locale is provided
 		if len(locale) > 0 && locale[0] != "" && model != nil {
-			conv.translate(model, model.ID, locale[0])
+			store.translate(model, model.ID, locale[0])
 		}
 
 		assistants = append(assistants, model)
@@ -455,11 +481,27 @@ func (conv *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) (
 }
 
 // GetAssistant retrieves a single assistant by ID
-func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.AssistantModel, error) {
-	row, err := conv.query.New().
-		Table(conv.getAssistantTable()).
-		Where("assistant_id", assistantID).
-		First()
+func (store *Xun) GetAssistant(assistantID string, fields []string, locale ...string) (*types.AssistantModel, error) {
+	qb := store.query.New().
+		Table(store.getAssistantTable()).
+		Where("assistant_id", assistantID)
+
+	// Apply select fields with security validation
+	// If no fields specified, use default fields
+	fieldsToSelect := fields
+	if len(fieldsToSelect) == 0 {
+		fieldsToSelect = types.AssistantDefaultFields
+	}
+
+	// ValidateAssistantFields will validate fields against whitelist
+	sanitized := types.ValidateAssistantFields(fieldsToSelect)
+	selectFields := make([]interface{}, len(sanitized))
+	for i, field := range sanitized {
+		selectFields[i] = field
+	}
+	qb.Select(selectFields...)
+
+	row, err := qb.First()
 	if err != nil {
 		return nil, err
 	}
@@ -474,31 +516,34 @@ func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.Assi
 	}
 
 	// Parse JSON fields
-	jsonFields := []string{"tags", "options", "prompts", "workflow", "kb", "mcp", "tools", "placeholder", "locales", "uses"}
-	conv.parseJSONFields(data, jsonFields)
+	jsonFields := []string{"tags", "modes", "options", "prompts", "prompt_presets", "connector_options", "workflow", "kb", "db", "mcp", "placeholder", "locales", "uses", "search"}
+	store.parseJSONFields(data, jsonFields)
 
 	// Convert map to types.AssistantModel
 	model := &types.AssistantModel{
-		ID:           getString(data, "assistant_id"),
-		Type:         getString(data, "type"),
-		Name:         getString(data, "name"),
-		Avatar:       getString(data, "avatar"),
-		Connector:    getString(data, "connector"),
-		Path:         getString(data, "path"),
-		BuiltIn:      getBool(data, "built_in"),
-		Sort:         getInt(data, "sort"),
-		Description:  getString(data, "description"),
-		Readonly:     getBool(data, "readonly"),
-		Public:       getBool(data, "public"),
-		Share:        getString(data, "share"),
-		Mentionable:  getBool(data, "mentionable"),
-		Automated:    getBool(data, "automated"),
-		CreatedAt:    getInt64(data, "created_at"),
-		UpdatedAt:    getInt64(data, "updated_at"),
-		YaoCreatedBy: getString(data, "__yao_created_by"),
-		YaoUpdatedBy: getString(data, "__yao_updated_by"),
-		YaoTeamID:    getString(data, "__yao_team_id"),
-		YaoTenantID:  getString(data, "__yao_tenant_id"),
+		ID:                   getString(data, "assistant_id"),
+		Type:                 getString(data, "type"),
+		Name:                 getString(data, "name"),
+		Avatar:               getString(data, "avatar"),
+		Connector:            getString(data, "connector"),
+		Path:                 getString(data, "path"),
+		Source:               getString(data, "source"),
+		BuiltIn:              getBool(data, "built_in"),
+		Sort:                 getInt(data, "sort"),
+		Description:          getString(data, "description"),
+		DefaultMode:          getString(data, "default_mode"),
+		Readonly:             getBool(data, "readonly"),
+		Public:               getBool(data, "public"),
+		Share:                getString(data, "share"),
+		Mentionable:          getBool(data, "mentionable"),
+		Automated:            getBool(data, "automated"),
+		DisableGlobalPrompts: getBool(data, "disable_global_prompts"),
+		CreatedAt:            getInt64(data, "created_at"),
+		UpdatedAt:            getInt64(data, "updated_at"),
+		YaoCreatedBy:         getString(data, "__yao_created_by"),
+		YaoUpdatedBy:         getString(data, "__yao_updated_by"),
+		YaoTeamID:            getString(data, "__yao_team_id"),
+		YaoTenantID:          getString(data, "__yao_tenant_id"),
 	}
 
 	// Handle Tags
@@ -507,6 +552,16 @@ func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.Assi
 		for i, tag := range tags {
 			if s, ok := tag.(string); ok {
 				model.Tags[i] = s
+			}
+		}
+	}
+
+	// Handle Modes
+	if modes, ok := data["modes"].([]interface{}); ok {
+		model.Modes = make([]string, len(modes))
+		for i, mode := range modes {
+			if s, ok := mode.(string); ok {
+				model.Modes[i] = s
 			}
 		}
 	}
@@ -528,10 +583,37 @@ func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.Assi
 		}
 	}
 
+	if promptPresets, has := data["prompt_presets"]; has && promptPresets != nil {
+		raw, err := jsoniter.Marshal(promptPresets)
+		if err == nil {
+			var pp map[string][]types.Prompt
+			if err := jsoniter.Unmarshal(raw, &pp); err == nil {
+				model.PromptPresets = pp
+			}
+		}
+	}
+
+	if connectorOptions, has := data["connector_options"]; has && connectorOptions != nil {
+		raw, err := jsoniter.Marshal(connectorOptions)
+		if err == nil {
+			var co types.ConnectorOptions
+			if err := jsoniter.Unmarshal(raw, &co); err == nil {
+				model.ConnectorOptions = &co
+			}
+		}
+	}
+
 	if kb, has := data["kb"]; has && kb != nil {
 		kbConverted, err := types.ToKnowledgeBase(kb)
 		if err == nil {
 			model.KB = kbConverted
+		}
+	}
+
+	if db, has := data["db"]; has && db != nil {
+		dbConverted, err := types.ToDatabase(db)
+		if err == nil {
+			model.DB = dbConverted
 		}
 	}
 
@@ -546,16 +628,6 @@ func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.Assi
 		wf, err := types.ToWorkflow(workflow)
 		if err == nil {
 			model.Workflow = wf
-		}
-	}
-
-	if tools, has := data["tools"]; has && tools != nil {
-		raw, err := jsoniter.Marshal(tools)
-		if err == nil {
-			var tc types.ToolCalls
-			if err := jsoniter.Unmarshal(raw, &tc); err == nil {
-				model.Tools = &tc
-			}
 		}
 	}
 
@@ -582,25 +654,35 @@ func (conv *Xun) GetAssistant(assistantID string, locale ...string) (*types.Assi
 	if uses, has := data["uses"]; has && uses != nil {
 		raw, err := jsoniter.Marshal(uses)
 		if err == nil {
-			var u types.Uses
+			var u context.Uses
 			if err := jsoniter.Unmarshal(raw, &u); err == nil {
 				model.Uses = &u
 			}
 		}
 	}
 
+	if search, has := data["search"]; has && search != nil {
+		raw, err := jsoniter.Marshal(search)
+		if err == nil {
+			var s searchTypes.Config
+			if err := jsoniter.Unmarshal(raw, &s); err == nil {
+				model.Search = &s
+			}
+		}
+	}
+
 	// Apply i18n translation if locale is provided
 	if len(locale) > 0 && locale[0] != "" {
-		conv.translate(model, assistantID, locale[0])
+		store.translate(model, assistantID, locale[0])
 	}
 
 	return model, nil
 }
 
 // DeleteAssistants deletes assistants based on filter conditions
-func (conv *Xun) DeleteAssistants(filter types.AssistantFilter) (int64, error) {
-	qb := conv.query.New().
-		Table(conv.getAssistantTable())
+func (store *Xun) DeleteAssistants(filter types.AssistantFilter) (int64, error) {
+	qb := store.query.New().
+		Table(store.getAssistantTable())
 
 	// Apply tag filter if provided
 	if len(filter.Tags) > 0 {
@@ -659,8 +741,8 @@ func (conv *Xun) DeleteAssistants(filter types.AssistantFilter) (int64, error) {
 }
 
 // GetAssistantTags retrieves all unique tags from assistants with filtering
-func (conv *Xun) GetAssistantTags(filter types.AssistantFilter, locale ...string) ([]types.Tag, error) {
-	qb := conv.query.New().Table(conv.getAssistantTable())
+func (store *Xun) GetAssistantTags(filter types.AssistantFilter, locale ...string) ([]types.Tag, error) {
+	qb := store.query.New().Table(store.getAssistantTable())
 
 	// Apply type filter (default to "assistant")
 	typeFilter := "assistant"
@@ -733,7 +815,7 @@ func (conv *Xun) GetAssistantTags(filter types.AssistantFilter, locale ...string
 }
 
 // translate applies i18n translation to assistant model fields
-func (conv *Xun) translate(model *types.AssistantModel, assistantID string, locale string) {
+func (store *Xun) translate(model *types.AssistantModel, assistantID string, locale string) {
 	if model == nil {
 		return
 	}

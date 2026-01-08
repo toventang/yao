@@ -6,17 +6,21 @@ import (
 
 	"github.com/yaoapp/gou/application"
 	"github.com/yaoapp/gou/connector"
-	"github.com/yaoapp/kun/exception"
-	"github.com/yaoapp/yao/agent/api"
+	gouOpenAI "github.com/yaoapp/gou/connector/openai"
 	"github.com/yaoapp/yao/agent/assistant"
+	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
-	mongoStore "github.com/yaoapp/yao/agent/store/mongo"
-	redisStore "github.com/yaoapp/yao/agent/store/redis"
+	searchDefaults "github.com/yaoapp/yao/agent/search/defaults"
+	searchTypes "github.com/yaoapp/yao/agent/search/types"
+	storeMongo "github.com/yaoapp/yao/agent/store/mongo"
+	storeRedis "github.com/yaoapp/yao/agent/store/redis"
 	store "github.com/yaoapp/yao/agent/store/types"
-	xunStore "github.com/yaoapp/yao/agent/store/xun"
+	"github.com/yaoapp/yao/agent/store/xun"
 	"github.com/yaoapp/yao/agent/types"
 	"github.com/yaoapp/yao/config"
 )
+
+var agentDSL *types.DSL
 
 // Load load AIGC
 func Load(cfg config.Config) error {
@@ -44,22 +48,21 @@ func Load(cfg config.Config) error {
 	}
 
 	// Default Assistant, Agent is the developer name, Mohe is the brand name of the assistant
-	if setting.Use == nil {
-		setting.Use = &types.Use{Default: "mohe"} // Agent is the developer name, Mohe is the brand name of the assistant
+	if setting.Uses == nil {
+		setting.Uses = &types.Uses{Default: "mohe"} // Agent is the developer name, Mohe is the brand name of the assistant
 	}
 
 	// Title Assistant
-	if setting.Use.Title == "" {
-		setting.Use.Title = setting.Use.Default
+	if setting.Uses.Title == "" {
+		setting.Uses.Title = setting.Uses.Default
 	}
 
 	// Prompt Assistant
-	if setting.Use.Prompt == "" {
-		setting.Use.Prompt = setting.Use.Default
+	if setting.Uses.Prompt == "" {
+		setting.Uses.Prompt = setting.Uses.Default
 	}
 
-	// Initialize Agent API
-	api.Agent = &api.API{DSL: &setting}
+	agentDSL = &setting
 
 	// Store Setting
 	err = initStore()
@@ -67,14 +70,32 @@ func Load(cfg config.Config) error {
 		return err
 	}
 
-	// Initialize Connector settings
-	err = initConnectorSettings()
+	// Initialize model capabilities
+	err = initModelCapabilities()
 	if err != nil {
 		return err
 	}
 
 	// Initialize Global I18n
 	err = initGlobalI18n()
+	if err != nil {
+		return err
+	}
+
+	// Initialize Global Prompts
+	err = initGlobalPrompts()
+	if err != nil {
+		return err
+	}
+
+	// Initialize KB Configuration
+	err = initKBConfig()
+	if err != nil {
+		return err
+	}
+
+	// Initialize Search Configuration
+	err = initSearchConfig()
 	if err != nil {
 		return err
 	}
@@ -88,12 +109,9 @@ func Load(cfg config.Config) error {
 	return nil
 }
 
-// GetAgent returns the Agent instance
-func GetAgent() *api.API {
-	if api.Agent == nil {
-		exception.New("Agent is not initialized", 500).Throw()
-	}
-	return api.Agent
+// GetAgent returns the Agent settings
+func GetAgent() *types.DSL {
+	return agentDSL
 }
 
 // initGlobalI18n initialize the global i18n
@@ -106,26 +124,45 @@ func initGlobalI18n() error {
 	return nil
 }
 
-// initConnectors initialize the connectors
-func initConnectorSettings() error {
-	path := filepath.Join("agent", "connectors.yml")
+// initGlobalPrompts initialize the global prompts from agent/prompts.yml
+func initGlobalPrompts() error {
+	prompts, _, err := store.LoadGlobalPrompts()
+	if err != nil {
+		return err
+	}
+	agentDSL.GlobalPrompts = prompts
+	return nil
+}
+
+// GetGlobalPrompts returns the global prompts
+// ctx: context variables for parsing $CTX.* variables
+func GetGlobalPrompts(ctx map[string]string) []store.Prompt {
+	if agentDSL == nil || len(agentDSL.GlobalPrompts) == 0 {
+		return nil
+	}
+	return store.Prompts(agentDSL.GlobalPrompts).Parse(ctx)
+}
+
+// initModelCapabilities initialize the model capabilities configuration
+func initModelCapabilities() error {
+	path := filepath.Join("agent", "models.yml")
 	if exists, _ := application.App.Exists(path); !exists {
 		return nil
 	}
 
-	// Open the connectors
+	// Read the model capabilities configuration
 	bytes, err := application.App.Read(path)
 	if err != nil {
 		return err
 	}
 
-	var connectors map[string]assistant.ConnectorSetting = map[string]assistant.ConnectorSetting{}
-	err = application.Parse("connectors.yml", bytes, &connectors)
+	var models map[string]gouOpenAI.Capabilities = map[string]gouOpenAI.Capabilities{}
+	err = application.Parse("models.yml", bytes, &models)
 	if err != nil {
 		return err
 	}
 
-	api.Agent.DSL.Connectors = connectors
+	agentDSL.Models = models
 	return nil
 }
 
@@ -133,60 +170,93 @@ func initConnectorSettings() error {
 func initStore() error {
 
 	var err error
-	if api.Agent.DSL.StoreSetting.Connector == "default" || api.Agent.DSL.StoreSetting.Connector == "" {
-		api.Agent.DSL.Store, err = xunStore.NewXun(api.Agent.DSL.StoreSetting)
+	if agentDSL.StoreSetting.Connector == "default" || agentDSL.StoreSetting.Connector == "" {
+		agentDSL.Store, err = xun.NewXun(agentDSL.StoreSetting)
 		return err
 	}
 
 	// other connector
-	conn, err := connector.Select(api.Agent.DSL.StoreSetting.Connector)
+	conn, err := connector.Select(agentDSL.StoreSetting.Connector)
 	if err != nil {
 		return fmt.Errorf("load connectors error: %s", err.Error())
 	}
 
 	if conn.Is(connector.DATABASE) {
-		api.Agent.DSL.Store, err = xunStore.NewXun(api.Agent.DSL.StoreSetting)
+		agentDSL.Store, err = xun.NewXun(agentDSL.StoreSetting)
 		return err
 
 	} else if conn.Is(connector.REDIS) {
-		api.Agent.DSL.Store = redisStore.NewRedis()
+		agentDSL.Store = storeRedis.NewRedis()
 		return nil
 
 	} else if conn.Is(connector.MONGO) {
-		api.Agent.DSL.Store = mongoStore.NewMongo()
+		agentDSL.Store = storeMongo.NewMongo()
 		return nil
 	}
 
-	return fmt.Errorf("Agent store connector %s not support", api.Agent.DSL.StoreSetting.Connector)
+	return fmt.Errorf("Agent store connector %s not support", agentDSL.StoreSetting.Connector)
 }
 
 // initAssistant initialize the assistant
 func initAssistant() error {
 
 	// Set Storage
-	assistant.SetStorage(api.Agent.DSL.Store)
+	assistant.SetStorage(agentDSL.Store)
 
-	// Assistant Vision
-	if api.Agent.DSL.Vision != nil {
-		assistant.SetVision(api.Agent.DSL.Vision)
-	}
+	// Set Store Setting (MaxSize, TTL, etc.)
+	assistant.SetStoreSetting(&agentDSL.StoreSetting)
 
 	// Set global Uses configuration
-	if api.Agent.DSL.Use != nil {
-		globalUses := &store.Uses{
-			Vision: api.Agent.DSL.Use.Vision,
-			Audio:  api.Agent.DSL.Use.Audio,
-			Search: api.Agent.DSL.Use.Search,
-			Fetch:  api.Agent.DSL.Use.Fetch,
+	if agentDSL.Uses != nil {
+		globalUses := &context.Uses{
+			Vision:   agentDSL.Uses.Vision,
+			Audio:    agentDSL.Uses.Audio,
+			Search:   agentDSL.Uses.Search,
+			Fetch:    agentDSL.Uses.Fetch,
+			Web:      agentDSL.Uses.Web,
+			Keyword:  agentDSL.Uses.Keyword,
+			QueryDSL: agentDSL.Uses.QueryDSL,
+			Rerank:   agentDSL.Uses.Rerank,
 		}
 		assistant.SetGlobalUses(globalUses)
 	}
 
-	if api.Agent.DSL.Connectors != nil {
-		assistant.SetConnectorSettings(api.Agent.DSL.Connectors)
+	// Set global prompts
+	if len(agentDSL.GlobalPrompts) > 0 {
+		assistant.SetGlobalPrompts(agentDSL.GlobalPrompts)
 	}
 
-	// Load Built-in Assistants
+	if agentDSL.Models != nil {
+		assistant.SetModelCapabilities(agentDSL.Models)
+	}
+
+	if agentDSL.KB != nil {
+		assistant.SetGlobalKBSetting(agentDSL.KB)
+	}
+
+	if agentDSL.Search != nil {
+		assistant.SetGlobalSearchConfig(agentDSL.Search)
+	}
+
+	// Set system agents configuration
+	if agentDSL.System != nil {
+		assistant.SetSystemConfig(&assistant.SystemConfig{
+			Default:    agentDSL.System.Default,
+			Keyword:    agentDSL.System.Keyword,
+			QueryDSL:   agentDSL.System.QueryDSL,
+			Title:      agentDSL.System.Title,
+			Prompt:     agentDSL.System.Prompt,
+			NeedSearch: agentDSL.System.NeedSearch,
+			Entity:     agentDSL.System.Entity,
+		})
+	}
+
+	// Load System Agents (from bindata: __yao.keyword, __yao.querydsl, etc.)
+	if err := assistant.LoadSystemAgents(); err != nil {
+		return err
+	}
+
+	// Load Built-in Assistants (from application /assistants directory)
 	err := assistant.LoadBuiltIn()
 	if err != nil {
 		return err
@@ -198,14 +268,208 @@ func initAssistant() error {
 		return err
 	}
 
-	api.Agent.DSL.Assistant = defaultAssistant
+	agentDSL.Assistant = defaultAssistant
 	return nil
+}
+
+// initKBConfig initialize the knowledge base configuration from agent/kb.yml
+func initKBConfig() error {
+	path := filepath.Join("agent", "kb.yml")
+	if exists, _ := application.App.Exists(path); !exists {
+		return nil // KB config is optional
+	}
+
+	// Read the KB configuration
+	bytes, err := application.App.Read(path)
+	if err != nil {
+		return err
+	}
+
+	var kbSetting store.KBSetting
+	err = application.Parse("kb.yml", bytes, &kbSetting)
+	if err != nil {
+		return err
+	}
+
+	agentDSL.KB = &kbSetting
+	return nil
+}
+
+// initSearchConfig initialize the search configuration from agent/search.yml
+func initSearchConfig() error {
+	// Start with system defaults
+	agentDSL.Search = searchDefaults.SystemDefaults
+
+	path := filepath.Join("agent", "search.yml")
+	if exists, _ := application.App.Exists(path); !exists {
+		return nil // Search config is optional, use defaults
+	}
+
+	// Read the search configuration
+	bytes, err := application.App.Read(path)
+	if err != nil {
+		return err
+	}
+
+	var searchConfig searchTypes.Config
+	err = application.Parse("search.yml", bytes, &searchConfig)
+	if err != nil {
+		return err
+	}
+
+	// Merge with defaults
+	agentDSL.Search = mergeSearchConfig(searchDefaults.SystemDefaults, &searchConfig)
+	return nil
+}
+
+// mergeSearchConfig merges two search configs (base < override)
+func mergeSearchConfig(base, override *searchTypes.Config) *searchTypes.Config {
+	if base == nil {
+		return override
+	}
+	if override == nil {
+		return base
+	}
+
+	result := *base // Copy base
+
+	// Merge Web config
+	if override.Web != nil {
+		if result.Web == nil {
+			result.Web = override.Web
+		} else {
+			if override.Web.Provider != "" {
+				result.Web.Provider = override.Web.Provider
+			}
+			if override.Web.APIKeyEnv != "" {
+				result.Web.APIKeyEnv = override.Web.APIKeyEnv
+			}
+			if override.Web.MaxResults > 0 {
+				result.Web.MaxResults = override.Web.MaxResults
+			}
+		}
+	}
+
+	// Merge KB config
+	if override.KB != nil {
+		if result.KB == nil {
+			result.KB = override.KB
+		} else {
+			if len(override.KB.Collections) > 0 {
+				result.KB.Collections = override.KB.Collections
+			}
+			if override.KB.Threshold > 0 {
+				result.KB.Threshold = override.KB.Threshold
+			}
+			if override.KB.Graph {
+				result.KB.Graph = override.KB.Graph
+			}
+		}
+	}
+
+	// Merge DB config
+	if override.DB != nil {
+		if result.DB == nil {
+			result.DB = override.DB
+		} else {
+			if len(override.DB.Models) > 0 {
+				result.DB.Models = override.DB.Models
+			}
+			if override.DB.MaxResults > 0 {
+				result.DB.MaxResults = override.DB.MaxResults
+			}
+		}
+	}
+
+	// Merge Keyword config
+	if override.Keyword != nil {
+		if result.Keyword == nil {
+			result.Keyword = override.Keyword
+		} else {
+			if override.Keyword.MaxKeywords > 0 {
+				result.Keyword.MaxKeywords = override.Keyword.MaxKeywords
+			}
+			if override.Keyword.Language != "" {
+				result.Keyword.Language = override.Keyword.Language
+			}
+		}
+	}
+
+	// Merge QueryDSL config
+	if override.QueryDSL != nil {
+		result.QueryDSL = override.QueryDSL
+	}
+
+	// Merge Rerank config
+	if override.Rerank != nil {
+		if result.Rerank == nil {
+			result.Rerank = override.Rerank
+		} else {
+			if override.Rerank.TopN > 0 {
+				result.Rerank.TopN = override.Rerank.TopN
+			}
+		}
+	}
+
+	// Merge Citation config
+	if override.Citation != nil {
+		if result.Citation == nil {
+			result.Citation = override.Citation
+		} else {
+			if override.Citation.Format != "" {
+				result.Citation.Format = override.Citation.Format
+			}
+			// AutoInjectPrompt is a bool, need to check if explicitly set
+			result.Citation.AutoInjectPrompt = override.Citation.AutoInjectPrompt
+			if override.Citation.CustomPrompt != "" {
+				result.Citation.CustomPrompt = override.Citation.CustomPrompt
+			}
+		}
+	}
+
+	// Merge Weights config
+	if override.Weights != nil {
+		if result.Weights == nil {
+			result.Weights = override.Weights
+		} else {
+			if override.Weights.User > 0 {
+				result.Weights.User = override.Weights.User
+			}
+			if override.Weights.Hook > 0 {
+				result.Weights.Hook = override.Weights.Hook
+			}
+			if override.Weights.Auto > 0 {
+				result.Weights.Auto = override.Weights.Auto
+			}
+		}
+	}
+
+	// Merge Options config
+	if override.Options != nil {
+		if result.Options == nil {
+			result.Options = override.Options
+		} else {
+			if override.Options.SkipThreshold > 0 {
+				result.Options.SkipThreshold = override.Options.SkipThreshold
+			}
+		}
+	}
+
+	return &result
+}
+
+// GetSearchConfig returns the global search configuration
+func GetSearchConfig() *searchTypes.Config {
+	if agentDSL == nil {
+		return searchDefaults.SystemDefaults
+	}
+	return agentDSL.Search
 }
 
 // defaultAssistant get the default assistant
 func defaultAssistant() (*assistant.Assistant, error) {
-	if api.Agent.DSL.Use == nil || api.Agent.DSL.Use.Default == "" {
+	if agentDSL.Uses == nil || agentDSL.Uses.Default == "" {
 		return nil, fmt.Errorf("default assistant not found")
 	}
-	return assistant.Get(api.Agent.DSL.Use.Default)
+	return assistant.Get(agentDSL.Uses.Default)
 }

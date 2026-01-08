@@ -4,7 +4,6 @@ import (
 	stdContext "context"
 	"testing"
 
-	"github.com/yaoapp/gou/plan"
 	"github.com/yaoapp/yao/agent/assistant"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/testutils"
@@ -27,14 +26,14 @@ func BenchmarkSimpleStandardMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx := newBenchContext("bench-simple-standard", "tests.create")
-		_, err := agent.Script.Create(ctx, []context.Message{
+		_, _, err := agent.HookScript.Create(ctx, []context.Message{
 			{Role: "user", Content: "Hello"},
 		})
 		if err != nil {
@@ -54,14 +53,14 @@ func BenchmarkSimplePerformanceMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx := newBenchContext("bench-simple-performance", "tests.create")
-		_, err := agent.Script.Create(ctx, []context.Message{
+		_, _, err := agent.HookScript.Create(ctx, []context.Message{
 			{Role: "user", Content: "Hello"},
 		})
 		if err != nil {
@@ -85,7 +84,7 @@ func BenchmarkBusinessStandardMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -95,7 +94,7 @@ func BenchmarkBusinessStandardMode(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		scenario := scenarios[i%len(scenarios)]
 		ctx := newBenchContext("bench-business-standard", "tests.create")
-		_, err := agent.Script.Create(ctx, []context.Message{
+		_, _, err := agent.HookScript.Create(ctx, []context.Message{
 			{Role: "user", Content: scenario.content},
 		})
 		if err != nil {
@@ -115,7 +114,7 @@ func BenchmarkBusinessPerformanceMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -125,7 +124,7 @@ func BenchmarkBusinessPerformanceMode(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		scenario := scenarios[i%len(scenarios)]
 		ctx := newBenchContext("bench-business-performance", "tests.create")
-		_, err := agent.Script.Create(ctx, []context.Message{
+		_, _, err := agent.HookScript.Create(ctx, []context.Message{
 			{Role: "user", Content: scenario.content},
 		})
 		if err != nil {
@@ -150,7 +149,7 @@ func BenchmarkConcurrentSimpleStandardMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -159,7 +158,7 @@ func BenchmarkConcurrentSimpleStandardMode(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			ctx := newBenchContext("bench-concurrent-simple-standard", "tests.create")
-			_, err := agent.Script.Create(ctx, []context.Message{
+			_, _, err := agent.HookScript.Create(ctx, []context.Message{
 				{Role: "user", Content: "Hello"},
 			})
 			if err != nil {
@@ -182,7 +181,7 @@ func BenchmarkConcurrentSimplePerformanceMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -191,7 +190,7 @@ func BenchmarkConcurrentSimplePerformanceMode(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			ctx := newBenchContext("bench-concurrent-simple", "tests.create")
-			_, err := agent.Script.Create(ctx, []context.Message{
+			_, _, err := agent.HookScript.Create(ctx, []context.Message{
 				{Role: "user", Content: "Hello"},
 			})
 			if err != nil {
@@ -214,7 +213,7 @@ func BenchmarkConcurrentBusinessStandardMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -226,7 +225,7 @@ func BenchmarkConcurrentBusinessStandardMode(b *testing.B) {
 		for pb.Next() {
 			scenario := scenarios[i%len(scenarios)]
 			ctx := newBenchContext("bench-concurrent-business-standard", "tests.create")
-			_, err := agent.Script.Create(ctx, []context.Message{
+			_, _, err := agent.HookScript.Create(ctx, []context.Message{
 				{Role: "user", Content: scenario.content},
 			})
 			if err != nil {
@@ -249,7 +248,7 @@ func BenchmarkConcurrentBusinessPerformanceMode(b *testing.B) {
 		b.Fatalf("Failed to get assistant: %s", err.Error())
 	}
 
-	if agent.Script == nil {
+	if agent.HookScript == nil {
 		b.Fatalf("Assistant has no script")
 	}
 
@@ -261,7 +260,7 @@ func BenchmarkConcurrentBusinessPerformanceMode(b *testing.B) {
 		for pb.Next() {
 			scenario := scenarios[i%len(scenarios)]
 			ctx := newBenchContext("bench-concurrent-business", "tests.create")
-			_, err := agent.Script.Create(ctx, []context.Message{
+			_, _, err := agent.HookScript.Create(ctx, []context.Message{
 				{Role: "user", Content: scenario.content},
 			})
 			if err != nil {
@@ -296,35 +295,32 @@ func getBusinessScenarios() []struct {
 
 // newBenchContext creates a minimal context for benchmarking
 func newBenchContext(chatID, assistantID string) *context.Context {
-	return &context.Context{
-		Context:     stdContext.Background(),
-		Space:       plan.NewMemorySharedSpace(),
-		ChatID:      chatID,
-		AssistantID: assistantID,
-		Connector:   "",
-		Locale:      "en-us",
-		Theme:       "light",
-		Client: context.Client{
-			Type:      "web",
-			UserAgent: "BenchAgent/1.0",
-			IP:        "127.0.0.1",
-		},
-		Referer:  context.RefererAPI,
-		Accept:   context.AcceptWebCUI,
-		Route:    "",
-		Metadata: make(map[string]interface{}),
-		Authorized: &types.AuthorizedInfo{
-			Subject:  "bench-user",
-			ClientID: "bench-client",
-			UserID:   "bench-user-123",
-			TeamID:   "bench-team-456",
-			TenantID: "bench-tenant-789",
-			Constraints: types.DataConstraints{
-				TeamOnly: true,
-				Extra: map[string]interface{}{
-					"department": "engineering",
-				},
+	authorized := &types.AuthorizedInfo{
+		Subject:  "bench-user",
+		ClientID: "bench-client",
+		UserID:   "bench-user-123",
+		TeamID:   "bench-team-456",
+		TenantID: "bench-tenant-789",
+		Constraints: types.DataConstraints{
+			TeamOnly: true,
+			Extra: map[string]interface{}{
+				"department": "engineering",
 			},
 		},
 	}
+
+	ctx := context.New(stdContext.Background(), authorized, chatID)
+	ctx.AssistantID = assistantID
+	ctx.Locale = "en-us"
+	ctx.Theme = "light"
+	ctx.Client = context.Client{
+		Type:      "web",
+		UserAgent: "BenchAgent/1.0",
+		IP:        "127.0.0.1",
+	}
+	ctx.Referer = context.RefererAPI
+	ctx.Accept = context.AcceptWebCUI
+	ctx.Route = ""
+	ctx.Metadata = make(map[string]interface{})
+	return ctx
 }

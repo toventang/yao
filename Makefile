@@ -11,11 +11,17 @@ OS := $(shell uname)
 
 # ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 TESTFOLDER := $(shell $(GO) list ./... | grep -vE 'examples|openai|aigc|neo|twilio|share*' | awk '!/\/tests\// || /openapi\/tests/')
+# Core tests (exclude AI-related: agent, aigc, openai, and KB)
+TESTFOLDER_CORE := $(shell $(GO) list ./... | grep -vE 'examples|openai|aigc|neo|twilio|share*|agent|kb' | awk '!/\/tests\// || /openapi\/tests/')
+# AI tests (agent, aigc) - exclude agent/search/handlers/web (requires external API keys)
+TESTFOLDER_AI := $(shell $(GO) list ./agent/... ./aigc/... | grep -v 'agent/search/handlers/web')
+# KB tests (kb)
+TESTFOLDER_KB := $(shell $(GO) list ./kb/...)
 TESTTAGS ?= ""
 
 # TESTWIDGETS := $(shell $(GO) list ./widgets/...)
 
-# Unit Test
+# Unit Test (all tests)
 .PHONY: unit-test
 unit-test:
 	echo "mode: count" > coverage.out
@@ -41,14 +47,104 @@ unit-test:
 		fi; \
 	done
 
+# Core Unit Test (exclude AI-related tests)
+.PHONY: unit-test-core
+unit-test-core:
+	echo "mode: count" > coverage.out
+	for d in $(TESTFOLDER_CORE); do \
+		$(GO) test -tags $(TESTTAGS) -v -covermode=count -coverprofile=profile.out -coverpkg=$$(echo $$d | sed "s/\/test$$//g") -skip='TestMemoryLeak|TestIsolateDisposal' $$d > tmp.out; \
+		cat tmp.out; \
+		if grep -q "^--- FAIL" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "build failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "setup failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "runtime error" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		fi; \
+		if [ -f profile.out ]; then \
+			cat profile.out | grep -v "mode:" >> coverage.out; \
+			rm profile.out; \
+		fi; \
+	done
+
+# AI Unit Test (agent, aigc)
+.PHONY: unit-test-ai
+unit-test-ai:
+	echo "mode: count" > coverage.out
+	for d in $(TESTFOLDER_AI); do \
+		$(GO) test -tags $(TESTTAGS) -v -timeout=20m -covermode=count -coverprofile=profile.out -coverpkg=$$(echo $$d | sed "s/\/test$$//g") -skip='TestMemoryLeak|TestIsolateDisposal' $$d > tmp.out; \
+		cat tmp.out; \
+		if grep -q "^--- FAIL" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "^FAIL" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "^panic:" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "build failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "setup failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "runtime error" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		fi; \
+		if [ -f profile.out ]; then \
+			cat profile.out | grep -v "mode:" >> coverage.out; \
+			rm profile.out; \
+		fi; \
+	done
+
+# KB Unit Test (kb)
+.PHONY: unit-test-kb
+unit-test-kb:
+	echo "mode: count" > coverage.out
+	for d in $(TESTFOLDER_KB); do \
+		$(GO) test -tags $(TESTTAGS) -v -timeout=20m -covermode=count -coverprofile=profile.out -coverpkg=$$(echo $$d | sed "s/\/test$$//g") -skip='TestMemoryLeak|TestIsolateDisposal|TestSearchCleanup' $$d > tmp.out; \
+		cat tmp.out; \
+		if grep -q "^--- FAIL" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "^FAIL" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "^panic:" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "build failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "setup failed" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		elif grep -q "runtime error" tmp.out; then \
+			rm tmp.out; \
+			exit 1; \
+		fi; \
+		if [ -f profile.out ]; then \
+			cat profile.out | grep -v "mode:" >> coverage.out; \
+			rm profile.out; \
+		fi; \
+	done
+
 # Benchmark Test
 .PHONY: benchmark
 benchmark:
 	@echo ""
 	@echo "============================================="
-	@echo "Running Benchmark Tests (agent only)..."
+	@echo "Running Benchmark Tests (agent & trace)..."
 	@echo "============================================="
-	@for d in $$($(GO) list ./agent/...); do \
+	@for d in $$($(GO) list ./agent/... ./trace/...); do \
 		if $(GO) test -list=Benchmark $$d 2>/dev/null | grep -q "^Benchmark"; then \
 			echo ""; \
 			echo "📊 Benchmarking: $$d"; \
@@ -66,14 +162,14 @@ benchmark:
 memory-leak:
 	@echo ""
 	@echo "============================================="
-	@echo "Running Memory Leak Detection (agent only)..."
+	@echo "Running Memory Leak Detection (agent & trace)..."
 	@echo "============================================="
-	@for d in $$($(GO) list ./agent/...); do \
-		if $(GO) test -list='TestMemoryLeak|TestIsolateDisposal' $$d 2>/dev/null | grep -qE "^Test(MemoryLeak|IsolateDisposal)"; then \
+	@for d in $$($(GO) list ./agent/... ./trace/...); do \
+		if $(GO) test -list='TestMemoryLeak|TestIsolateDisposal|TestGoroutineLeak' $$d 2>/dev/null | grep -qE "^Test(MemoryLeak|IsolateDisposal|GoroutineLeak)"; then \
 			echo ""; \
 			echo "🔍 Memory Leak Detection: $$d"; \
 			echo "---------------------------------------------"; \
-			$(GO) test -run='TestMemoryLeak|TestIsolateDisposal' -v $$d || exit 1; \
+			$(GO) test -run='TestMemoryLeak|TestIsolateDisposal|TestGoroutineLeak' -v -timeout=5m $$d || exit 1; \
 		fi; \
 	done
 	@echo ""
