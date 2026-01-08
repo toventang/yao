@@ -1,0 +1,65 @@
+name: Sync from Parent (Fork)
+
+on:
+  schedule:
+    - cron: '0 */24 * * *'  # 每24小时同步一次
+  workflow_dispatch:
+
+jobs:
+  sync-parent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check current repo info
+        id: repo_info
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // 获取当前仓库信息（包含parent信息）
+            const repo = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            if (!repo.data.parent) {
+              throw new Error('This repository is not a fork');
+            }
+            
+            // 获取父仓库的默认分支
+            const parentRepo = await github.rest.repos.get({
+              owner: repo.data.parent.owner.login,
+              repo: repo.data.parent.name
+            });
+            
+            // 获取父仓库最新提交
+            const latestCommit = await github.rest.repos.getCommit({
+              owner: repo.data.parent.owner.login,
+              repo: repo.data.parent.name,
+              ref: parentRepo.data.default_branch
+            });
+            
+            // 设置输出
+            core.setOutput('parent_repo', repo.data.parent.full_name);
+            core.setOutput('parent_branch', parentRepo.data.default_branch);
+            core.setOutput('latest_commit_sha', latestCommit.data.sha.substring(0, 7));
+            core.setOutput('latest_commit_msg', latestCommit.data.commit.message.split('\n')[0]);
+            
+            console.log(`Parent: ${repo.data.parent.full_name}`);
+            console.log(`Branch: ${parentRepo.data.default_branch}`);
+            console.log(`Latest: ${latestCommit.data.sha.substring(0, 7)}`);
+
+      - name: Sync files
+        uses: champ-oss/file-sync@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repo: ${{ steps.repo_info.outputs.parent_repo }}
+          repo-branch: ${{ steps.repo_info.outputs.parent_branch }}
+          commit-message: "chore: sync from parent (${{ steps.repo_info.outputs.latest_commit_sha }})"
+
+      - name: Create summary
+        if: always()
+        run: |
+          echo "从父仓库同步完成：" > summary.md
+          echo "- 父仓库: ${{ steps.repo_info.outputs.parent_repo }}" >> summary.md
+          echo "- 分支: ${{ steps.repo_info.outputs.parent_branch }}" >> summary.md
+          echo "- 基于提交: ${{ steps.repo_info.outputs.latest_commit_sha }}" >> summary.md
+          cat summary.md >> $GITHUB_STEP_SUMMARY
