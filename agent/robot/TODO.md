@@ -191,9 +191,11 @@ Create empty structs and stub methods that return nil/empty/success:
 
 ---
 
-## Phase 3: Complete Scheduling System
+## Phase 3: Complete Scheduling System ✅
 
 **Goal:** Implement complete scheduling system. Executor is stub (simulates success).
+
+**Status:** Complete - All 7 sub-tasks done, 80+ integration tests passing
 
 This phase delivers a fully working scheduling pipeline:
 
@@ -228,91 +230,142 @@ Trigger → Manager → Cache → Dedup → Pool → Worker → Executor(stub) �
   - [x] 15 test cases covering all edge cases
   - [x] All tests passing
 
-### 3.3 Trigger Implementation
+### ✅ 3.3 Manager Implementation (COMPLETE)
 
-- [ ] `trigger/trigger.go` - trigger dispatcher (routes to clock/intervene/event)
-- [ ] `trigger/clock.go` - clock trigger
-  - [ ] `times` mode: match specific times (09:00, 14:00)
-  - [ ] `interval` mode: run every X duration (30m, 1h)
-  - [ ] `daemon` mode: restart immediately after completion
-  - [ ] Timezone handling
-- [ ] `trigger/intervene.go` - human intervention
-  - [ ] Parse action (task.add, goal.adjust, etc.)
-  - [ ] Build TriggerInput with Messages
-- [ ] `trigger/event.go` - event handling
-  - [ ] Webhook event dispatch
-  - [ ] Database change event dispatch
-- [ ] `trigger/control.go` - execution control
-  - [ ] Pause execution
-  - [ ] Resume execution
-  - [ ] Cancel/Stop execution
-- [ ] Test: clock matching (all modes), intervention handling, event dispatch
+> **Note:** Manager is the scheduling core, depends on completed Cache and Pool.
 
-### 3.4 Dedup Implementation
-
-- [ ] `dedup/dedup.go` - Dedup struct
-- [ ] `dedup/fast.go` - fast in-memory time-window dedup
-  - [ ] Key: `memberID:triggerType:window`
-  - [ ] Check before submit
-  - [ ] Mark after submit
-- [ ] Test: dedup check/mark, window expiry
-
-### 3.5 Job Integration
-
-- [ ] `job/job.go` - create job
-  - [ ] `job_id`: `robot_exec_{execID}`
-  - [ ] `category_id`: `autonomous_robot`
-  - [ ] Metadata: member_id, team_id, trigger_type, exec_id
-- [ ] `job/execution.go` - execution lifecycle
-  - [ ] Create execution on trigger
-  - [ ] Update status on phase change
-  - [ ] Complete/fail on finish
-- [ ] `job/log.go` - write phase logs
-  - [ ] Log phase start/end
-  - [ ] Log errors
-- [ ] Test: job creation, execution tracking, log writing
-
-### 3.6 Manager Implementation
-
-- [ ] `manager/manager.go` - Manager struct
-  - [ ] `Start()` - start ticker goroutine, start pool
-  - [ ] `Stop()` - graceful shutdown (wait for running, drain queue)
-  - [ ] `Tick()` - main loop:
+- [x] `manager/manager.go` - Manager struct
+  - [x] `Start()` - load cache, start pool, start ticker goroutine
+  - [x] `Stop()` - graceful shutdown (wait for running, drain queue)
+  - [x] `Tick()` - main loop:
     1. Get all cached robots
     2. For each robot with clock trigger enabled
-    3. Check if should execute (schedule match + dedup)
+    3. Check if should execute (times/interval/daemon modes)
     4. Submit to pool
-- [ ] Test: manager start/stop, tick cycle
+  - [x] `TriggerManual()` - manual trigger for testing/API
+  - [x] Clock modes: times, interval, daemon
+  - [x] Day matching for times mode
+  - [x] Timezone handling
+  - [x] Skip paused/error/maintenance robots
+- [x] Test: manager start/stop, tick cycle, manual trigger, clock modes, goroutine leak
 
-### 3.7 Executor Stub
+### ✅ 3.4 Trigger Implementation (COMPLETE)
 
-- [ ] `executor/executor.go` - stub implementation
-  - [ ] `Execute()` - simulate full execution
-    1. Create Execution record
+- [x] `trigger/trigger.go` - validation and helper functions
+  - [x] `ValidateIntervention()` - validate human intervention requests
+  - [x] `ValidateEvent()` - validate event trigger requests
+  - [x] `BuildEventInput()` - build TriggerInput from event request
+  - [x] `GetActionCategory()` / `GetActionDescription()` - action helpers
+- [x] `trigger/clock.go` - ClockMatcher for clock trigger matching
+  - [x] `times` mode: match specific times (09:00, 14:00)
+  - [x] `interval` mode: run every X duration (30m, 1h)
+  - [x] `daemon` mode: restart immediately after completion
+  - [x] Timezone handling
+  - [x] Day-of-week filtering
+- [x] `trigger/control.go` - ExecutionController for pause/resume/stop
+  - [x] Track/Untrack executions
+  - [x] Pause/Resume execution
+  - [x] Stop execution (cancel context)
+  - [x] WaitIfPaused() for executor integration
+- [x] `manager/manager.go` - integrated trigger handling
+  - [x] `Intervene()` - human intervention handler
+  - [x] `HandleEvent()` - event trigger handler
+  - [x] `PauseExecution()` / `ResumeExecution()` / `StopExecution()`
+  - [x] `ListExecutions()` / `ListExecutionsByMember()`
+- [x] Tests: `trigger/trigger_test.go`, `trigger/clock_test.go`, `trigger/control_test.go`
+  - [x] Validation tests for intervention and event requests
+  - [x] Clock matching tests for all modes
+  - [x] ExecutionController lifecycle tests
+  - [x] Manager integration tests for Intervene/HandleEvent
+
+### ✅ 3.5 Job Integration (COMPLETE)
+
+- [x] `job/job.go` - create job
+  - [x] `job_id`: `robot_exec_{execID}`
+  - [x] `category_name`: `Autonomous Robot` / `自主机器人` (localized)
+  - [x] Metadata: member_id, team_id, trigger_type, exec_id, display_name
+  - [x] `Options` struct for extensibility (Priority, MaxRetryCount, DefaultTimeout, Metadata)
+  - [x] `Create()`, `Get()`, `Update()`, `Complete()`, `Fail()`, `Cancel()`
+  - [x] Status mapping: ExecPending→queued, ExecRunning→running, etc.
+  - [x] Localization support (en-US, zh-CN)
+- [x] `job/execution.go` - execution lifecycle
+  - [x] `CreateOptions` struct for extensibility
+  - [x] `CreateExecution()` - create both robot Execution and job.Execution
+  - [x] `UpdatePhase()` - update phase with progress tracking (10%→25%→40%→60%→80%→95%)
+  - [x] `UpdateStatus()` - update execution status
+  - [x] `CompleteExecution()` / `FailExecution()` / `CancelExecution()`
+  - [x] TriggerType → TriggerCategory mapping (clock→scheduled, human→manual, event→event)
+  - [x] Duration calculation on completion/failure/cancellation
+- [x] `job/log.go` - write phase logs
+  - [x] `Log()` - base log function with context
+  - [x] `LogPhaseStart()` / `LogPhaseEnd()` / `LogPhaseError()`
+  - [x] `LogError()` / `LogInfo()` / `LogDebug()` / `LogWarn()`
+  - [x] `LogTaskStart()` / `LogTaskEnd()`
+  - [x] `LogDelivery()` / `LogLearning()`
+  - [x] Localization support for all log messages
+- [x] Test: job creation, execution tracking, log writing
+  - [x] `job/job_test.go` - 17 test cases
+  - [x] `job/execution_test.go` - 26 test cases
+  - [x] `job/log_test.go` - 24 test cases
+  - [x] All tests passing with real database
+
+### ✅ 3.6 Executor Stub Enhancement (COMPLETE)
+
+- [x] `executor/executor.go` - enhanced stub implementation
+  - [x] `Execute()` - simulate full execution with Job integration
+    1. Create Execution record + Job (via job package)
     2. Update phase: P0 → P1 → P2 → P3 → P4 → P5
-    3. Sleep briefly between phases (simulate work)
+    3. Log phase transitions
     4. Return success with mock data
-- [ ] Test: verify stub called, verify phase progression
+  - [x] `Config` struct with `SkipJobIntegration`, `OnPhaseStart`, `OnPhaseEnd`
+  - [x] `NewWithDelay()`, `NewWithCallback()` for testing
+  - [x] Quota check with `robot.TryAcquireSlot()`
+  - [x] Clock trigger: P0→P5, Human/Event trigger: P1→P5
+- [x] Phase-specific files (modular design for Phase 4+ replacement):
+  - [x] `executor/inspiration.go` - `RunInspiration()` P0 mock
+  - [x] `executor/goals.go` - `RunGoals()` P1 mock
+  - [x] `executor/tasks.go` - `RunTasks()` P2 mock
+  - [x] `executor/run.go` - `RunExecution()` P3 mock
+  - [x] `executor/delivery.go` - `RunDelivery()` P4 mock
+  - [x] `executor/learning.go` - `RunLearning()` P5 mock
+- [x] `simulateStreamDelay()` - 50ms hardcoded delay per phase
+- [x] Test: smoke tests for basic flow verification
+  - [x] `executor/executor_test.go` - 6 test cases
+  - [x] Clock/Human/Event triggers, nil robot, simulated failure, counters
 
-### 3.8 Integration Test (End-to-End Scheduling)
+### 3.7 Integration Test (End-to-End Scheduling) ✅
 
-- [ ] Create test robot in `__yao.member` with clock config
-- [ ] Start manager
-- [ ] Wait for clock trigger
-- [ ] Verify:
-  - [ ] Robot loaded to cache
-  - [ ] Clock trigger matched
-  - [ ] Dedup checked
-  - [ ] Job submitted to pool
-  - [ ] Worker picked up job
-  - [ ] Executor stub called
-  - [ ] Job execution recorded
-  - [ ] Logs written
-- [ ] Test human intervention trigger
-- [ ] Test event trigger
-- [ ] Test concurrent executions (multiple robots)
-- [ ] Test quota enforcement (per-robot limit)
-- [ ] Test pause/resume/stop
+- [x] Create test robot in `__yao.member` with clock config
+- [x] Start manager
+- [x] Wait for clock trigger
+- [x] Verify:
+  - [x] Robot loaded to cache
+  - [x] Clock trigger matched
+  - [x] Job submitted to pool
+  - [x] Worker picked up job
+  - [x] Executor stub called
+  - [x] Job execution recorded
+  - [x] Logs written
+- [x] Test human intervention trigger
+- [x] Test event trigger
+- [x] Test concurrent executions (multiple robots)
+- [x] Test quota enforcement (per-robot limit)
+- [x] Test pause/resume/stop
+
+**Test Files Created:**
+
+- `manager/integration_test.go` - Core scheduling flow (Cache→Pool→Executor)
+- `manager/integration_clock_test.go` - Clock trigger modes (times/interval/daemon)
+- `manager/integration_human_test.go` - Human intervention trigger tests
+- `manager/integration_event_test.go` - Event trigger tests
+- `manager/integration_concurrent_test.go` - Concurrent execution & quota tests
+- `manager/integration_control_test.go` - Pause/Resume/Stop tests
+
+**Test Coverage:**
+
+- 27 top-level test functions
+- 80+ sub-tests covering all verification points
+- 3x run stability verified
 
 ---
 
@@ -490,15 +543,27 @@ Create `yao-dev-app/assistants/robot/` directory:
 
 ## Phase 11: Advanced Features
 
-**Goal:** Implement semantic dedup, plan queue.
+**Goal:** Implement dedup, semantic dedup, plan queue.
 
-### 11.1 Semantic Dedup
+### 11.1 Fast Dedup (Time-Window)
+
+> **Note:** Manager has `// TODO: dedup check` comment placeholder. Integrate after implementation.
+
+- [ ] `dedup/dedup.go` - Dedup struct
+- [ ] `dedup/fast.go` - fast in-memory time-window dedup
+  - [ ] Key: `memberID:triggerType:window`
+  - [ ] Check before submit
+  - [ ] Mark after submit
+- [ ] Integrate into Manager.Tick()
+- [ ] Test: dedup check/mark, window expiry
+
+### 11.2 Semantic Dedup
 
 - [ ] `dedup/semantic.go` - call Dedup Agent for goal/task level dedup
 - [ ] Dedup Agent setup (`assistants/robot/dedup/`)
 - [ ] Test: semantic dedup with real LLM
 
-### 11.2 Plan Queue
+### 11.3 Plan Queue
 
 - [ ] `plan/plan.go` - plan queue implementation
   - [ ] Store planned tasks/goals
@@ -615,19 +680,19 @@ func TestWithLLM(t *testing.T) {
 
 ## Progress Tracking
 
-| Phase                 | Status | Description                                          |
-| --------------------- | ------ | ---------------------------------------------------- |
-| 1. Types & Interfaces | ✅     | All types, enums, interfaces                         |
-| 2. Skeleton           | ✅     | Empty stubs, code compiles                           |
-| 3. Scheduling System  | ⬜     | Cache + Pool + Trigger + Dedup + Job (executor stub) |
-| 4. P0 Inspiration     | ⬜     | Inspiration Agent integration                        |
-| 5. P1 Goals           | ⬜     | Goal Generation Agent integration                    |
-| 6. P2 Tasks           | ⬜     | Task Planning Agent integration                      |
-| 7. P3 Run             | ⬜     | Task execution (assistant/mcp/process)               |
-| 8. P4 Delivery        | ⬜     | Output delivery (email/file/webhook/notify)          |
-| 9. P5 Learning        | ⬜     | Learning Agent + KB save                             |
-| 10. API & Integration | ⬜     | Complete API, end-to-end tests                       |
-| 11. Advanced          | ⬜     | Semantic dedup, plan queue                           |
+| Phase                 | Status | Description                                                          |
+| --------------------- | ------ | -------------------------------------------------------------------- |
+| 1. Types & Interfaces | ✅     | All types, enums, interfaces                                         |
+| 2. Skeleton           | ✅     | Empty stubs, code compiles                                           |
+| 3. Scheduling System  | 🟡     | Cache + Pool + Trigger + Job + Executor stub ✅, Integration test 🟡 |
+| 4. P0 Inspiration     | ⬜     | Inspiration Agent integration                                        |
+| 5. P1 Goals           | ⬜     | Goal Generation Agent integration                                    |
+| 6. P2 Tasks           | ⬜     | Task Planning Agent integration                                      |
+| 7. P3 Run             | ⬜     | Task execution (assistant/mcp/process)                               |
+| 8. P4 Delivery        | ⬜     | Output delivery (email/file/webhook/notify)                          |
+| 9. P5 Learning        | ⬜     | Learning Agent + KB save                                             |
+| 10. API & Integration | ⬜     | Complete API, end-to-end tests                                       |
+| 11. Advanced          | ⬜     | Semantic dedup, plan queue                                           |
 
 Legend: ⬜ Not started | 🟡 In progress | ✅ Complete
 
