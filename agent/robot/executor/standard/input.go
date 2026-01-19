@@ -300,6 +300,23 @@ func (f *InputFormatter) FormatGoals(goals *robottypes.Goals, robot *robottypes.
 	sb.WriteString(goals.Content)
 	sb.WriteString("\n")
 
+	// Delivery target (from P1) - important for task planning
+	// Tasks should be designed to produce output suitable for the delivery method
+	if goals.Delivery != nil {
+		sb.WriteString("\n## Delivery Target\n\n")
+		sb.WriteString(fmt.Sprintf("- **Type**: %s\n", goals.Delivery.Type))
+		if len(goals.Delivery.Recipients) > 0 {
+			sb.WriteString(fmt.Sprintf("- **Recipients**: %s\n", strings.Join(goals.Delivery.Recipients, ", ")))
+		}
+		if goals.Delivery.Format != "" {
+			sb.WriteString(fmt.Sprintf("- **Format**: %s\n", goals.Delivery.Format))
+		}
+		if goals.Delivery.Template != "" {
+			sb.WriteString(fmt.Sprintf("- **Template**: %s\n", goals.Delivery.Template))
+		}
+		sb.WriteString("\n**Note**: Design tasks to produce output suitable for this delivery method.\n")
+	}
+
 	// Available resources - reuse FormatAvailableResources for consistency
 	resourcesContent := f.FormatAvailableResources(robot)
 	if resourcesContent != "" {
@@ -494,11 +511,16 @@ func (f *InputFormatter) FormatExecutionSummary(exec *robottypes.Execution) stri
 	// Delivery (P4)
 	if exec.Delivery != nil {
 		sb.WriteString("## Delivery (P4)\n\n")
-		sb.WriteString(fmt.Sprintf("- **Type**: %s\n", exec.Delivery.Type))
+		if exec.Delivery.Content != nil {
+			sb.WriteString(fmt.Sprintf("- **Summary**: %s\n", exec.Delivery.Content.Summary))
+		}
 		if exec.Delivery.Success {
 			sb.WriteString("- **Status**: ✓ Success\n")
 		} else {
 			sb.WriteString(fmt.Sprintf("- **Status**: ✗ Failed (%s)\n", exec.Delivery.Error))
+		}
+		if len(exec.Delivery.Results) > 0 {
+			sb.WriteString(fmt.Sprintf("- **Channels**: %d\n", len(exec.Delivery.Results)))
 		}
 		sb.WriteString("\n")
 	}

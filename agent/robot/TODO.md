@@ -62,7 +62,7 @@
 - [x] `RobotStatus` - robot status (idle, working, paused, error, maintenance)
 - [x] `InterventionAction` - human actions (task.add, goal.adjust, etc.)
 - [x] `Priority` - priority levels (high, normal, low)
-- [x] `DeliveryType` - delivery types (email, file, webhook, notify)
+- [x] `DeliveryType` - delivery types (email, webhook, process, notify)
 - [x] `DedupResult` - dedup results (skip, merge, proceed)
 - [x] `EventSource` - event sources (webhook, database)
 - [x] `LearningType` - learning types (execution, feedback, insight)
@@ -555,7 +555,7 @@ yao-dev-app/assistants/
 
 - [x] `robot/delivery/package.yao` - config
 - [x] `robot/delivery/prompts.yml` - system prompt:
-  - Input: Task results, delivery target (email, report, notification)
+  - Input: Full execution context (P0-P3 results)
   - Output: Formatted delivery content
   - Style: Clear, professional
 
@@ -663,82 +663,203 @@ Each phase test uses different expert combinations:
 
 ---
 
-## Phase 7: P1 Goals Implementation
+## Phase 7: P1 Goals Implementation ✅
 
 **Goal:** Implement P1 (Goal Generation Agent). P0 → P1 → stub P2-P5.
 
 **Depends on:** Phase 6 (P0 Inspiration)
 
+**Status:** COMPLETED
+
 ### 7.1 P1 Implementation
 
-- [ ] `executor/goals.go` - `RunGoals(ctx, exec, data)` - real implementation
-- [ ] `executor/goals.go` - build prompt with inspiration report
-- [ ] `executor/goals.go` - call Goals Agent
-- [ ] `executor/goals.go` - parse response to `Goals` struct
-- [ ] `executor/goals.go` - handle Human/Event trigger (skip P0, use input directly)
+- [x] `executor/goals.go` - `RunGoals(ctx, exec, data)` - real implementation
+- [x] `executor/goals.go` - build prompt with inspiration report (Clock trigger)
+- [x] `executor/goals.go` - build prompt with trigger input (Human/Event trigger)
+- [x] `executor/goals.go` - call Goals Agent using `AgentCaller`
+- [x] `executor/goals.go` - parse response to `Goals` struct (JSON with content + delivery)
+- [x] `executor/goals.go` - handle Human/Event trigger (skip P0, use input directly)
+- [x] `executor/goals.go` - include robot identity in prompt
+- [x] `executor/goals.go` - include available resources in prompt
+- [x] `executor/goals.go` - `ParseDelivery()` - parse delivery target from JSON
+- [x] `executor/goals.go` - `IsValidDeliveryType()` - validate delivery types
 
 ### 7.2 Tests
 
-- [ ] `executor/goals_test.go` - P1 with real LLM call
-- [ ] Test: inspiration report in prompt (Clock trigger)
-- [ ] Test: user input in prompt (Human trigger)
-- [ ] Test: goals markdown generated with priorities
-- [ ] Test: goals are actionable and measurable
+- [x] `executor/goals_test.go` - P1 with real LLM call (14 test cases)
+- [x] Test: inspiration report in prompt (Clock trigger)
+- [x] Test: user input in prompt (Human trigger)
+- [x] Test: event data in prompt (Event trigger)
+- [x] Test: goals markdown generated with priorities
+- [x] Test: delivery parsing from agent response
+- [x] Test: error handling (robot nil, agent not found, empty input)
+- [x] Test: fallback behavior (no inspiration → clock context)
+- [x] `ParseDelivery()` unit tests (8 test cases covering edge cases)
+- [x] `IsValidDeliveryType()` unit tests
+
+### 7.3 Notes
+
+- P1 uses `robot.goals` test agent from `yao-dev-app/assistants/robot/goals/`
+- Goals Agent returns JSON: `{ "content": "...", "delivery": {...} }`
+- Delivery is optional; if not present or invalid, `Goals.Delivery` is nil
+- Available resources (agents, MCP, KB, DB) are passed to agent for achievable goal generation
 
 ---
 
-## Phase 8: P2 Tasks Implementation
+## Phase 8: P2 Tasks Implementation ✅
 
 **Goal:** Implement P2 (Task Planning Agent). P1 → P2 → stub P3-P5.
 
 **Depends on:** Phase 7 (P1 Goals)
 
-### 8.1 P2 Implementation
+**Status:** COMPLETED
 
-- [ ] `executor/tasks.go` - `RunTasks(ctx, exec, data)` - real implementation
-- [ ] `executor/tasks.go` - build prompt with goals
-- [ ] `executor/tasks.go` - include available tools/agents in prompt
-- [ ] `executor/tasks.go` - call Tasks Agent
-- [ ] `executor/tasks.go` - parse response to `[]Task` (structured JSON)
-- [ ] `executor/tasks.go` - validate task structure
+### 8.1 Validation Agent Setup (Prerequisite for P3) ✅
 
-### 8.2 Tests
+> **Note:** Validation Agent was already set up in Phase 5.
 
-- [ ] `executor/tasks_test.go` - P2 with real LLM call
-- [ ] Test: goals included in prompt
-- [ ] Test: available tools listed in prompt
-- [ ] Test: structured tasks generated (2-3 tasks per goal)
-- [ ] Test: each task has valid executor type and ID
+- [x] `robot/validation/package.yao` - Validation Agent config (DeepSeek V3, temperature 0.2)
+- [x] `robot/validation/prompts.yml` - validation prompts
+  - Input: Task result, expected outcome, validation rules
+  - Output: Validation result (pass/fail, score, issues, suggestions)
+
+### 8.2 P2 Implementation ✅
+
+- [x] `executor/tasks.go` - `RunTasks(ctx, exec, data)` - real implementation
+- [x] `executor/tasks.go` - build prompt with goals (using `FormatGoals`)
+- [x] `executor/tasks.go` - include available tools/agents in prompt
+- [x] `executor/tasks.go` - include delivery target in prompt (for task output format)
+- [x] `executor/tasks.go` - call Tasks Agent using `AgentCaller`
+- [x] `executor/tasks.go` - parse response to `[]Task` (structured JSON)
+- [x] `executor/tasks.go` - validate task structure (executor type, ID, messages)
+- [x] `executor/tasks.go` - `ParseTasks()`, `ParseTask()`, `ParseMessages()` helpers
+- [x] `executor/tasks.go` - `SortTasksByOrder()` - ensure correct execution sequence
+- [x] `executor/tasks.go` - `ValidateExecutorExists()` - optional executor existence check
+- [x] `executor/tasks.go` - `ValidateTasksWithResources()` - validation with warnings
+- [x] `executor/input.go` - `FormatGoals()` updated to include Delivery Target
+
+### 8.3 Tests ✅
+
+- [x] `executor/tasks_test.go` - P2 with real LLM call (7 integration tests)
+- [x] Test: goals included in prompt
+- [x] Test: available tools listed in prompt
+- [x] Test: delivery target included in prompt
+- [x] Test: structured tasks generated
+- [x] Test: each task has valid executor type and ID
+- [x] Test: each task has expected output and validation rules
+- [x] `ParseTasks` unit tests (5 tests)
+- [x] `ValidateTasks` unit tests (5 tests)
+- [x] `SortTasksByOrder` unit tests (4 tests)
+- [x] `ValidateExecutorExists` unit tests (7 tests)
+- [x] `ValidateTasksWithResources` unit tests (3 tests)
+- [x] `ParseExecutorType` unit tests (5 tests)
+- [x] `IsValidExecutorType` unit tests (2 tests)
+- [x] `FormatGoals` with delivery target tests (4 tests)
+
+### 8.4 Notes
+
+- Tasks Agent returns JSON: `{ "tasks": [...] }`
+- Each task includes: id, executor_type, executor_id, messages, expected_output, validation_rules, order
+- Tasks are sorted by `order` field after parsing
+- Executor existence is optionally validated (warnings only, doesn't block)
+- Delivery target from P1 is passed to P2 so tasks can produce appropriate output format
 
 ---
 
-## Phase 9: P3 Run Implementation
+## Phase 9: P3 Run Implementation ✅
 
-**Goal:** Implement P3 (Task Execution). P2 → P3 → stub P4-P5.
+**Goal:** Implement P3 (Task Execution + Validation). P2 → P3 → stub P4-P5.
 
-**Depends on:** Phase 8 (P2 Tasks)
+**Depends on:** Phase 8 (P2 Tasks + Validation Agent)
 
-### 9.1 Implementation
+**Status:** Complete
 
-- [ ] `executor/run.go` - `RunExecution(ctx, exec, data)` - real implementation
-- [ ] `executor/run.go` - iterate tasks in order
-- [ ] `executor/run.go` - dispatch to correct executor (assistant/mcp/process)
-- [ ] `executor/run.go` - collect results with timing
-- [ ] `executor/run.go` - handle task failures gracefully
-- [ ] `executor/run.go` - support pause/resume during execution
+### 9.1 Implementation ✅
 
-### 9.2 Validation Agent Setup
+- [x] `executor/run.go` - `RunExecution(ctx, exec, data)` - real implementation
+  - [x] `RunConfig` - configuration (ContinueOnFailure, ValidationThreshold, MaxTurnsPerTask)
+  - [x] Sequential task execution with progress tracking
+  - [x] Task status updates (Running → Completed/Failed/Skipped)
+  - [x] `ContinueOnFailure` option for graceful failure handling
+  - [x] Previous task results passed as context to subsequent tasks
+- [x] `executor/runner.go` - `Runner` struct for task execution
+  - [x] `ExecuteWithRetry()` - multi-turn conversation flow for assistant tasks
+  - [x] `executeNonAssistantTask()` - single-call execution for MCP/Process
+  - [x] `executeAssistantWithMultiTurn()` - AI assistant with conversation support
+  - [x] `ExecuteMCPTask()` - MCP tool execution (format: `clientID.toolName`)
+  - [x] `ExecuteProcessTask()` - Yao process execution
+  - [x] `BuildTaskContext()` - context with previous results
+  - [x] `BuildAssistantMessages()` - build messages for assistant
+  - [x] `FormatPreviousResultsAsContext()` - format previous results as context
+  - [x] `extractOutput()` - extract output from CallResult
+  - [x] `generateDefaultReply()` - fallback reply generation
+- [x] `executor/validator.go` - Two-layer validation system
+  - [x] Layer 1: Rule-based validation using `yao/assert`
+  - [x] Layer 2: Semantic validation using Validation Agent
+  - [x] `ValidateWithContext()` - validation with multi-turn support
+  - [x] `isComplete()` - determine if expected result is obtained
+  - [x] `checkNeedReply()` - determine if conversation should continue
+  - [x] `generateFeedbackReply()` - generate validation feedback for next turn
+  - [x] `detectNeedMoreInfo()` - detect if assistant needs clarification
+  - [x] `convertStringRule()` - natural language rules to assertions
+  - [x] `parseRules()` - JSON and string rule parsing
+  - [x] `mergeResults()` - combine rule and semantic results
 
-- [ ] `robot/validation/package.yao` - Validation Agent config
-- [ ] `robot/validation/prompts.yml` - validation prompts
+### 9.2 Assert Package ✅
+
+Created new `yao/assert` package for universal assertion/validation:
+
+- [x] `assert/types.go` - `Assertion`, `Result`, `AssertionOptions` types
+- [x] `assert/asserter.go` - `Asserter` with 8 assertion types:
+  - [x] `equals` - exact match
+  - [x] `contains` - substring check
+  - [x] `not_contains` - negative substring check
+  - [x] `json_path` - JSON path extraction and comparison
+  - [x] `regex` - regex pattern matching
+  - [x] `type` - type checking (with optional path)
+  - [x] `script` - custom script validation
+  - [x] `agent` - AI agent validation
+- [x] `assert/helpers.go` - `ValidateOutput()`, `ExtractPath()`, `ToString()`, `GetType()`
+- [x] `assert/asserter_test.go` - 98.7% test coverage
 
 ### 9.3 Tests
 
-- [ ] `executor/run_test.go` - P3 with real agent calls
-- [ ] Test: tasks executed in order
-- [ ] Test: results collected with correct structure
-- [ ] Test: task failure doesn't stop entire execution
-- [ ] Test: pause/resume works during task execution
+**Completed:**
+- [x] `assert/asserter_test.go` - 40+ test cases (98.7% coverage)
+- [x] `types/robot_test.go` - Task structure tests with validation rules
+- [x] `tasks_test.go` - ParseTasks with validation rules format
+- [x] Validation rules format aligned with `prompts.yml` guidelines
+
+**Completed Tests:**
+- [x] `executor/standard/run_test.go` - P3 RunExecution tests ✅
+  - [x] Test: tasks executed in order (`TestRunExecutionBasic`)
+  - [x] Test: task status updates (`TestRunExecutionTaskStatus`)
+  - [x] Test: remaining tasks marked as skipped on failure
+  - [x] Test: error handling (robot nil, no tasks, non-existent assistant)
+  - [x] Test: rule-based and semantic validation (`TestRunExecutionValidation`)
+  - [x] Test: previous results passed as context to subsequent tasks
+- [x] `executor/standard/runner_test.go` - Runner tests ✅
+  - [x] Test: ExecuteWithRetry with multi-turn conversation flow
+  - [x] Test: max turns limit enforcement
+  - [x] Test: BuildTaskContext with previous results
+  - [x] Test: FormatPreviousResultsAsContext formatting
+  - [x] Test: BuildAssistantMessages with task content
+  - [x] Test: FormatMessagesAsText (string, multipart, map)
+  - [x] Test: MCP and Process tasks (skipped - requires runtime)
+- [x] `executor/standard/validator_test.go` - Validator tests ✅
+  - [x] Test: ValidateWithContext with multi-turn state
+  - [x] Test: isComplete determination logic
+  - [x] Test: checkNeedReply scenarios
+  - [x] Test: convertStringRule for natural language rules
+  - [x] Test: parseRules for JSON assertions (equals, regex, json_path, type)
+  - [x] Test: validateSemantic with Validation Agent
+  - [x] Test: mergeResults logic (rule + semantic)
+
+**Completed:**
+- [x] Test: ContinueOnFailure option (run_test.go) ✅
+  - [x] `stops_on_first_failure_when_ContinueOnFailure_is_false`
+  - [x] `continues_execution_when_ContinueOnFailure_is_true`
+  - [x] `multiple_failures_with_ContinueOnFailure`
 
 ---
 
@@ -748,92 +869,285 @@ Each phase test uses different expert combinations:
 
 **Depends on:** Phase 9 (P3 Run)
 
-### 10.1 Delivery Agent Setup
+### 10.1 Execution Persistence (Prerequisite) ✅
 
-- [ ] `robot/delivery/package.yao` - Delivery Agent config
-- [ ] `robot/delivery/prompts.yml` - delivery prompts
+> **Background:** Each Robot execution (P0-P5) needs persistent storage for UI history queries.
 
-### 10.2 Implementation
+- [x] `yao/models/agent/execution.mod.yao` - Execution record model (`agent_execution` table)
+  - [x] id, execution_id (unique)
+  - [x] member_id (globally unique), team_id, job_id
+  - [x] trigger_type (enum: clock, human, event)
+  - [x] **Status tracking** (synced with runtime Execution):
+    - [x] status (enum: pending, running, completed, failed, cancelled)
+    - [x] phase (enum: inspiration, goals, tasks, run, delivery, learning)
+    - [x] current (JSON) - current executing state (task_index, progress)
+    - [x] error - error message if failed
+  - [x] input (JSON) - trigger input
+  - [x] **Phase outputs** (P0-P5):
+    - [x] inspiration (JSON) - P0 output
+    - [x] goals (JSON) - P1 output
+    - [x] tasks (JSON) - P2 output
+    - [x] results (JSON) - P3 output
+    - [x] delivery (JSON) - P4 output
+    - [x] learning (JSON) - P5 output
+  - [x] **Timestamps**: start_time, end_time, created_at, updated_at
+  - [x] Relations: member (hasOne __yao.member)
+- [x] `agent/robot/store/execution.go` - Execution record storage
+  - [x] `Save(ctx, record)` - create or update execution record
+  - [x] `Get(ctx, execID)` - get execution by ID
+  - [x] `List(ctx, opts)` - query execution history with filters
+  - [x] `UpdatePhase(ctx, execID, phase, data)` - update current phase and data
+  - [x] `UpdateStatus(ctx, execID, status, error)` - update execution status
+  - [x] `UpdateCurrent(ctx, execID, current)` - update current executing state
+  - [x] `Delete(ctx, execID)` - delete execution record
+  - [x] `FromExecution(exec, robotID)` - convert runtime Execution to record
+  - [x] `ToExecution()` - convert record to runtime Execution
+- [x] Tests: `agent/robot/store/execution_test.go` (9 test groups, all passing)
+- [x] Integrate into Executor - call `UpdatePhase()` after each phase completes
+  - [x] Added `SkipPersistence` config option to `executor/types/Config`
+  - [x] Added `ExecutionStore` to `executor/standard/Executor`
+  - [x] Save execution record at start of `Execute()`
+  - [x] Call `UpdatePhase()` after each phase completes in `runPhase()`
+  - [x] Call `UpdateStatus()` on status changes (running, completed, failed)
 
-- [ ] `executor/delivery.go` - `RunDelivery(ctx, exec, data)` - real implementation
-- [ ] `executor/delivery.go` - build delivery content from results
-- [ ] `executor/delivery.go` - support email delivery
-- [ ] `executor/delivery.go` - support file delivery
-- [ ] `executor/delivery.go` - support webhook delivery
-- [ ] `executor/delivery.go` - support notify delivery
+### 10.2 Messenger Attachment Support ✅
 
-### 10.3 Tests
+> **Conclusion:** All email providers now support attachments.
 
-- [ ] `executor/delivery_test.go` - P4 delivery
-- [ ] Test: delivery content generated correctly
-- [ ] Test: email delivery (mock or real)
-- [ ] Test: file delivery to configured path
+**Implementation Status:**
+
+| Provider | Attachment Support | Implementation |
+|----------|-------------------|----------------|
+| Twilio/SendGrid | ✅ Supported | `buildAttachments()` - base64 encoded |
+| Mailgun | ✅ Supported | `sendEmailWithAttachments()` - multipart/form-data |
+| SMTP (mailer) | ✅ Supported | `buildMessageWithAttachments()` - MIME multipart/mixed |
+
+**Features Supported:**
+- Regular attachments (Content-Disposition: attachment)
+- Inline attachments (Content-Disposition: inline) with Content-ID for HTML embedding
+- Multiple attachments per email
+- Automatic content type detection
+- Base64 encoding for SMTP (RFC 2045 compliant, 76-char line wrapping)
+
+**Tests Added:**
+- `messenger/providers/mailgun/mailgun_test.go`:
+  - `TestSend_EmailWithAttachments_MockServer`
+  - `TestSend_EmailWithInlineAttachment_MockServer`
+  - `TestSend_EmailWithAttachments_RealAPI`
+- `messenger/providers/mailer/mailer_test.go`:
+  - `TestBuildMessage_WithAttachments` (single, multiple, inline, no attachments)
+  - `TestSend_EmailWithAttachments_RealAPI`
+
+```go
+// messenger/types/types.go
+type Attachment struct {
+    Filename    string `json:"filename"`
+    ContentType string `json:"content_type"`
+    Content     []byte `json:"content"`
+    Inline      bool   `json:"inline,omitempty"`
+    CID         string `json:"cid,omitempty"`
+}
+```
+
+Supported channels:
+- [x] Email - Full attachment support
+- [x] SMS - No attachment (text only)
+- [x] WhatsApp - TBD
+
+### 10.3 Type Updates (Prerequisite) ✅
+
+- [x] Update `types/enums.go` - Update `DeliveryType` enum
+  - [x] Remove `DeliveryFile`
+  - [x] Add `DeliveryProcess`
+- [x] Update `types/robot.go` - Delivery types for new architecture
+  - [x] `DeliveryResult` - update to new structure (RequestID, Content, Results[])
+  - [x] Add `DeliveryContent` struct
+  - [x] Add `DeliveryAttachment` struct
+  - [x] Add `DeliveryRequest` struct
+  - [x] Add `DeliveryContext` struct
+  - [x] Add `DeliveryPreferences` struct (with Email, Webhook, Process)
+  - [x] Add `EmailPreference`, `EmailTarget` structs
+  - [x] Add `WebhookPreference`, `WebhookTarget` structs
+  - [x] Add `ProcessPreference`, `ProcessTarget` structs
+  - [x] Add `ChannelResult` struct (with Target field)
+- [x] Update `types/enums_test.go` - Update DeliveryType tests
+- [x] Update `types/robot_test.go` - Update delivery result tests
+
+### 10.4 Delivery Agent Setup
+
+- [x] `robot/delivery/package.yao` - Delivery Agent config
+- [x] `robot/delivery/prompts.yml` - delivery prompts
+  - [x] Input: Full execution context (P0-P3 results)
+  - [x] Output: DeliveryContent (Summary, Body, Attachments) - **only content, no channels**
+  - [x] Agent focuses on content generation, NOT channel selection
+
+### 10.5 Delivery Content Structure
+
+```go
+// DeliveryRequest - pushed to Delivery Center
+// No Channels - Delivery Center decides based on preferences
+type DeliveryRequest struct {
+    Content *DeliveryContent `json:"content"` // Agent-generated content
+    Context *DeliveryContext `json:"context"` // Tracking info
+}
+
+// DeliveryContent - Content generated by Delivery Agent (only content)
+type DeliveryContent struct {
+    Summary     string               `json:"summary"`               // Brief 1-2 sentence summary
+    Body        string               `json:"body"`                  // Full markdown report
+    Attachments []DeliveryAttachment `json:"attachments,omitempty"` // Output artifacts from P3
+}
+
+// DeliveryAttachment - Task output attachment with metadata
+type DeliveryAttachment struct {
+    Title       string `json:"title"`                 // Human-readable title
+    Description string `json:"description,omitempty"` // What this artifact is
+    TaskID      string `json:"task_id,omitempty"`     // Which task produced this
+    File        string `json:"file"`                  // Wrapper: __<uploader>://<fileID>
+}
+
+// DeliveryContext - tracking info
+type DeliveryContext struct {
+    MemberID    string      `json:"member_id"`    // Robot member ID (globally unique)
+    ExecutionID string      `json:"execution_id"`
+    TriggerType TriggerType `json:"trigger_type"` // clock | human | event
+    TeamID      string      `json:"team_id"`
+}
+```
+
+**Key Design:**
+- **Agent only generates content** (Summary, Body, Attachments)
+- **Delivery Center decides channels** based on Robot/User preferences
+- If webhook configured, every execution pushes automatically
+
+**File Wrapper:**
+- Format: `__<uploader>://<fileID>`
+- Parse: `attachment.Parse(value)` → `(uploader, fileID, isWrapper)`
+- Read: `attachment.Base64(ctx, value)` → base64 content
+
+**Delivery Channels (each supports multiple targets):**
+| Channel | Description | Multiple Targets |
+|---------|-------------|------------------|
+| `email` | Send via yao/messenger | ✅ Multiple recipients |
+| `webhook` | POST to external URL | ✅ Multiple URLs |
+| `process` | Yao Process call | ✅ Multiple processes |
+| `notify` | In-app notification | Future (auto by subscriptions) |
+
+### 10.6 Implementation
+
+**P4 Entry (executor/delivery.go):**
+- [x] `RunDelivery(ctx, exec, data)` - P4 entry point
+  - [x] Call Delivery Agent to generate content (only content, no channels)
+  - [x] Build DeliveryRequest (Content + Context)
+  - [x] Push to Delivery Center
+  - [x] Store DeliveryResult in exec.Delivery
+
+**Delivery Center (executor/delivery_center.go):**
+- [x] `DeliveryCenter.Deliver(ctx, request)` - main entry
+  - [x] Read Robot/User delivery preferences
+  - [x] Iterate through all enabled targets for each channel
+  - [x] Aggregate ChannelResults into DeliveryResult
+
+**Channel Handlers (each supports multiple targets):**
+- [x] `sendEmail()` - uses yao/messenger
+  - [x] Convert DeliveryAttachment to messenger.Attachment
+  - [x] Support multiple EmailTarget
+  - [x] Support custom subject_template per target
+  - [x] Use `Robot.RobotEmail` as From address (if configured)
+  - [x] Use global `DefaultEmailChannel()` for messenger channel selection
+- [x] `postWebhook()` - POST JSON
+  - [x] POST DeliveryContent as JSON payload
+  - [x] Support multiple WebhookTarget
+  - [x] Support custom headers per target
+- [x] `callProcess()` - Yao Process call
+  - [x] DeliveryContent as first arg
+  - [x] Support multiple ProcessTarget
+  - [x] Support additional args per target
+
+### 10.7 Tests
+
+- [x] `executor/delivery_test.go` - P4 delivery
+- [x] Test: Delivery Agent generates content (only content)
+- [x] Test: DeliveryCenter reads preferences
+- [x] Test: Multiple email targets (TestDeliveryCenterEmail)
+- [x] Test: Multiple webhook targets
+- [x] Test: Multiple process targets (TestDeliveryCenterProcess)
+- [x] Test: Mixed channels (email + webhook + process) (TestDeliveryCenterAllChannels)
+- [x] Test: sendEmail with attachments (TestDeliveryCenterEmail)
+- [x] Test: postWebhook with custom headers
+- [x] Test: callProcess with args (TestDeliveryCenterProcess)
+- [x] Test: Partial success (some targets fail)
+- [x] Test: DeliveryResult aggregation
 
 ---
 
-## Phase 11: P5 Learning Implementation
+## Phase 11: API & Integration
 
-**Goal:** Implement P5 (Learning). Full execution flow complete.
+**Goal:** Complete API implementation, end-to-end tests. Main flow: P0 → P1 → P2 → P3 → P4.
 
 **Depends on:** Phase 10 (P4 Delivery)
 
-### 11.1 Learning Agent Setup
+> **Note:** P5 Learning is an advanced feature (async, background, user-invisible). 
+> Main flow works without it. Moved to Phase 12 (Advanced Features).
 
-- [ ] `robot/learning/package.yao` - Learning Agent config
-- [ ] `robot/learning/prompts.yml` - learning prompts
-
-### 11.2 Store Implementation
-
-- [ ] `store/store.go` - Store interface and struct
-- [ ] `store/kb.go` - KB operations (create, save, search)
-- [ ] `store/learning.go` - save learning entries to private KB
-
-### 11.3 Implementation
-
-- [ ] `executor/learning.go` - `RunLearning(ctx, exec, data)` - real implementation
-- [ ] `executor/learning.go` - extract learnings from execution
-- [ ] `executor/learning.go` - call Learning Agent
-- [ ] `executor/learning.go` - save to private KB
-
-### 11.4 Tests
-
-- [ ] `executor/learning_test.go` - P5 learning
-- [ ] Test: learnings extracted from execution
-- [ ] Test: learnings saved to KB
-- [ ] Test: KB can be queried for past learnings
-
----
-
-## Phase 12: API & Integration
-
-**Goal:** Complete API implementation, end-to-end tests.
-
-### 12.1 API Implementation
+### 11.1 API Implementation
 
 - [ ] `api/api.go` - implement all Go API functions
 - [ ] `api/process.go` - implement all Process handlers
 - [ ] `api/jsapi.go` - implement JSAPI
 
-### 12.2 End-to-End Tests
+### 11.2 End-to-End Tests
 
-- [ ] Full clock trigger flow (P0 → P5)
-- [ ] Human intervention flow (P1 → P5)
-- [ ] Event trigger flow (P1 → P5)
+- [ ] Full clock trigger flow (P0 → P1 → P2 → P3 → P4)
+- [ ] Human intervention flow (P1 → P2 → P3 → P4)
+- [ ] Event trigger flow (P1 → P2 → P3 → P4)
 - [ ] Concurrent execution test
 - [ ] Pause/Resume/Stop test
 
-### 12.3 Integration with OpenAPI
+### 11.3 Integration with OpenAPI
 
 - [ ] HTTP endpoints for human intervention
 - [ ] Webhook endpoints for events
 
 ---
 
-## Phase 13: Advanced Features
+## Phase 12: Advanced Features
 
-**Goal:** Implement dedup, semantic dedup, plan queue.
+**Goal:** Implement P5 Learning, dedup, semantic dedup, plan queue.
 
-### 13.1 Fast Dedup (Time-Window)
+> **Note:** These are optional advanced features. Main flow works without them.
+
+### 12.1 P5 Learning Implementation
+
+> **Background:** P5 Learning is async, runs after P4 Delivery completes.
+> User doesn't wait for it. Results stored in private KB for future reference.
+
+#### 12.1.1 Learning Agent Setup
+
+- [ ] `robot/learning/package.yao` - Learning Agent config
+- [ ] `robot/learning/prompts.yml` - learning prompts
+
+#### 12.1.2 Store Implementation
+
+- [ ] `store/store.go` - Store interface and struct
+- [ ] `store/kb.go` - KB operations (create, save, search)
+- [ ] `store/learning.go` - save learning entries to private KB
+
+#### 12.1.3 Implementation
+
+- [ ] `executor/learning.go` - `RunLearning(ctx, exec, data)` - real implementation
+- [ ] `executor/learning.go` - extract learnings from execution
+- [ ] `executor/learning.go` - call Learning Agent
+- [ ] `executor/learning.go` - save to private KB
+
+#### 12.1.4 Tests
+
+- [ ] `executor/learning_test.go` - P5 learning
+- [ ] Test: learnings extracted from execution
+- [ ] Test: learnings saved to KB
+- [ ] Test: KB can be queried for past learnings
+
+### 12.2 Fast Dedup (Time-Window)
 
 > **Note:** Manager has `// TODO: dedup check` comment placeholder. Integrate after implementation.
 
@@ -845,13 +1159,13 @@ Each phase test uses different expert combinations:
 - [ ] Integrate into Manager.Tick()
 - [ ] Test: dedup check/mark, window expiry
 
-### 13.2 Semantic Dedup
+### 12.3 Semantic Dedup
 
 - [ ] `dedup/semantic.go` - call Dedup Agent for goal/task level dedup
 - [ ] Dedup Agent setup (`assistants/robot/dedup/`)
 - [ ] Test: semantic dedup with real LLM
 
-### 13.3 Plan Queue
+### 12.4 Plan Queue
 
 - [ ] `plan/plan.go` - plan queue implementation
   - [ ] Store planned tasks/goals
@@ -976,15 +1290,17 @@ func TestWithLLM(t *testing.T) {
 | 4. Agent Infra        | ✅     | AgentCaller, InputFormatter, test assistants                                 |
 | 5. Test Scenarios     | ✅     | Phase agents (P0-P5), expert agents                                          |
 | 6. P0 Inspiration     | ✅     | Inspiration Agent integration                                                |
-| 7. P1 Goals           | ⬜     | Goal Generation Agent integration                                            |
-| 8. P2 Tasks           | ⬜     | Task Planning Agent integration                                              |
-| 9. P3 Run             | ⬜     | Task execution (assistant/mcp/process)                                       |
-| 10. P4 Delivery       | ⬜     | Output delivery (email/file/webhook/notify)                                  |
-| 11. P5 Learning       | ⬜     | Learning Agent + KB save                                                     |
-| 12. API & Integration | ⬜     | Complete API, end-to-end tests                                               |
-| 13. Advanced          | ⬜     | Semantic dedup, plan queue, Sandbox mode (requires container infrastructure) |
+| 7. P1 Goals           | ✅     | Goal Generation Agent integration                                            |
+| 8. P2 Tasks           | ✅     | Task Planning Agent integration                                              |
+| 9. P3 Run             | ✅     | Task execution + validation + yao/assert + multi-turn conversation           |
+| 10. P4 Delivery       | ✅     | Output delivery (email/webhook/process, notify future)                       |
+| 11. API & Integration | ⬜     | Complete API, end-to-end tests (main flow: P0→P1→P2→P3→P4)                   |
+| 12. Advanced          | ⬜     | P5 Learning, dedup, plan queue, Sandbox mode                                 |
 
 Legend: ⬜ Not started | 🟡 In progress | ✅ Complete
+
+**Main Flow (MVP):** P0 Inspiration → P1 Goals → P2 Tasks → P3 Run → P4 Delivery
+**Advanced (Optional):** P5 Learning (async), Dedup, Plan Queue, Sandbox
 
 ---
 
