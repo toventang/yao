@@ -11,16 +11,21 @@ import (
 
 // Robot - runtime representation of an autonomous robot (from __yao.member)
 // Relationship: 1 Robot : N Executions (concurrent)
-// Each trigger creates a new Execution (mapped to job.Job)
+// Each trigger creates a new Execution (stored in __yao.agent_execution)
 type Robot struct {
 	// From __yao.member
 	MemberID       string      `json:"member_id"`
 	TeamID         string      `json:"team_id"`
 	DisplayName    string      `json:"display_name"`
+	Bio            string      `json:"bio"` // Robot's description (from __yao.member.bio)
 	SystemPrompt   string      `json:"system_prompt"`
 	Status         RobotStatus `json:"robot_status"`
 	AutonomousMode bool        `json:"autonomous_mode"`
 	RobotEmail     string      `json:"robot_email"` // Robot's email address for sending emails
+
+	// Manager info (from __yao.member)
+	ManagerID    string `json:"manager_id"`    // Direct manager user_id (who manages this robot)
+	ManagerEmail string `json:"manager_email"` // Manager's email address (for default delivery)
 
 	// Parsed config (from robot_config JSON field)
 	Config *Config `json:"-"`
@@ -116,8 +121,7 @@ func (r *Robot) GetExecutions() []*Execution {
 }
 
 // Execution - single execution instance
-// Each trigger creates a new Execution, mapped to a job.Job for monitoring
-// Relationship: 1 Execution = 1 job.Job
+// Each trigger creates a new Execution, stored in ExecutionStore
 type Execution struct {
 	ID          string      `json:"id"`        // unique execution ID
 	MemberID    string      `json:"member_id"` // robot member ID
@@ -129,8 +133,10 @@ type Execution struct {
 	Phase       Phase       `json:"phase"`
 	Error       string      `json:"error,omitempty"`
 
-	// Job integration (each Execution = 1 job.Job)
-	JobID string `json:"job_id"` // corresponding job.Job ID
+	// UI display fields (updated by executor at each phase)
+	// These provide human-readable status for frontend display
+	Name            string `json:"name,omitempty"`              // Execution title (updated when goals complete)
+	CurrentTaskName string `json:"current_task_name,omitempty"` // Current task description (updated during run phase)
 
 	// Trigger input (stored for traceability)
 	Input *TriggerInput `json:"input,omitempty"` // original trigger input
@@ -166,6 +172,7 @@ type TriggerInput struct {
 	Action   InterventionAction     `json:"action,omitempty"`   // task.add, goal.adjust, etc.
 	Messages []agentcontext.Message `json:"messages,omitempty"` // user's input (text, images, files)
 	UserID   string                 `json:"user_id,omitempty"`  // who triggered
+	Locale   string                 `json:"locale,omitempty"`   // language for UI display (e.g., "en-US", "zh-CN")
 
 	// For event trigger
 	Source    EventSource            `json:"source,omitempty"`     // webhook | database
@@ -213,15 +220,20 @@ type DeliveryTarget struct {
 
 // Task - planned task (structured, for execution)
 type Task struct {
-	ID       string                 `json:"id"`
-	Messages []agentcontext.Message `json:"messages"`           // original input (text, images, files)
-	GoalRef  string                 `json:"goal_ref,omitempty"` // reference to goal (e.g., "Goal 1")
-	Source   TaskSource             `json:"source"`             // auto | human | event
+	ID          string                 `json:"id"`
+	Description string                 `json:"description,omitempty"` // human-readable task description (for UI display)
+	Messages    []agentcontext.Message `json:"messages"`              // original input (text, images, files)
+	GoalRef     string                 `json:"goal_ref,omitempty"`    // reference to goal (e.g., "Goal 1")
+	Source      TaskSource             `json:"source"`                // auto | human | event
 
 	// Executor
 	ExecutorType ExecutorType `json:"executor_type"`
-	ExecutorID   string       `json:"executor_id"`
+	ExecutorID   string       `json:"executor_id"` // unified ID: agent/assistant/process ID, or "mcp_server.mcp_tool" for MCP
 	Args         []any        `json:"args,omitempty"`
+
+	// MCP-specific fields (required when executor_type is "mcp")
+	MCPServer string `json:"mcp_server,omitempty"` // MCP server/client ID (e.g., "ark.image.text2img")
+	MCPTool   string `json:"mcp_tool,omitempty"`   // MCP tool name (e.g., "generate")
 
 	// Validation (defined in P2, used in P3)
 	// ExpectedOutput describes what the task should produce (for LLM semantic validation)
@@ -381,9 +393,12 @@ func NewRobotFromMap(m map[string]interface{}) (*Robot, error) {
 		MemberID:       memberID,
 		TeamID:         teamID,
 		DisplayName:    getString(m, "display_name"),
+		Bio:            getString(m, "bio"),
 		SystemPrompt:   getString(m, "system_prompt"),
 		AutonomousMode: getBool(m, "autonomous_mode"),
 		RobotEmail:     getString(m, "robot_email"),
+		ManagerID:      getString(m, "manager_id"),
+		ManagerEmail:   getString(m, "manager_email"),
 	}
 
 	// Parse robot_status
@@ -402,7 +417,55 @@ func NewRobotFromMap(m map[string]interface{}) (*Robot, error) {
 		robot.Config = config
 	}
 
+	// Ensure Config exists for merging agents/mcp_servers
+	if robot.Config == nil {
+		robot.Config = &Config{}
+	}
+	if robot.Config.Resources == nil {
+		robot.Config.Resources = &Resources{}
+	}
+
+	// Merge agents from member table into Config.Resources.Agents
+	if agentsData, ok := m["agents"]; ok && agentsData != nil {
+		agents := getStringSlice(agentsData)
+		if len(agents) > 0 {
+			robot.Config.Resources.Agents = agents
+		}
+	}
+
+	// Merge mcp_servers from member table into Config.Resources.MCP
+	if mcpData, ok := m["mcp_servers"]; ok && mcpData != nil {
+		mcpServers := getStringSlice(mcpData)
+		if len(mcpServers) > 0 {
+			for _, serverID := range mcpServers {
+				robot.Config.Resources.MCP = append(robot.Config.Resources.MCP, MCPConfig{
+					ID: serverID,
+				})
+			}
+		}
+	}
+
 	return robot, nil
+}
+
+// getStringSlice converts interface{} to []string
+func getStringSlice(v interface{}) []string {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case []string:
+		return val
+	case []interface{}:
+		result := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return nil
 }
 
 // getString safely gets a string value from map

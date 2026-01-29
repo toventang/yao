@@ -3,6 +3,9 @@ package standard
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yaoapp/gou/process"
+	"github.com/yaoapp/gou/text"
 	robottypes "github.com/yaoapp/yao/agent/robot/types"
 	"github.com/yaoapp/yao/attachment"
 	"github.com/yaoapp/yao/messenger"
@@ -116,11 +120,13 @@ func (dc *DeliveryCenter) sendEmail(
 		return result
 	}
 
-	// Build email message
+	// Build email message with HTML content
+	htmlBody, plainBody := buildEmailBody(target.Template, content)
 	msg := &messengerTypes.Message{
 		To:      target.To,
-		Subject: buildEmailSubject(target.Subject, target.Template, content, deliveryCtx),
-		Body:    buildEmailBody(target.Template, content),
+		Subject: buildEmailSubject(target.Subject, target.Template, content, deliveryCtx, robotInstance),
+		Body:    plainBody, // Plain text fallback
+		HTML:    htmlBody,  // HTML content for rich email display
 		Type:    messengerTypes.MessageTypeEmail,
 	}
 
@@ -217,10 +223,11 @@ func (dc *DeliveryCenter) postWebhook(
 		req.Header.Set(key, value)
 	}
 
-	// Add secret if configured (for signature verification)
+	// Add HMAC signature if secret is configured
 	if target.Secret != "" {
-		// TODO: Implement HMAC signature
-		req.Header.Set("X-Webhook-Secret", target.Secret)
+		signature := computeHMACSignature(payloadBytes, target.Secret)
+		req.Header.Set("X-Yao-Signature", signature)
+		req.Header.Set("X-Yao-Signature-Algorithm", "HMAC-SHA256")
 	}
 
 	// Send request
@@ -295,40 +302,76 @@ func (dc *DeliveryCenter) callProcess(
 	}
 
 	result.Success = true
-	result.Details = proc.Value
+	// Convert proc.Value to JSON-serializable format to avoid func type issues
+	result.Details = toJSONSerializable(proc.Value)
 
 	return result
 }
 
+// toJSONSerializable ensures the value can be JSON serialized
+// Returns the original value if serializable, or a string fallback if not
+func toJSONSerializable(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+
+	// Try to marshal to check if it's JSON serializable
+	_, err := json.Marshal(v)
+	if err != nil {
+		// If it can't be serialized (e.g., contains func), return a string representation
+		return fmt.Sprintf("%v", v)
+	}
+
+	// Return original value if it's serializable
+	return v
+}
+
 // buildEmailSubject builds the email subject line
-func buildEmailSubject(subject, template string, content *robottypes.DeliveryContent, ctx *robottypes.DeliveryContext) string {
+func buildEmailSubject(subject, template string, content *robottypes.DeliveryContent, ctx *robottypes.DeliveryContext, robot *robottypes.Robot) string {
 	// Use explicit subject if provided
 	if subject != "" {
 		return subject
 	}
 
+	// Get robot display name for subject prefix
+	robotName := "Robot"
+	if robot != nil && robot.DisplayName != "" {
+		robotName = robot.DisplayName
+	}
+
 	// Use template-based subject if template is specified
 	// TODO: Implement template rendering
 	if template != "" {
-		return fmt.Sprintf("[Robot] %s", content.Summary)
+		return fmt.Sprintf("[%s] %s", robotName, content.Summary)
 	}
 
 	// Default: use summary
 	if content.Summary != "" {
-		return fmt.Sprintf("[Robot] %s", content.Summary)
+		return fmt.Sprintf("[%s] %s", robotName, content.Summary)
 	}
 
-	return fmt.Sprintf("[Robot] Execution %s Complete", ctx.ExecutionID)
+	return fmt.Sprintf("[%s] Execution %s Complete", robotName, ctx.ExecutionID)
 }
 
 // buildEmailBody builds the email body content
-func buildEmailBody(template string, content *robottypes.DeliveryContent) string {
+// buildEmailBody returns HTML and plain text versions of the email body
+// Returns: (htmlBody, plainBody)
+func buildEmailBody(template string, content *robottypes.DeliveryContent) (string, string) {
 	// TODO: Implement template rendering
-	// For now, just use the body directly
-	if content.Body != "" {
-		return content.Body
+	// Get markdown content (used as plain text fallback)
+	markdown := content.Body
+	if markdown == "" {
+		markdown = content.Summary
 	}
-	return content.Summary
+
+	// Convert Markdown to HTML for rich email display
+	html, err := text.MarkdownToHTML(markdown)
+	if err != nil {
+		// Fallback: use markdown as both HTML and plain text
+		return markdown, markdown
+	}
+
+	return html, markdown
 }
 
 // convertAttachments converts DeliveryAttachment to messenger Attachment format
@@ -375,4 +418,27 @@ func convertAttachments(ctx context.Context, attachments []robottypes.DeliveryAt
 	}
 
 	return result
+}
+
+// ============================================================================
+// Webhook Signature
+// ============================================================================
+
+// computeHMACSignature computes HMAC-SHA256 signature for webhook payload
+// Returns hex-encoded signature string
+func computeHMACSignature(payload []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyHMACSignature verifies the HMAC-SHA256 signature of a webhook payload
+// Headers:
+//   - X-Yao-Signature: hex-encoded HMAC-SHA256 signature
+//   - X-Yao-Signature-Algorithm: "HMAC-SHA256"
+//
+// Returns true if the signature is valid
+func VerifyHMACSignature(payload []byte, secret, signature string) bool {
+	expected := computeHMACSignature(payload, secret)
+	return hmac.Equal([]byte(expected), []byte(signature))
 }

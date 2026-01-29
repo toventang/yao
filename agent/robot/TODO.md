@@ -165,7 +165,6 @@ Create empty structs and stub methods that return nil/empty/success:
 - [x] `dedup/dedup.go` - Dedup struct, stub methods
 - [x] `store/store.go` - Store struct, stub methods
 - [x] `pool/pool.go` - Pool struct, stub methods
-- [x] `job/job.go` - job helper stubs
 - [x] `plan/plan.go` - Plan struct, stub methods
 - [x] `trigger/trigger.go` - trigger dispatcher stub
 - [x] `executor/executor.go` - Executor struct, stub `Execute()`
@@ -278,35 +277,16 @@ Trigger → Manager → Cache → Dedup → Pool → Worker → Executor(stub) �
   - [x] ExecutionController lifecycle tests
   - [x] Manager integration tests for Intervene/HandleEvent
 
-### ✅ 3.5 Job Integration (COMPLETE)
+### ✅ 3.5 Execution Storage (COMPLETE)
 
-- [x] `job/job.go` - create job
-  - [x] `job_id`: `robot_exec_{execID}`
-  - [x] `category_name`: `Autonomous Robot` / `自主机器人` (localized)
-  - [x] Metadata: member_id, team_id, trigger_type, exec_id, display_name
-  - [x] `Options` struct for extensibility (Priority, MaxRetryCount, DefaultTimeout, Metadata)
-  - [x] `Create()`, `Get()`, `Update()`, `Complete()`, `Fail()`, `Cancel()`
-  - [x] Status mapping: ExecPending→queued, ExecRunning→running, etc.
+- [x] ExecutionStore - execution record persistence
+  - [x] Execution data stored in `__yao.agent_execution` table
+  - [x] All phase outputs (Inspiration, Goals, Tasks, Results, Delivery, Learning)
+  - [x] Status and phase tracking
+  - [x] Logging via `kun/log` package
   - [x] Localization support (en-US, zh-CN)
-- [x] `job/execution.go` - execution lifecycle
-  - [x] `CreateOptions` struct for extensibility
-  - [x] `CreateExecution()` - create both robot Execution and job.Execution
-  - [x] `UpdatePhase()` - update phase with progress tracking (10%→25%→40%→60%→80%→95%)
-  - [x] `UpdateStatus()` - update execution status
-  - [x] `CompleteExecution()` / `FailExecution()` / `CancelExecution()`
-  - [x] TriggerType → TriggerCategory mapping (clock→scheduled, human→manual, event→event)
-  - [x] Duration calculation on completion/failure/cancellation
-- [x] `job/log.go` - write phase logs
-  - [x] `Log()` - base log function with context
-  - [x] `LogPhaseStart()` / `LogPhaseEnd()` / `LogPhaseError()`
-  - [x] `LogError()` / `LogInfo()` / `LogDebug()` / `LogWarn()`
-  - [x] `LogTaskStart()` / `LogTaskEnd()`
-  - [x] `LogDelivery()` / `LogLearning()`
-  - [x] Localization support for all log messages
-- [x] Test: job creation, execution tracking, log writing
-  - [x] `job/job_test.go` - 17 test cases
-  - [x] `job/execution_test.go` - 26 test cases
-  - [x] `job/log_test.go` - 24 test cases
+- [x] Test: execution storage, status tracking
+  - [x] `store/execution_test.go` - execution store tests
   - [x] All tests passing with real database
 
 ### ✅ 3.6 Executor Architecture (COMPLETE)
@@ -875,7 +855,7 @@ Created new `yao/assert` package for universal assertion/validation:
 
 - [x] `yao/models/agent/execution.mod.yao` - Execution record model (`agent_execution` table)
   - [x] id, execution_id (unique)
-  - [x] member_id (globally unique), team_id, job_id
+  - [x] member_id (globally unique), team_id
   - [x] trigger_type (enum: clock, human, event)
   - [x] **Status tracking** (synced with runtime Execution):
     - [x] status (enum: pending, running, completed, failed, cancelled)
@@ -1081,73 +1061,125 @@ type DeliveryContext struct {
 
 ---
 
-## Phase 11: API & Integration
+## Phase 11: API & Integration (MVP)
 
-**Goal:** Complete API implementation, end-to-end tests. Main flow: P0 → P1 → P2 → P3 → P4.
+**Goal:** Complete Go API and end-to-end tests. Main flow: P0 → P1 → P2 → P3 → P4.
 
 **Depends on:** Phase 10 (P4 Delivery)
 
-> **Note:** P5 Learning is an advanced feature (async, background, user-invisible). 
-> Main flow works without it. Moved to Phase 12 (Advanced Features).
+> **Note:** Process handlers and JSAPI are optional wrappers, moved to Phase 12.
+> Go API is sufficient for MVP integration.
 
-### 11.1 API Implementation
+### 11.1 Go API Implementation
 
-- [ ] `api/api.go` - implement all Go API functions
-- [ ] `api/process.go` - implement all Process handlers
-- [ ] `api/jsapi.go` - implement JSAPI
+- [x] `api/types.go` - API request/response types
+- [x] `api/lifecycle.go` - manager lifecycle
+  - [x] `Start()` / `Stop()` - manager lifecycle
+  - [x] `StartWithConfig(config)` - start with custom config
+  - [x] `IsRunning()` - check if system is running
+- [x] `api/robot.go` - robot query functions
+  - [x] `GetRobot(memberID)` - get robot by member ID
+  - [x] `ListRobots(query)` - list robots with filtering
+  - [x] `GetRobotStatus(memberID)` - get robot runtime status
+- [x] `api/trigger.go` - trigger functions
+  - [x] `Trigger(memberID, request)` - main trigger entry point
+  - [x] `TriggerManual(memberID, triggerType, data)` - manual trigger for testing
+  - [x] `Intervene(memberID, request)` - human intervention
+  - [x] `HandleEvent(memberID, request)` - event trigger
+- [x] `api/execution.go` - execution query and control
+  - [x] `GetExecution(execID)` - get execution by ID
+  - [x] `ListExecutions(memberID, query)` - list executions
+  - [x] `GetExecutionStatus(execID)` - get execution with runtime status
+  - [x] `PauseExecution(execID)` / `ResumeExecution(execID)` / `StopExecution(execID)`
+- [x] `api/api.go` - package documentation
+- [x] Tests: `api/*_test.go` (black-box tests, 16 test cases)
 
 ### 11.2 End-to-End Tests
 
-- [ ] Full clock trigger flow (P0 → P1 → P2 → P3 → P4)
-- [ ] Human intervention flow (P1 → P2 → P3 → P4)
-- [ ] Event trigger flow (P1 → P2 → P3 → P4)
-- [ ] Concurrent execution test
-- [ ] Pause/Resume/Stop test
-
-### 11.3 Integration with OpenAPI
-
-- [ ] HTTP endpoints for human intervention
-- [ ] Webhook endpoints for events
+- [x] Full clock trigger flow (P0 → P1 → P2 → P3 → P4) - `e2e_clock_test.go`
+- [x] Human intervention flow (P1 → P2 → P3 → P4) - `e2e_human_test.go`
+- [x] Event trigger flow (P1 → P2 → P3 → P4) - `e2e_event_test.go`
+- [x] Concurrent execution test - `e2e_concurrent_test.go`
+- [x] Pause/Resume/Stop test - `e2e_control_test.go`
 
 ---
 
-## Phase 12: Advanced Features
+## Phase 12: OpenAPI Integration
 
-**Goal:** Implement P5 Learning, dedup, semantic dedup, plan queue.
+**Goal:** HTTP endpoints for Robot Agent management and triggers.
 
-> **Note:** These are optional advanced features. Main flow works without them.
+**Depends on:** Phase 11 (API & Integration), Frontend UI Design
 
-### 12.1 P5 Learning Implementation
+> **Note:** This phase will be planned in detail after frontend UI design is complete.
+> The API endpoints will be designed based on actual UI requirements.
+
+### 12.1 Planned Features
+
+- [ ] HTTP endpoints for robot management (CRUD)
+- [ ] HTTP endpoints for human intervention triggers
+- [ ] Webhook endpoints for external events
+- [ ] WebSocket for real-time execution status updates
+- [ ] Authentication and authorization integration
+
+### 12.2 Design Dependencies
+
+- Frontend dashboard design (robot list, status, controls)
+- Execution history UI design
+- Human intervention UI design
+- Real-time notification requirements
+
+---
+
+## Phase 13: Advanced Features
+
+**Goal:** P5 Learning, Process/JSAPI wrappers, dedup, plan queue.
+
+> **Note:** These are optional features. Main flow works without them.
+
+### 13.1 Process & JSAPI Wrappers
+
+> **Note:** These are convenience wrappers around Go API for Yao ecosystem integration.
+
+- [ ] `api/process.go` - implement Process handlers
+  - [ ] `robot.Start` / `robot.Stop`
+  - [ ] `robot.Trigger` / `robot.Intervene` / `robot.HandleEvent`
+  - [ ] `robot.Pause` / `robot.Resume` / `robot.Stop`
+  - [ ] `robot.Get` / `robot.List`
+  - [ ] `robot.GetExecution` / `robot.ListExecutions`
+- [ ] `api/jsapi.go` - implement JSAPI for JavaScript runtime
+- [ ] Tests for Process and JSAPI
+
+### 13.2 P5 Learning Implementation
 
 > **Background:** P5 Learning is async, runs after P4 Delivery completes.
 > User doesn't wait for it. Results stored in private KB for future reference.
 
-#### 12.1.1 Learning Agent Setup
+#### 13.2.1 Learning Agent Setup
 
 - [ ] `robot/learning/package.yao` - Learning Agent config
 - [ ] `robot/learning/prompts.yml` - learning prompts
 
-#### 12.1.2 Store Implementation
+#### 13.2.2 Store Implementation
 
 - [ ] `store/store.go` - Store interface and struct
 - [ ] `store/kb.go` - KB operations (create, save, search)
 - [ ] `store/learning.go` - save learning entries to private KB
 
-#### 12.1.3 Implementation
+#### 13.2.3 Implementation
 
 - [ ] `executor/learning.go` - `RunLearning(ctx, exec, data)` - real implementation
 - [ ] `executor/learning.go` - extract learnings from execution
 - [ ] `executor/learning.go` - call Learning Agent
 - [ ] `executor/learning.go` - save to private KB
 
-#### 12.1.4 Tests
+#### 13.2.4 Tests
 
 - [ ] `executor/learning_test.go` - P5 learning
 - [ ] Test: learnings extracted from execution
 - [ ] Test: learnings saved to KB
 - [ ] Test: KB can be queried for past learnings
 
-### 12.2 Fast Dedup (Time-Window)
+### 13.3 Fast Dedup (Time-Window)
 
 > **Note:** Manager has `// TODO: dedup check` comment placeholder. Integrate after implementation.
 
@@ -1159,13 +1191,13 @@ type DeliveryContext struct {
 - [ ] Integrate into Manager.Tick()
 - [ ] Test: dedup check/mark, window expiry
 
-### 12.3 Semantic Dedup
+### 13.4 Semantic Dedup
 
 - [ ] `dedup/semantic.go` - call Dedup Agent for goal/task level dedup
 - [ ] Dedup Agent setup (`assistants/robot/dedup/`)
 - [ ] Test: semantic dedup with real LLM
 
-### 12.4 Plan Queue
+### 13.5 Plan Queue
 
 - [ ] `plan/plan.go` - plan queue implementation
   - [ ] Store planned tasks/goals
@@ -1294,13 +1326,15 @@ func TestWithLLM(t *testing.T) {
 | 8. P2 Tasks           | ✅     | Task Planning Agent integration                                              |
 | 9. P3 Run             | ✅     | Task execution + validation + yao/assert + multi-turn conversation           |
 | 10. P4 Delivery       | ✅     | Output delivery (email/webhook/process, notify future)                       |
-| 11. API & Integration | ⬜     | Complete API, end-to-end tests (main flow: P0→P1→P2→P3→P4)                   |
-| 12. Advanced          | ⬜     | P5 Learning, dedup, plan queue, Sandbox mode                                 |
+| 11. API & Integration | ✅     | Go API, end-to-end tests (main flow: P0→P1→P2→P3→P4)                         |
+| 12. OpenAPI           | ⬜     | HTTP endpoints (depends on frontend UI design)                               |
+| 13. Advanced          | ⬜     | Process/JSAPI, P5 Learning, dedup, plan queue, Sandbox                       |
 
 Legend: ⬜ Not started | 🟡 In progress | ✅ Complete
 
-**Main Flow (MVP):** P0 Inspiration → P1 Goals → P2 Tasks → P3 Run → P4 Delivery
-**Advanced (Optional):** P5 Learning (async), Dedup, Plan Queue, Sandbox
+**Main Flow (MVP):** P0 Inspiration → P1 Goals → P2 Tasks → P3 Run → P4 Delivery ✅
+**OpenAPI (Phase 12):** HTTP endpoints - planned after frontend UI design
+**Advanced (Phase 13):** P5 Learning (async), Process/JSAPI, Dedup, Plan Queue, Sandbox
 
 ---
 

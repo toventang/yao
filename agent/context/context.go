@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/yaoapp/yao/agent/memory"
 	"github.com/yaoapp/yao/agent/output/message"
@@ -112,6 +111,10 @@ func (ctx *Context) Release() {
 	// Clear current stack reference
 	ctx.Stack = nil
 
+	// Close SafeWriter if exists (must be before setting Writer to nil)
+	// This ensures the background goroutine is properly stopped
+	ctx.CloseSafeWriter()
+
 	// Clear writer reference
 	ctx.Writer = nil
 
@@ -130,6 +133,95 @@ func (ctx *Context) GetAuthorizedMap() map[string]interface{} {
 		return nil
 	}
 	return ctx.Authorized.AuthorizedToMap()
+}
+
+// Fork creates a child context for concurrent agent/LLM calls
+// The forked context shares read-only resources (Authorized, Cache, Writer)
+// but has its own independent Stack, Logger, and Memory.Context namespace
+// to avoid race conditions and state sharing issues.
+//
+// This is essential for batch operations (All/Any/Race) where multiple goroutines
+// need to execute concurrently without interfering with each other's state.
+//
+// Key behavior:
+// - Memory.User, Memory.Team, Memory.Chat are shared (cross-request state)
+// - Memory.Context is INDEPENDENT (request-scoped state, isolated per fork)
+//
+// The forked context does NOT need to be released separately - the parent context
+// manages shared resources. However, the child's Stack will be collected in parent's Stacks map.
+func (ctx *Context) Fork() *Context {
+	childID := generateContextID()
+
+	// Fork memory with independent Context namespace
+	// This prevents parallel sub-agents from sharing ctx.memory.context state
+	var forkedMemory *memory.Memory
+	if ctx.Memory != nil {
+		var err error
+		forkedMemory, err = ctx.Memory.Fork(childID)
+		if err != nil {
+			// Fallback to shared memory if fork fails (log warning)
+			forkedMemory = ctx.Memory
+		}
+	}
+
+	child := &Context{
+		// Inherit parent's standard context
+		Context: ctx.Context,
+
+		// New unique ID for this forked context
+		ID: childID,
+
+		// Memory with independent Context namespace (see above)
+		Memory: forkedMemory,
+
+		// Share read-only/thread-safe resources with parent
+		Cache:        ctx.Cache,        // Cache store is thread-safe
+		Writer:       ctx.Writer,       // Output writer is thread-safe (output module handles concurrency)
+		Authorized:   ctx.Authorized,   // Read-only auth info
+		Capabilities: ctx.Capabilities, // Read-only model capabilities
+
+		// Share reference to parent's Stacks map for trace collection
+		// Child stacks will be added here by EnterStack
+		Stacks: ctx.Stacks,
+
+		// Stack is nil for forked contexts - will be set by EnterStack
+		// ForkParent stores parent stack info so EnterStack can create child stack
+		Stack: nil,
+
+		// Create independent resources to avoid race conditions
+		IDGenerator:     message.NewIDGenerator(),
+		Logger:          NewRequestLogger(ctx.AssistantID, ctx.ChatID, childID),
+		messageMetadata: newMessageMetadataStore(),
+
+		// Inherit context metadata
+		ChatID:      ctx.ChatID,
+		AssistantID: ctx.AssistantID,
+		Locale:      ctx.Locale,
+		Theme:       ctx.Theme,
+		Client:      ctx.Client,
+		Referer:     ctx.Referer,
+		Accept:      ctx.Accept,
+		Route:       ctx.Route,
+		Metadata:    ctx.Metadata,
+
+		// Don't inherit these - they are request-specific
+		Buffer:    nil, // Buffer belongs to root context
+		Interrupt: nil, // Interrupt controller belongs to root context
+		trace:     nil, // Trace will be inherited via TraceID in Stack
+	}
+
+	// Set ForkParent info if parent has a Stack
+	// This allows EnterStack to create a child stack instead of root stack
+	if ctx.Stack != nil {
+		child.ForkParent = &ForkParentInfo{
+			StackID: ctx.Stack.ID,
+			TraceID: ctx.Stack.TraceID,
+			Depth:   ctx.Stack.Depth,
+			Path:    append([]string{}, ctx.Stack.Path...), // Copy path slice
+		}
+	}
+
+	return child
 }
 
 // Send sends data to the context's writer
@@ -318,12 +410,12 @@ func SendInterrupt(contextID string, signal *InterruptSignal) error {
 
 // generateContextID generates a unique context ID
 func generateContextID() string {
-	return fmt.Sprintf("ctx-%d", time.Now().UnixNano())
+	return message.GenerateNanoID()
 }
 
-// RequestID returns the request ID for the context
+// RequestID returns a unique request ID using NanoID
 func (ctx *Context) RequestID() string {
-	return fmt.Sprintf("%s", ctx.ID)
+	return message.GenerateNanoID()
 }
 
 // TraceID returns the trace ID for the context
@@ -431,4 +523,20 @@ func (ctx *Context) shouldSkipHistory() bool {
 		return false
 	}
 	return ctx.Stack.Options.Skip.History
+}
+
+// IsA2ACall returns true if this is any Agent-to-Agent call (delegate or fork)
+// A2A calls are identified by Referer being "agent" or "agent_fork":
+// - ctx.agent.Call/All/Any/Race uses RefererAgentFork (forked context, skips history)
+// - delegate uses RefererAgent (same context flow, saves history)
+func (ctx *Context) IsA2ACall() bool {
+	return ctx.Referer == RefererAgent || ctx.Referer == RefererAgentFork
+}
+
+// IsForkedA2ACall returns true if this is a forked A2A call (ctx.agent.Call/All/Any/Race)
+// Forked calls use RefererAgentFork, while delegate calls use RefererAgent.
+// This is used to skip history saving for forked sub-agent calls,
+// while allowing delegate calls to save history normally.
+func (ctx *Context) IsForkedA2ACall() bool {
+	return ctx.Referer == RefererAgentFork
 }

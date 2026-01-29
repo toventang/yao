@@ -38,6 +38,8 @@ interface Context {
   memory: Memory; // Agent memory with four namespaces: user, team, chat, context
   trace: Trace; // Trace object for debugging and monitoring
   mcp: MCP; // MCP object for external tool/resource access
+  agent: Agent; // Agent-to-Agent calls (A2A)
+  llm: LLM; // Direct LLM connector calls
 }
 ```
 
@@ -1629,6 +1631,9 @@ The `ctx.mcp` object provides access to Model Context Protocol operations for in
 | `CallTool(client, name, args?)`      | Call a single tool               |
 | `CallTools(client, tools)`           | Call multiple tools sequentially |
 | `CallToolsParallel(client, tools)`   | Call multiple tools in parallel  |
+| `All(requests)`                      | Call tools across servers, wait for all |
+| `Any(requests)`                      | Call tools across servers, first success wins |
+| `Race(requests)`                     | Call tools across servers, first complete wins |
 | `ListPrompts(client, cursor?)`       | List available prompts           |
 | `GetPrompt(client, name, args?)`     | Get a specific prompt            |
 | `ListSamples(client, type, name)`    | List samples for a tool/resource |
@@ -1682,7 +1687,7 @@ console.log(tools.tools); // Array of tools
 
 #### `ctx.mcp.CallTool(client, name, arguments?)`
 
-Calls a single tool.
+Calls a single tool and returns the parsed result directly.
 
 **Parameters:**
 
@@ -1690,43 +1695,61 @@ Calls a single tool.
 - `name`: String - Tool name
 - `arguments`: Object (optional) - Tool arguments
 
+**Returns:** Parsed result directly (automatically extracts and parses JSON from tool response)
+
 ```javascript
-const result = ctx.mcp.CallTool("echo", "ping", { count: 3 });
-console.log(result.content); // Tool result content
+// Result is returned directly - no wrapper object needed
+const result = ctx.mcp.CallTool("echo", "echo", { message: "hello" });
+console.log(result.echo);  // "hello" - directly access parsed data!
+
+// Another example
+const status = ctx.mcp.CallTool("echo", "status", { verbose: true });
+console.log(status.status);  // "online"
+console.log(status.uptime);  // 3600
 ```
 
 #### `ctx.mcp.CallTools(client, tools)`
 
-Calls multiple tools sequentially.
+Calls multiple tools sequentially and returns array of parsed results.
 
 **Parameters:**
 
 - `client`: String - MCP client ID
 - `tools`: Array - Array of tool call objects
+
+**Returns:** Array of parsed results (same order as input tools)
 
 ```javascript
 const results = ctx.mcp.CallTools("echo", [
   { name: "ping", arguments: { count: 1 } },
-  { name: "status", arguments: { verbose: true } },
+  { name: "echo", arguments: { message: "hello" } },
 ]);
-console.log(results.results); // Array of results
+
+// Results are directly accessible
+console.log(results[0].message);  // "pong"
+console.log(results[1].echo);     // "hello"
 ```
 
 #### `ctx.mcp.CallToolsParallel(client, tools)`
 
-Calls multiple tools in parallel.
+Calls multiple tools in parallel and returns array of parsed results.
 
 **Parameters:**
 
 - `client`: String - MCP client ID
 - `tools`: Array - Array of tool call objects
 
+**Returns:** Array of parsed results (same order as input tools)
+
 ```javascript
 const results = ctx.mcp.CallToolsParallel("echo", [
   { name: "ping", arguments: { count: 1 } },
-  { name: "status", arguments: { verbose: false } },
+  { name: "echo", arguments: { message: "hello" } },
 ]);
-console.log(results.results); // Array of results (order may vary)
+
+// Results are directly accessible (order matches input order)
+console.log(results[0].message);  // "pong" (ping result)
+console.log(results[1].echo);     // "hello" (echo result)
 ```
 
 ### Prompt Operations
@@ -1793,6 +1816,653 @@ Gets a specific sample by index.
 ```javascript
 const sample = ctx.mcp.GetSample("echo", "tool", "ping", 0);
 console.log(sample.name, sample.input); // Sample name and input data
+```
+
+### Cross-Server Tool Operations
+
+These methods enable calling tools across multiple MCP servers concurrently, similar to JavaScript Promise patterns. This is useful for:
+
+- **Parallel data fetching**: Query multiple data sources simultaneously
+- **Redundancy/Fallback**: Try multiple servers, use first successful result
+- **Load balancing**: Distribute load across servers
+
+#### `ctx.mcp.All(requests)`
+
+Calls tools on multiple MCP servers concurrently and waits for all to complete (like `Promise.all`).
+
+**Parameters:**
+
+- `requests`: Array of request objects with `mcp`, `tool`, and optional `arguments`
+
+**Returns:** Array of `MCPToolResult` objects in the same order as requests
+
+```javascript
+const results = ctx.mcp.All([
+  { mcp: "server1", tool: "search", arguments: { query: "topic" } },
+  { mcp: "server2", tool: "fetch", arguments: { id: 123 } },
+  { mcp: "server3", tool: "analyze", arguments: { data: "input" } }
+]);
+
+// Process all results
+results.forEach((r, i) => {
+  if (r.error) {
+    console.log(`Request ${i} failed: ${r.error}`);
+  } else {
+    console.log(`Request ${i} result:`, r.result);
+  }
+});
+```
+
+#### `ctx.mcp.Any(requests)`
+
+Calls tools on multiple MCP servers concurrently and returns when any succeeds (like `Promise.any`). Useful for redundancy/fallback scenarios.
+
+**Parameters:**
+
+- `requests`: Array of request objects
+
+**Returns:** Array of `MCPToolResult` objects (only contains results received before first success)
+
+```javascript
+// Try multiple search providers, use first successful result
+const results = ctx.mcp.Any([
+  { mcp: "search-primary", tool: "search", arguments: { q: "query" } },
+  { mcp: "search-backup", tool: "search", arguments: { q: "query" } }
+]);
+
+const success = results.find(r => r && !r.error);
+if (success) {
+  console.log("Search result:", success.result);
+}
+```
+
+#### `ctx.mcp.Race(requests)`
+
+Calls tools on multiple MCP servers concurrently and returns when any completes (like `Promise.race`). Returns immediately with first completion, regardless of success or failure.
+
+**Parameters:**
+
+- `requests`: Array of request objects
+
+**Returns:** Array of `MCPToolResult` objects (only first completed result is populated)
+
+```javascript
+// Get fastest response
+const results = ctx.mcp.Race([
+  { mcp: "region-us", tool: "ping", arguments: {} },
+  { mcp: "region-eu", tool: "ping", arguments: {} },
+  { mcp: "region-asia", tool: "ping", arguments: {} }
+]);
+
+const first = results.find(r => r !== undefined && r !== null);
+console.log(`Fastest server: ${first.mcp}`);
+```
+
+#### MCPToolRequest Structure
+
+```typescript
+interface MCPToolRequest {
+  mcp: string;        // MCP server ID (required)
+  tool: string;       // Tool name (required)
+  arguments?: any;    // Tool arguments (optional)
+}
+```
+
+#### MCPToolResult Structure
+
+```typescript
+interface MCPToolResult {
+  mcp: string;     // MCP server ID
+  tool: string;    // Tool name
+  result?: any;    // Parsed result content (directly usable)
+  error?: string;  // Error message (on failure)
+}
+```
+
+The `result` field contains the automatically parsed content from the MCP response:
+- For text content: JSON parsed if valid JSON, otherwise plain string
+- For image content: `{ type: "image", data: "...", mimeType: "..." }`
+- For resource content: The resource object directly
+- If only one content item exists, returns it directly (not as array)
+
+**Example using parsed result:**
+
+```javascript
+// Single server - direct result
+const result = ctx.mcp.CallTool("echo", "echo", { message: "hello" });
+console.log(result.echo);  // Directly access parsed data
+
+// Cross-server - results array with MCPToolResult objects
+const results = ctx.mcp.All([
+  { mcp: "echo", tool: "echo", arguments: { message: "hello" } }
+]);
+console.log(results[0].result.echo);  // Access via .result field
+```
+
+## Agent API
+
+The `ctx.agent` object provides methods to call other agents from within hooks, enabling agent-to-agent communication (A2A). This allows building complex multi-agent workflows where agents can delegate tasks, consult specialists, or orchestrate parallel operations.
+
+### Methods Summary
+
+| Method                          | Description                              |
+| ------------------------------- | ---------------------------------------- |
+| `Call(agentID, messages, opts)` | Call a single agent                      |
+| `All(requests, opts?)`          | Call multiple agents, wait for all       |
+| `Any(requests, opts?)`          | Call multiple agents, first success wins |
+| `Race(requests, opts?)`         | Call multiple agents, first complete wins|
+
+### Single Agent Call
+
+#### `ctx.agent.Call(agentID, messages, options?)`
+
+Calls a single agent and streams the response to the current context's output.
+
+**Parameters:**
+
+- `agentID`: String - The target agent/assistant ID
+- `messages`: Array - Messages to send to the agent
+- `options`: Object (optional) - Call options including callback
+
+**Options:**
+
+```typescript
+interface AgentCallOptions {
+  connector?: string;      // Override LLM connector
+  mode?: string;           // Agent mode ("chat", "task", etc.)
+  metadata?: Record<string, any>;  // Custom metadata passed to hooks
+  skip?: {
+    history?: boolean;        // Skip loading chat history
+    trace?: boolean;          // Skip trace recording
+    output?: boolean;         // Skip output to client
+    keyword?: boolean;        // Skip keyword extraction
+    search?: boolean;         // Skip search
+    content_parsing?: boolean; // Skip content parsing
+  };
+  onChunk?: (msg: Message) => number;  // Callback for each message chunk
+}
+```
+
+**Example:**
+
+```javascript
+// Basic call
+const result = ctx.agent.Call("specialist.agent", [
+  { role: "user", content: "Analyze this data" }
+]);
+
+// With callback
+const result = ctx.agent.Call("specialist.agent", messages, {
+  connector: "gpt-4o",
+  onChunk: (msg) => {
+    console.log("Received:", msg.type, msg.props?.content);
+    return 0; // 0 = continue, non-zero = stop
+  }
+});
+```
+
+**Returns:**
+
+```typescript
+interface AgentResult {
+  agent_id: string;            // Agent ID that was called
+  response?: Response;         // Full agent response
+  content?: string;            // Extracted text content
+  error?: string;              // Error message if failed
+}
+```
+
+**Message Object (received in onChunk callback):**
+
+The `onChunk` callback receives a `Message` object with the following structure:
+
+```typescript
+interface Message {
+  type: string;                  // Message type: "text", "thinking", "tool_call", "error", etc.
+  props?: Record<string, any>;   // Message properties (e.g., { content: "Hello" })
+  
+  // Streaming identifiers
+  chunk_id?: string;             // Unique chunk ID (C1, C2, ...)
+  message_id?: string;           // Logical message ID (M1, M2, ...)
+  block_id?: string;             // Output block ID (B1, B2, ...)
+  thread_id?: string;            // Thread ID for concurrent calls (T1, T2, ...)
+  
+  // Delta control
+  delta?: boolean;               // Whether this is an incremental update
+  delta_path?: string;           // Update path (e.g., "content")
+  delta_action?: string;         // Update action: "append", "replace", "merge", "set"
+}
+```
+
+Common message types:
+- `"text"` - Text content (`props.content` contains the text)
+- `"thinking"` - Reasoning/thinking content (o1, DeepSeek R1 models)
+- `"tool_call"` - Tool/function call
+- `"error"` - Error message (`props.error` contains error details)
+
+### Parallel Agent Calls
+
+The parallel methods allow calling multiple agents concurrently, similar to JavaScript Promise patterns.
+
+> **Important: SSE Output is Automatically Disabled**
+>
+> For all batch calls (`All`, `Any`, `Race`), SSE output is **automatically disabled** (`skip.output = true`).
+> This prevents multiple agents from writing to the same SSE stream simultaneously, which would cause
+> client disconnection and message corruption. Use the `onChunk` callback to receive streaming messages
+> if needed.
+
+#### `ctx.agent.All(requests, options?)`
+
+Executes all agent calls and waits for all to complete (like `Promise.all`).
+
+**Parameters:**
+
+- `requests`: Array of request objects
+- `options`: Object (optional) - Global options including callback
+
+**Request Structure:**
+
+```typescript
+interface AgentRequest {
+  agent: string;                     // Target agent ID
+  messages: Message[];               // Messages to send
+  options?: AgentCallOptions;        // Per-request options (excluding onChunk)
+}
+
+// Note: Per-request onChunk is NOT supported in batch calls.
+// Use the global onChunk callback in the second argument instead.
+// Note: skip.output is automatically set to true for all batch calls.
+```
+
+**Example:**
+
+```javascript
+// Call multiple agents in parallel
+const results = ctx.agent.All([
+  { agent: "analyzer", messages: [{ role: "user", content: "Analyze X" }] },
+  { agent: "summarizer", messages: [{ role: "user", content: "Summarize Y" }] }
+]);
+
+// Results array matches request order
+results.forEach((r, i) => {
+  if (r.error) {
+    console.log(`Agent ${r.agent_id} failed:`, r.error);
+  } else {
+    console.log(`Agent ${r.agent_id} response:`, r.content);
+  }
+});
+
+// With global callback for all responses
+const results = ctx.agent.All([
+  { agent: "agent-1", messages: [...] },
+  { agent: "agent-2", messages: [...] }
+], {
+  onChunk: (agentId, index, msg) => {
+    console.log(`Agent ${agentId} [${index}]:`, msg.type, msg.props?.content);
+    return 0;
+  }
+});
+```
+
+#### `ctx.agent.Any(requests, options?)`
+
+Returns as soon as any agent call succeeds (like `Promise.any`). Other calls continue in background.
+
+**Example:**
+
+```javascript
+// Try multiple agents, use first successful response
+const results = ctx.agent.Any([
+  { agent: "primary.agent", messages: [...] },
+  { agent: "fallback.agent", messages: [...] }
+]);
+
+// First successful result is returned
+const success = results.find(r => !r.error);
+if (success) {
+  console.log("Got response from:", success.agent_id);
+}
+```
+
+#### `ctx.agent.Race(requests, options?)`
+
+Returns as soon as any agent call completes, regardless of success/failure (like `Promise.race`).
+
+**Example:**
+
+```javascript
+// Race multiple agents for fastest response
+const results = ctx.agent.Race([
+  { agent: "fast.agent", messages: [...] },
+  { agent: "slow.agent", messages: [...] }
+]);
+
+// First completed result (may be error or success)
+const first = results.find(r => r !== null);
+console.log("Fastest agent:", first.agent_id);
+```
+
+### Use Cases
+
+```javascript
+// Use case 1: Specialist consultation
+function Next(ctx, payload) {
+  const { completion } = payload;
+  
+  if (completion?.content?.includes("complex analysis")) {
+    // Delegate to specialist
+    const result = ctx.agent.Call("specialist.analyzer", [
+      { role: "user", content: completion.content }
+    ]);
+    
+    return {
+      data: {
+        status: "delegated",
+        specialist_response: result.content
+      }
+    };
+  }
+  
+  return null;
+}
+
+// Use case 2: Parallel processing
+function Create(ctx, messages) {
+  const userQuery = messages[messages.length - 1]?.content;
+  
+  // Query multiple knowledge sources in parallel
+  const results = ctx.agent.All([
+    { agent: "kb.technical", messages: [{ role: "user", content: userQuery }] },
+    { agent: "kb.business", messages: [{ role: "user", content: userQuery }] },
+    { agent: "kb.legal", messages: [{ role: "user", content: userQuery }] }
+  ]);
+  
+  // Combine results
+  const combinedKnowledge = results
+    .filter(r => !r.error)
+    .map(r => r.content)
+    .join("\n\n");
+  
+  // Add to messages
+  return {
+    messages: [
+      ...messages,
+      { role: "system", content: `Relevant knowledge:\n${combinedKnowledge}` }
+    ]
+  };
+}
+
+// Use case 3: Fallback strategy
+function Next(ctx, payload) {
+  if (payload.error) {
+    // Try backup agents
+    const results = ctx.agent.Any([
+      { agent: "backup.gpt4", messages: payload.messages },
+      { agent: "backup.claude", messages: payload.messages }
+    ]);
+    
+    const success = results.find(r => !r.error);
+    if (success) {
+      return { data: { recovered: true, content: success.content } };
+    }
+  }
+  
+  return null;
+}
+```
+
+## LLM API
+
+The `ctx.llm` object provides direct access to LLM connectors for streaming completions. This allows calling LLM models directly without going through the full agent pipeline, useful for quick completions, model comparisons, or building custom workflows.
+
+### Methods Summary
+
+| Method                            | Description                            |
+| --------------------------------- | -------------------------------------- |
+| `Stream(connector, messages, opts)` | Stream LLM completion                |
+| `All(requests, opts?)`            | Call multiple LLMs, wait for all       |
+| `Any(requests, opts?)`            | Call multiple LLMs, first success wins |
+| `Race(requests, opts?)`           | Call multiple LLMs, first complete wins|
+
+### Single LLM Call
+
+#### `ctx.llm.Stream(connector, messages, options?)`
+
+Calls an LLM connector with streaming output to the current context's writer.
+
+**Parameters:**
+
+- `connector`: String - The LLM connector ID (e.g., "gpt-4o", "claude-3")
+- `messages`: Array - Messages to send to the LLM
+- `options`: Object (optional) - LLM options including callback
+
+**Options:**
+
+```typescript
+interface LlmOptions {
+  temperature?: number;           // Sampling temperature (0-2)
+  max_tokens?: number;            // Max tokens (legacy, use max_completion_tokens)
+  max_completion_tokens?: number; // Max completion tokens
+  top_p?: number;                 // Nucleus sampling
+  presence_penalty?: number;      // Presence penalty (-2 to 2)
+  frequency_penalty?: number;     // Frequency penalty (-2 to 2)
+  stop?: string | string[];       // Stop sequences
+  user?: string;                  // User identifier for tracking
+  seed?: number;                  // Random seed for reproducibility
+  tools?: object[];               // Function/tool definitions
+  tool_choice?: string | object;  // Tool choice strategy
+  response_format?: {             // Response format
+    type: string;                 // "text" | "json_object" | "json_schema"
+    json_schema?: {
+      name: string;
+      description?: string;
+      schema: object;
+      strict?: boolean;
+    };
+  };
+  reasoning_effort?: string;      // For reasoning models (e.g., "low", "medium", "high")
+  onChunk?: (msg: Message) => number;  // Callback for each chunk
+}
+```
+
+**Example:**
+
+```javascript
+// Basic streaming call
+const result = ctx.llm.Stream("gpt-4o", [
+  { role: "system", content: "You are a helpful assistant." },
+  { role: "user", content: "Explain quantum computing" }
+]);
+
+// With options and callback
+const result = ctx.llm.Stream("gpt-4o", messages, {
+  temperature: 0.7,
+  max_tokens: 2000,
+  onChunk: (msg) => {
+    console.log("Chunk:", msg.type, msg.props?.content);
+    return 0; // 0 = continue, non-zero = stop
+  }
+});
+
+console.log("Full response:", result.content);
+```
+
+**Returns:**
+
+```typescript
+interface LlmResult {
+  connector: string;                    // Connector ID used
+  response?: CompletionResponse;        // Full completion response
+  content?: string;                     // Extracted text content
+  error?: string;                       // Error message if failed
+}
+```
+
+### Parallel LLM Calls
+
+The parallel methods allow calling multiple LLM connectors concurrently, useful for model comparison, ensemble methods, or fallback strategies.
+
+#### `ctx.llm.All(requests, options?)`
+
+Executes all LLM calls and waits for all to complete (like `Promise.all`).
+
+**Request Structure:**
+
+```typescript
+interface LlmRequest {
+  connector: string;         // LLM connector ID
+  messages: Message[];       // Messages to send
+  options?: LlmOptions;      // Per-request options (excluding onChunk)
+}
+```
+
+**Example:**
+
+```javascript
+// Compare responses from multiple models
+const results = ctx.llm.All([
+  { connector: "gpt-4o", messages: [...], options: { temperature: 0.7 } },
+  { connector: "claude-3", messages: [...], options: { temperature: 0.7 } },
+  { connector: "gemini-pro", messages: [...] }
+]);
+
+results.forEach((r) => {
+  console.log(`${r.connector}: ${r.content?.substring(0, 100)}...`);
+});
+
+// With global callback
+const results = ctx.llm.All([
+  { connector: "gpt-4o", messages: [...] },
+  { connector: "claude-3", messages: [...] }
+], {
+  onChunk: (connectorId, index, msg) => {
+    console.log(`LLM ${connectorId} [${index}]:`, msg.props?.content);
+    return 0;
+  }
+});
+```
+
+#### `ctx.llm.Any(requests, options?)`
+
+Returns as soon as any LLM call succeeds (like `Promise.any`).
+
+**Example:**
+
+```javascript
+// Use first successful response from any model
+const results = ctx.llm.Any([
+  { connector: "gpt-4o", messages: [...] },
+  { connector: "gpt-4o-mini", messages: [...] }
+]);
+
+const success = results.find(r => !r.error);
+if (success) {
+  ctx.Send(success.content);
+}
+```
+
+#### `ctx.llm.Race(requests, options?)`
+
+Returns as soon as any LLM call completes (like `Promise.race`).
+
+**Example:**
+
+```javascript
+// Get fastest response
+const results = ctx.llm.Race([
+  { connector: "gpt-4o-mini", messages: [...] },  // Usually faster
+  { connector: "gpt-4o", messages: [...] }        // Usually slower
+]);
+
+const first = results.find(r => r !== null);
+console.log("Fastest model:", first.connector);
+```
+
+### Use Cases
+
+```javascript
+// Use case 1: Quick classification without full agent pipeline
+function Create(ctx, messages) {
+  const userMessage = messages[messages.length - 1]?.content;
+  
+  // Quick intent classification
+  const result = ctx.llm.Stream("gpt-4o-mini", [
+    { role: "system", content: "Classify intent as: question, command, or chat" },
+    { role: "user", content: userMessage }
+  ], { temperature: 0, max_tokens: 10 });
+  
+  const intent = result.content?.toLowerCase();
+  ctx.memory.context.Set("intent", intent);
+  
+  return { messages };
+}
+
+// Use case 2: Model comparison for quality assurance
+function Next(ctx, payload) {
+  const { completion } = payload;
+  
+  // Get second opinion from different model
+  const results = ctx.llm.All([
+    { connector: "gpt-4o", messages: payload.messages },
+    { connector: "claude-3-opus", messages: payload.messages }
+  ]);
+  
+  // Compare responses
+  const gptResponse = results[0].content;
+  const claudeResponse = results[1].content;
+  
+  return {
+    data: {
+      primary: completion.content,
+      comparisons: {
+        gpt4o: gptResponse,
+        claude: claudeResponse
+      }
+    }
+  };
+}
+
+// Use case 3: Ensemble with voting
+function Create(ctx, messages) {
+  // Get multiple model opinions for important decisions
+  const results = ctx.llm.All([
+    { connector: "gpt-4o", messages: [...] },
+    { connector: "claude-3", messages: [...] },
+    { connector: "gemini-pro", messages: [...] }
+  ]);
+  
+  // Simple majority voting (in real use, implement proper consensus)
+  const responses = results.filter(r => !r.error).map(r => r.content);
+  
+  return {
+    messages: [
+      ...messages,
+      { 
+        role: "system", 
+        content: `Multiple model opinions:\n${responses.map((r, i) => `Model ${i+1}: ${r}`).join('\n')}`
+      }
+    ]
+  };
+}
+
+// Use case 4: Fallback with latency optimization
+function Next(ctx, payload) {
+  if (payload.error) {
+    // Race multiple fallback models
+    const results = ctx.llm.Race([
+      { connector: "gpt-4o-mini", messages: payload.messages },
+      { connector: "claude-3-haiku", messages: payload.messages }
+    ]);
+    
+    const fastest = results.find(r => r !== null);
+    if (fastest && !fastest.error) {
+      ctx.Send(fastest.content);
+      return { data: { recovered: true, model: fastest.connector } };
+    }
+  }
+  
+  return null;
+}
 ```
 
 ## Hooks

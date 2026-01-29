@@ -23,6 +23,10 @@ func (e *Executor) RunTasks(ctx *robottypes.Context, exec *robottypes.Execution,
 		return fmt.Errorf("robot not found in execution")
 	}
 
+	// Update UI field with i18n
+	locale := getEffectiveLocale(robot, exec.Input)
+	e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "breaking_down_tasks"))
+
 	// Validate: Goals must exist (from P1)
 	if exec.Goals == nil || exec.Goals.Content == "" {
 		return fmt.Errorf("goals not available for task planning")
@@ -152,9 +156,11 @@ func ParseTask(data map[string]interface{}, index int) (*robottypes.Task, error)
 		task.Messages = ParseMessages(messages)
 	}
 
-	// Optional: description -> convert to message if no messages
-	if len(task.Messages) == 0 {
-		if desc, ok := data["description"].(string); ok && desc != "" {
+	// Optional: description - save to Description field and convert to message if no messages
+	if desc, ok := data["description"].(string); ok && desc != "" {
+		task.Description = desc
+		// Also convert to Messages for execution if no explicit messages provided
+		if len(task.Messages) == 0 {
 			task.Messages = []agentcontext.Message{
 				{Role: agentcontext.RoleUser, Content: desc},
 			}
@@ -165,6 +171,14 @@ func ParseTask(data map[string]interface{}, index int) (*robottypes.Task, error)
 	if args, ok := data["args"].([]interface{}); ok {
 		task.Args = make([]any, len(args))
 		copy(task.Args, args)
+	}
+
+	// MCP-specific fields (required when executor_type is "mcp")
+	if mcpServer, ok := data["mcp_server"].(string); ok {
+		task.MCPServer = mcpServer
+	}
+	if mcpTool, ok := data["mcp_tool"].(string); ok {
+		task.MCPTool = mcpTool
 	}
 
 	// Optional: expected_output (for P3 validation)
@@ -318,6 +332,7 @@ func SortTasksByOrder(tasks []robottypes.Task) {
 // ValidateExecutorExists checks if the executor ID exists in available resources
 // This is an optional validation - tasks with unknown executors will still be created
 // but may fail during P3 execution
+// For MCP tasks, pass mcpServer as the second parameter (executorID is ignored for MCP)
 func ValidateExecutorExists(executorID string, executorType robottypes.ExecutorType, robot *robottypes.Robot) bool {
 	if robot == nil || robot.Config == nil || robot.Config.Resources == nil {
 		return true // Skip validation if no resources configured
@@ -333,6 +348,10 @@ func ValidateExecutorExists(executorID string, executorType robottypes.ExecutorT
 		return false
 
 	case robottypes.ExecutorMCP:
+		// For MCP, executorID can be either:
+		// 1. The mcp_server value (new format)
+		// 2. The combined mcp_server.mcp_tool format (for display)
+		// We validate against mcp_server (the MCP server/client ID)
 		for _, mcp := range robot.Config.Resources.MCP {
 			if mcp.ID == executorID {
 				return true
@@ -347,4 +366,19 @@ func ValidateExecutorExists(executorID string, executorType robottypes.ExecutorT
 	}
 
 	return false
+}
+
+// ValidateMCPTask validates MCP task fields
+// Returns an error if mcp_server or mcp_tool is missing for MCP tasks
+func ValidateMCPTask(task *robottypes.Task) error {
+	if task.ExecutorType != robottypes.ExecutorMCP {
+		return nil
+	}
+	if task.MCPServer == "" {
+		return fmt.Errorf("MCP task %s: mcp_server field is required", task.ID)
+	}
+	if task.MCPTool == "" {
+		return fmt.Errorf("MCP task %s: mcp_tool field is required", task.ID)
+	}
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/yaoapp/yao/agent/robot/pool"
 	"github.com/yaoapp/yao/agent/robot/trigger"
 	"github.com/yaoapp/yao/agent/robot/types"
+	oauthtypes "github.com/yaoapp/yao/openapi/oauth/types"
 )
 
 // Default configuration values
@@ -137,6 +138,16 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("failed to load robots: %w", err)
 	}
 
+	// Set completion callback to clean up ExecutionController when execution finishes
+	m.pool.SetOnComplete(func(execID, memberID string, status types.ExecStatus) {
+		// Remove from ExecutionController (cleans up in-memory tracking)
+		m.execController.Untrack(execID)
+		// Remove from robot's in-memory execution list
+		if robot := m.cache.Get(memberID); robot != nil {
+			robot.RemoveExecution(execID)
+		}
+	})
+
 	// Start worker pool
 	if err := m.pool.Start(); err != nil {
 		return fmt.Errorf("failed to start pool: %w", err)
@@ -197,9 +208,8 @@ func (m *Manager) tickerLoop() {
 			m.ticker.Stop()
 			return
 		case now := <-m.ticker.C:
-			// Perform tick
-			ctx := types.NewContext(m.ctx, nil)
-			_ = m.Tick(ctx, now)
+			// Perform tick - context is created per-robot in Tick()
+			_ = m.Tick(m.ctx, now)
 		}
 	}
 }
@@ -208,8 +218,8 @@ func (m *Manager) tickerLoop() {
 // 1. Get all cached robots
 // 2. For each robot with clock trigger enabled
 // 3. Check if should execute based on clock config
-// 4. Submit to pool
-func (m *Manager) Tick(ctx *types.Context, now time.Time) error {
+// 4. Submit to pool with robot's own identity
+func (m *Manager) Tick(parentCtx context.Context, now time.Time) error {
 	m.mu.RLock()
 	if !m.started {
 		m.mu.RUnlock()
@@ -250,12 +260,24 @@ func (m *Manager) Tick(ctx *types.Context, now time.Time) error {
 		//     continue
 		// }
 
+		// Pre-generate execution ID and track for pause/resume/stop
+		// We need to track BEFORE submit so we can pass the cancellable context to the executor
+		execID := pool.GenerateExecID()
+		ctrlExec := m.execController.Track(execID, robot.MemberID, robot.TeamID)
+
+		// Create context with robot's own identity and cancellable context
+		// Clock-triggered executions run as the robot itself
+		robotAuth := m.buildRobotAuth(robot)
+		execCtx := types.NewContext(ctrlExec.Context(), robotAuth)
+
 		// Create clock context for P0 inspiration
 		clockCtx := types.NewClockContext(now, robot.Config.Clock.TZ)
 
-		// Submit to pool
-		_, err := m.pool.Submit(ctx, robot, types.TriggerClock, clockCtx)
+		// Submit to pool with the cancellable context and execution control
+		_, err := m.pool.SubmitWithID(execCtx, robot, types.TriggerClock, clockCtx, execID, ctrlExec)
 		if err != nil {
+			// If submission failed, untrack the execution
+			m.execController.Untrack(execID)
 			// Log error but continue with other robots
 			// In production, this would be logged properly
 			continue
@@ -266,6 +288,17 @@ func (m *Manager) Tick(ctx *types.Context, now time.Time) error {
 	}
 
 	return nil
+}
+
+// buildRobotAuth creates AuthorizedInfo for a robot's own identity
+// Used when robot executes autonomously (clock trigger)
+func (m *Manager) buildRobotAuth(robot *types.Robot) *oauthtypes.AuthorizedInfo {
+	return &oauthtypes.AuthorizedInfo{
+		UserID: robot.MemberID,
+		TeamID: robot.TeamID,
+		// ClientID could be set to a special "robot-agent" identifier if needed
+		ClientID: "robot-agent",
+	}
 }
 
 // shouldTrigger checks if a robot should be triggered based on its clock config
@@ -365,6 +398,7 @@ func (m *Manager) matchesDay(clock *types.Clock, now time.Time) bool {
 
 // TriggerManual manually triggers a robot execution (for testing or API calls)
 // This bypasses clock checking and directly submits to pool
+// For non-autonomous robots: lazy-loads from DB, executes, then unloads
 func (m *Manager) TriggerManual(ctx *types.Context, memberID string, trigger types.TriggerType, data interface{}) (string, error) {
 	m.mu.RLock()
 	if !m.started {
@@ -373,10 +407,10 @@ func (m *Manager) TriggerManual(ctx *types.Context, memberID string, trigger typ
 	}
 	m.mu.RUnlock()
 
-	// Get robot from cache
-	robot := m.cache.Get(memberID)
-	if robot == nil {
-		return "", types.ErrRobotNotFound
+	// Get robot from cache, or lazy-load if not found
+	robot, lazyLoaded, err := m.getOrLoadRobot(ctx, memberID)
+	if err != nil {
+		return "", err
 	}
 
 	// Check robot status
@@ -391,10 +425,31 @@ func (m *Manager) TriggerManual(ctx *types.Context, memberID string, trigger typ
 		}
 	}
 
-	// Submit to pool
-	execID, err := m.pool.Submit(ctx, robot, trigger, data)
+	// Pre-generate execution ID and track for pause/resume/stop
+	// We need to track BEFORE submit so we can pass the cancellable context to the executor
+	execID := pool.GenerateExecID()
+	ctrlExec := m.execController.Track(execID, memberID, robot.TeamID)
+
+	// Create a new context with the cancellable context from ExecutionController
+	// This allows Stop() to propagate cancellation to the executor
+	execCtx := types.NewContext(ctrlExec.Context(), ctx.Auth)
+
+	// Submit to pool with the cancellable context and execution control
+	// The control interface allows executor to check pause state and wait if paused
+	_, err = m.pool.SubmitWithID(execCtx, robot, trigger, data, execID, ctrlExec)
 	if err != nil {
+		// If submission failed, untrack the execution
+		m.execController.Untrack(execID)
+		// If lazy-loaded and submission failed, remove from cache
+		if lazyLoaded {
+			m.cache.Remove(memberID)
+		}
 		return "", err
+	}
+
+	// For lazy-loaded robots, schedule cleanup after execution completes
+	if lazyLoaded {
+		m.scheduleCleanup(robot)
 	}
 
 	return execID, nil
@@ -404,6 +459,7 @@ func (m *Manager) TriggerManual(ctx *types.Context, memberID string, trigger typ
 
 // Intervene processes a human intervention request
 // Human intervention skips P0 (inspiration) and goes directly to P1 (goals)
+// For non-autonomous robots: lazy-loads from DB, executes, then unloads
 func (m *Manager) Intervene(ctx *types.Context, req *types.InterveneRequest) (*types.ExecutionResult, error) {
 	m.mu.RLock()
 	if !m.started {
@@ -417,10 +473,10 @@ func (m *Manager) Intervene(ctx *types.Context, req *types.InterveneRequest) (*t
 		return nil, err
 	}
 
-	// Get robot from cache
-	robot := m.cache.Get(req.MemberID)
-	if robot == nil {
-		return nil, types.ErrRobotNotFound
+	// Get robot from cache, or lazy-load if not found
+	robot, lazyLoaded, err := m.getOrLoadRobot(ctx, req.MemberID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check robot status
@@ -444,6 +500,10 @@ func (m *Manager) Intervene(ctx *types.Context, req *types.InterveneRequest) (*t
 
 	// Handle plan.add action - schedule for later
 	if req.Action == types.ActionPlanAdd && req.PlanTime != nil {
+		// If lazy-loaded but not executing, remove immediately
+		if lazyLoaded {
+			m.cache.Remove(req.MemberID)
+		}
 		// TODO: Add to plan queue (Phase 11.3)
 		return &types.ExecutionResult{
 			Status:  types.ExecPending,
@@ -457,11 +517,20 @@ func (m *Manager) Intervene(ctx *types.Context, req *types.InterveneRequest) (*t
 	// Submit to pool with executor mode
 	execID, err := m.pool.SubmitWithMode(ctx, robot, types.TriggerHuman, triggerInput, executorMode)
 	if err != nil {
+		// If lazy-loaded and submission failed, remove from cache
+		if lazyLoaded {
+			m.cache.Remove(req.MemberID)
+		}
 		return nil, err
 	}
 
 	// Track execution for pause/resume/stop
 	m.execController.Track(execID, req.MemberID, req.TeamID)
+
+	// For lazy-loaded robots, schedule cleanup after execution completes
+	if lazyLoaded {
+		m.scheduleCleanup(robot)
+	}
 
 	return &types.ExecutionResult{
 		ExecutionID: execID,
@@ -472,6 +541,7 @@ func (m *Manager) Intervene(ctx *types.Context, req *types.InterveneRequest) (*t
 
 // HandleEvent processes an event trigger request
 // Event trigger skips P0 (inspiration) and goes directly to P1 (goals)
+// For non-autonomous robots: lazy-loads from DB, executes, then unloads
 func (m *Manager) HandleEvent(ctx *types.Context, req *types.EventRequest) (*types.ExecutionResult, error) {
 	m.mu.RLock()
 	if !m.started {
@@ -485,10 +555,10 @@ func (m *Manager) HandleEvent(ctx *types.Context, req *types.EventRequest) (*typ
 		return nil, err
 	}
 
-	// Get robot from cache
-	robot := m.cache.Get(req.MemberID)
-	if robot == nil {
-		return nil, types.ErrRobotNotFound
+	// Get robot from cache, or lazy-load if not found
+	robot, lazyLoaded, err := m.getOrLoadRobot(ctx, req.MemberID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check robot status
@@ -512,11 +582,20 @@ func (m *Manager) HandleEvent(ctx *types.Context, req *types.EventRequest) (*typ
 	// Submit to pool with executor mode
 	execID, err := m.pool.SubmitWithMode(ctx, robot, types.TriggerEvent, triggerInput, executorMode)
 	if err != nil {
+		// If lazy-loaded and submission failed, remove from cache
+		if lazyLoaded {
+			m.cache.Remove(req.MemberID)
+		}
 		return nil, err
 	}
 
 	// Track execution for pause/resume/stop
 	m.execController.Track(execID, req.MemberID, "")
+
+	// For lazy-loaded robots, schedule cleanup after execution completes
+	if lazyLoaded {
+		m.scheduleCleanup(robot)
+	}
 
 	return &types.ExecutionResult{
 		ExecutionID: execID,
@@ -529,17 +608,70 @@ func (m *Manager) HandleEvent(ctx *types.Context, req *types.EventRequest) (*typ
 
 // PauseExecution pauses a running execution
 func (m *Manager) PauseExecution(ctx *types.Context, execID string) error {
-	return m.execController.Pause(execID)
+	// Get execution info before pausing
+	exec := m.execController.Get(execID)
+	if exec == nil {
+		return fmt.Errorf("execution not found: %s", execID)
+	}
+
+	// Pause the execution
+	if err := m.execController.Pause(execID); err != nil {
+		return err
+	}
+
+	// Remove from robot's in-memory execution list (paused doesn't count as running)
+	if robot := m.cache.Get(exec.MemberID); robot != nil {
+		robot.RemoveExecution(execID)
+	}
+
+	return nil
 }
 
 // ResumeExecution resumes a paused execution
 func (m *Manager) ResumeExecution(ctx *types.Context, execID string) error {
-	return m.execController.Resume(execID)
+	// Get execution info before resuming
+	exec := m.execController.Get(execID)
+	if exec == nil {
+		return fmt.Errorf("execution not found: %s", execID)
+	}
+
+	// Resume the execution
+	if err := m.execController.Resume(execID); err != nil {
+		return err
+	}
+
+	// Add back to robot's in-memory execution list
+	if robot := m.cache.Get(exec.MemberID); robot != nil {
+		robot.AddExecution(&types.Execution{
+			ID:       execID,
+			MemberID: exec.MemberID,
+			TeamID:   exec.TeamID,
+			Status:   types.ExecRunning,
+		})
+	}
+
+	return nil
 }
 
 // StopExecution stops a running execution
 func (m *Manager) StopExecution(ctx *types.Context, execID string) error {
-	return m.execController.Stop(execID)
+	// Get execution info before stopping
+	exec := m.execController.Get(execID)
+	if exec == nil {
+		return fmt.Errorf("execution not found: %s", execID)
+	}
+
+	// Stop the execution
+	if err := m.execController.Stop(execID); err != nil {
+		return err
+	}
+
+	// Remove from robot's in-memory execution list
+	if robot := m.cache.Get(exec.MemberID); robot != nil {
+		robot.RemoveExecution(execID)
+	}
+
+	return nil
 }
 
 // GetExecutionStatus returns the status of an execution
@@ -562,6 +694,70 @@ func (m *Manager) ListExecutionsByMember(memberID string) []*trigger.ControlledE
 }
 
 // ==================== Helper Methods ====================
+
+// getOrLoadRobot gets a robot from cache, or lazy-loads from DB if not found
+// Returns: robot, wasLazyLoaded, error
+func (m *Manager) getOrLoadRobot(ctx *types.Context, memberID string) (*types.Robot, bool, error) {
+	// Try cache first
+	robot := m.cache.Get(memberID)
+	if robot != nil {
+		return robot, false, nil
+	}
+
+	// Not in cache - lazy load from database
+	robot, err := m.cache.LoadByID(ctx, memberID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Add to cache temporarily for execution tracking
+	m.cache.Add(robot)
+
+	// Return with lazyLoaded=true to indicate cleanup needed after execution
+	return robot, true, nil
+}
+
+// scheduleCleanup schedules removal of a lazy-loaded robot after all executions complete
+// This runs in a goroutine that monitors the robot's execution count
+func (m *Manager) scheduleCleanup(robot *types.Robot) {
+	go func() {
+		memberID := robot.MemberID
+
+		// Poll every 5 seconds to check if all executions are done
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		// Timeout after 24 hours to prevent memory leaks
+		timeout := time.After(24 * time.Hour)
+
+		for {
+			select {
+			case <-timeout:
+				// Timeout - force cleanup
+				m.cache.Remove(memberID)
+				return
+
+			case <-ticker.C:
+				// Check if robot still exists in cache
+				r := m.cache.Get(memberID)
+				if r == nil {
+					// Already removed
+					return
+				}
+
+				// Check if all executions are done
+				if r.RunningCount() == 0 {
+					// Only remove if still non-autonomous
+					// (user might have changed it during execution)
+					if !r.AutonomousMode {
+						m.cache.Remove(memberID)
+					}
+					return
+				}
+			}
+		}
+	}()
+}
 
 // resolveExecutorMode determines the executor mode to use
 // Priority: request > robot config > default (standard)
