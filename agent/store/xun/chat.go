@@ -262,6 +262,9 @@ func (store *Xun) ListChats(filter types.ChatFilter) (*types.ChatList, error) {
 	if filter.Keywords != "" {
 		qb.Where("title", "like", fmt.Sprintf("%%%s%%", filter.Keywords))
 	}
+	if filter.ChatIDPrefix != "" {
+		qb.Where("chat_id", "like", filter.ChatIDPrefix+"%")
+	}
 
 	// Apply time range filter
 	if filter.StartTime != nil {

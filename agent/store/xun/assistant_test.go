@@ -788,6 +788,467 @@ func TestSaveAssistant(t *testing.T) {
 		t.Logf("Successfully saved and retrieved source code for assistant %s", id)
 	})
 
+	t.Run("SandboxConfiguration", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:      "Sandbox Test Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Sandbox: &types.Sandbox{
+				Command: "claude",
+				Timeout: "5m",
+				Arguments: map[string]interface{}{
+					"max_turns":       10,
+					"permission_mode": "bypassPermissions",
+				},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with sandbox: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Sandbox == nil {
+			t.Fatal("Expected sandbox to be set")
+		}
+
+		if retrieved.Sandbox.Command != "claude" {
+			t.Errorf("Expected command 'claude', got '%s'", retrieved.Sandbox.Command)
+		}
+
+		if retrieved.Sandbox.Timeout != "5m" {
+			t.Errorf("Expected timeout '5m', got '%s'", retrieved.Sandbox.Timeout)
+		}
+
+		if retrieved.Sandbox.Arguments == nil {
+			t.Fatal("Expected sandbox arguments to be set")
+		}
+
+		if maxTurns, ok := retrieved.Sandbox.Arguments["max_turns"].(float64); !ok || maxTurns != 10 {
+			t.Errorf("Expected max_turns 10, got %v", retrieved.Sandbox.Arguments["max_turns"])
+		}
+
+		t.Logf("Successfully saved and retrieved sandbox configuration for assistant %s", id)
+	})
+
+	t.Run("SandboxWithImage", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:      "Sandbox Image Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Sandbox: &types.Sandbox{
+				Command:   "claude",
+				Image:     "yaoapp/sandbox-claude-desktop:latest",
+				Timeout:   "20m",
+				MaxMemory: "4g",
+				MaxCPU:    2.0,
+				Arguments: map[string]interface{}{
+					"max_turns":        500,
+					"permission_mode":  "bypassPermissions",
+					"disallowed_tools": "WebSearch",
+				},
+				Secrets: map[string]string{
+					"GITHUB_TOKEN": "$ENV.GITHUB_TOKEN",
+				},
+			},
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with sandbox image: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Sandbox == nil {
+			t.Fatal("Expected sandbox to be set")
+		}
+
+		if retrieved.Sandbox.Image != "yaoapp/sandbox-claude-desktop:latest" {
+			t.Errorf("Expected image 'yaoapp/sandbox-claude-desktop:latest', got '%s'", retrieved.Sandbox.Image)
+		}
+
+		if retrieved.Sandbox.MaxMemory != "4g" {
+			t.Errorf("Expected max_memory '4g', got '%s'", retrieved.Sandbox.MaxMemory)
+		}
+
+		if retrieved.Sandbox.MaxCPU != 2.0 {
+			t.Errorf("Expected max_cpu 2.0, got %f", retrieved.Sandbox.MaxCPU)
+		}
+
+		if retrieved.Sandbox.Secrets == nil || retrieved.Sandbox.Secrets["GITHUB_TOKEN"] != "$ENV.GITHUB_TOKEN" {
+			t.Errorf("Expected secrets to contain GITHUB_TOKEN, got %v", retrieved.Sandbox.Secrets)
+		}
+
+		t.Logf("Successfully saved and retrieved sandbox with image for assistant %s", id)
+	})
+
+	t.Run("NilSandbox", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:      "No Sandbox Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant without sandbox: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Sandbox != nil {
+			t.Errorf("Expected sandbox to be nil, got %+v", retrieved.Sandbox)
+		}
+	})
+
+	t.Run("CapabilitiesField", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:         "Capabilities Test",
+			Type:         "assistant",
+			Connector:    "openai",
+			Share:        "private",
+			Description:  "A test assistant",
+			Capabilities: "Can search the web, analyze data, write code, and summarize documents.",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with capabilities: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Capabilities != "Can search the web, analyze data, write code, and summarize documents." {
+			t.Errorf("Expected capabilities to match, got '%s'", retrieved.Capabilities)
+		}
+
+		if retrieved.Description != "A test assistant" {
+			t.Errorf("Expected description 'A test assistant', got '%s'", retrieved.Description)
+		}
+
+		t.Logf("Successfully saved and retrieved capabilities for assistant %s", id)
+	})
+
+	t.Run("EmptyCapabilities", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:      "No Capabilities Assistant",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant without capabilities: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Capabilities != "" {
+			t.Errorf("Expected empty capabilities, got '%s'", retrieved.Capabilities)
+		}
+	})
+
+	t.Run("CapabilitiesWithI18n", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:         "{{name}}",
+			Type:         "assistant",
+			Connector:    "openai",
+			Share:        "private",
+			Description:  "{{description}}",
+			Capabilities: "{{capabilities}}",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with i18n capabilities: %v", err)
+		}
+
+		// Setup i18n
+		i18n.Locales[id] = map[string]i18n.I18n{
+			"en": {
+				Locale: "en",
+				Messages: map[string]any{
+					"name":         "i18n Test",
+					"description":  "Description in English",
+					"capabilities": "Can do X, Y, and Z",
+				},
+			},
+			"zh-cn": {
+				Locale: "zh-cn",
+				Messages: map[string]any{
+					"name":         "国际化测试",
+					"description":  "中文描述",
+					"capabilities": "可以做X、Y和Z",
+				},
+			},
+		}
+
+		retrievedEN, err := store.GetAssistant(id, types.AssistantFullFields, "en")
+		if err != nil {
+			t.Fatalf("Failed to get assistant with EN locale: %v", err)
+		}
+
+		if retrievedEN.Capabilities != "Can do X, Y, and Z" {
+			t.Errorf("Expected capabilities 'Can do X, Y, and Z', got '%s'", retrievedEN.Capabilities)
+		}
+
+		retrievedZH, err := store.GetAssistant(id, types.AssistantFullFields, "zh-cn")
+		if err != nil {
+			t.Fatalf("Failed to get assistant with ZH locale: %v", err)
+		}
+
+		if retrievedZH.Capabilities != "可以做X、Y和Z" {
+			t.Errorf("Expected capabilities '可以做X、Y和Z', got '%s'", retrievedZH.Capabilities)
+		}
+
+		// Cleanup
+		delete(i18n.Locales, id)
+		t.Logf("Successfully tested capabilities i18n for assistant %s", id)
+	})
+
+	t.Run("CapabilitiesInKeywordSearch", func(t *testing.T) {
+		uniqueCapability := fmt.Sprintf("unique-cap-%d", time.Now().UnixNano())
+		assistant := &types.AssistantModel{
+			Name:         "Capabilities Search Test",
+			Type:         "assistant",
+			Connector:    "openai",
+			Share:        "private",
+			Capabilities: uniqueCapability,
+		}
+
+		_, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to save assistant: %v", err)
+		}
+
+		response, err := store.GetAssistants(types.AssistantFilter{
+			Keywords: uniqueCapability,
+			Page:     1,
+			PageSize: 20,
+		})
+		if err != nil {
+			t.Fatalf("Failed to search by capabilities keyword: %v", err)
+		}
+
+		if len(response.Data) < 1 {
+			t.Error("Expected to find assistant by capabilities keyword search")
+		}
+
+		found := false
+		for _, a := range response.Data {
+			if a.Capabilities == uniqueCapability {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Error("Expected to find assistant with matching capabilities")
+		}
+	})
+
+	t.Run("UpdateSandbox", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:      "Update Sandbox Test",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update with sandbox
+		updates := map[string]interface{}{
+			"sandbox": &types.Sandbox{
+				Command: "claude",
+				Timeout: "10m",
+			},
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update sandbox: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Sandbox == nil {
+			t.Fatal("Expected sandbox to be set")
+		}
+
+		if retrieved.Sandbox.Command != "claude" {
+			t.Errorf("Expected command 'claude', got '%s'", retrieved.Sandbox.Command)
+		}
+
+		// Update to remove sandbox
+		updates2 := map[string]interface{}{
+			"sandbox": nil,
+		}
+
+		err = store.UpdateAssistant(id, updates2)
+		if err != nil {
+			t.Fatalf("Failed to remove sandbox: %v", err)
+		}
+
+		retrieved2, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved2.Sandbox != nil {
+			t.Errorf("Expected sandbox to be nil, got %+v", retrieved2.Sandbox)
+		}
+	})
+
+	t.Run("UpdateCapabilities", func(t *testing.T) {
+		assistant := &types.AssistantModel{
+			Name:         "Update Capabilities Test",
+			Type:         "assistant",
+			Connector:    "openai",
+			Share:        "private",
+			Capabilities: "Original capabilities",
+		}
+
+		id, err := store.SaveAssistant(assistant)
+		if err != nil {
+			t.Fatalf("Failed to create assistant: %v", err)
+		}
+
+		// Update capabilities
+		updates := map[string]interface{}{
+			"capabilities": "Updated capabilities: can search, analyze, and write code",
+		}
+
+		err = store.UpdateAssistant(id, updates)
+		if err != nil {
+			t.Fatalf("Failed to update capabilities: %v", err)
+		}
+
+		retrieved, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved.Capabilities != "Updated capabilities: can search, analyze, and write code" {
+			t.Errorf("Expected updated capabilities, got '%s'", retrieved.Capabilities)
+		}
+
+		// Update to clear capabilities
+		updates2 := map[string]interface{}{
+			"capabilities": "",
+		}
+
+		err = store.UpdateAssistant(id, updates2)
+		if err != nil {
+			t.Fatalf("Failed to clear capabilities: %v", err)
+		}
+
+		retrieved2, err := store.GetAssistant(id, types.AssistantFullFields)
+		if err != nil {
+			t.Fatalf("Failed to retrieve assistant: %v", err)
+		}
+
+		if retrieved2.Capabilities != "" {
+			t.Errorf("Expected empty capabilities, got '%s'", retrieved2.Capabilities)
+		}
+	})
+
+	t.Run("FilterBySandbox", func(t *testing.T) {
+		// Create one assistant with sandbox
+		withSandbox := &types.AssistantModel{
+			Name:      "Filter Sandbox Yes",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+			Sandbox: &types.Sandbox{
+				Command: "claude",
+				Timeout: "5m",
+			},
+		}
+		idWith, err := store.SaveAssistant(withSandbox)
+		if err != nil {
+			t.Fatalf("Failed to save assistant with sandbox: %v", err)
+		}
+
+		// Create one assistant without sandbox
+		withoutSandbox := &types.AssistantModel{
+			Name:      "Filter Sandbox No",
+			Type:      "assistant",
+			Connector: "openai",
+			Share:     "private",
+		}
+		idWithout, err := store.SaveAssistant(withoutSandbox)
+		if err != nil {
+			t.Fatalf("Failed to save assistant without sandbox: %v", err)
+		}
+
+		testIDs := []string{idWith, idWithout}
+
+		// Filter: sandbox=true, scoped to test IDs
+		trueVal := true
+		result, err := store.GetAssistants(types.AssistantFilter{
+			Page:         1,
+			PageSize:     100,
+			Sandbox:      &trueVal,
+			AssistantIDs: testIDs,
+		})
+		if err != nil {
+			t.Fatalf("Failed to filter with sandbox=true: %v", err)
+		}
+		if len(result.Data) != 1 {
+			t.Errorf("Expected 1 result for sandbox=true, got %d", len(result.Data))
+		} else if result.Data[0].ID != idWith {
+			t.Errorf("Expected assistant %s, got %s", idWith, result.Data[0].ID)
+		}
+
+		// Filter: sandbox=false, scoped to test IDs
+		falseVal := false
+		result2, err := store.GetAssistants(types.AssistantFilter{
+			Page:         1,
+			PageSize:     100,
+			Sandbox:      &falseVal,
+			AssistantIDs: testIDs,
+		})
+		if err != nil {
+			t.Fatalf("Failed to filter with sandbox=false: %v", err)
+		}
+		if len(result2.Data) != 1 {
+			t.Errorf("Expected 1 result for sandbox=false, got %d", len(result2.Data))
+		} else if result2.Data[0].ID != idWithout {
+			t.Errorf("Expected assistant %s, got %s", idWithout, result2.Data[0].ID)
+		}
+
+		t.Logf("Sandbox filter test passed: sandbox=true returned %d, sandbox=false returned %d", len(result.Data), len(result2.Data))
+	})
+
 	t.Run("AllNewFieldsTogether", func(t *testing.T) {
 		// Test assistant with all new fields together
 		optionalFalse := false

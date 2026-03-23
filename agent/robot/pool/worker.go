@@ -1,12 +1,14 @@
 package pool
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/yaoapp/yao/agent/robot/logger"
 	"github.com/yaoapp/yao/agent/robot/types"
 )
+
+var log = logger.New("pool")
 
 // Worker represents a worker goroutine that processes jobs
 type Worker struct {
@@ -90,11 +92,22 @@ func (w *Worker) execute(item *QueueItem) {
 			w.requeue(item, "quota exceeded (race)")
 			return
 		}
-		fmt.Printf("Worker %d: Execution failed for robot %s: %v\n",
+
+		// Suspended execution: state is persisted, worker slot released gracefully.
+		// Do NOT call onComplete — the execution stays in robot.Executions and execController
+		// so that Resume can find it later (§16.1).
+		if err == types.ErrExecutionSuspended {
+			if execution != nil {
+				log.Info("Worker %d: Execution %s suspended for robot %s (waiting for input)",
+					w.id, execution.ID, item.Robot.MemberID)
+			}
+			return
+		}
+
+		log.Error("Worker %d: Execution failed for robot %s: %v",
 			w.id, item.Robot.MemberID, err)
 		// Notify completion callback with appropriate status
 		if w.pool.onComplete != nil {
-			// Determine status based on error type
 			status := types.ExecFailed
 			if err == types.ErrExecutionCancelled {
 				status = types.ExecCancelled
@@ -105,7 +118,7 @@ func (w *Worker) execute(item *QueueItem) {
 	}
 
 	if execution != nil {
-		fmt.Printf("Worker %d: Execution %s completed for robot %s (status: %s)\n",
+		log.Info("Worker %d: Execution %s completed for robot %s (status: %s)",
 			w.id, execution.ID, item.Robot.MemberID, execution.Status)
 		// Notify completion callback
 		if w.pool.onComplete != nil {
@@ -120,8 +133,7 @@ func (w *Worker) requeue(item *QueueItem, reason string) {
 	// - If queue has space: task waits for robot quota
 	// - If queue is full: system is overloaded, drop task
 	if !w.pool.queue.Enqueue(item) {
-		// Queue full = system overloaded, drop task (protective discard)
-		fmt.Printf("Worker %d: Task for robot %s dropped (queue full, %s)\n",
+		log.Warn("Worker %d: Task for robot %s dropped (queue full, %s)",
 			w.id, item.Robot.MemberID, reason)
 	}
 }

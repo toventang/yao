@@ -1,9 +1,11 @@
 package caller
 
 import (
+	"fmt"
 	"sync"
 
 	agentContext "github.com/yaoapp/yao/agent/context"
+	"github.com/yaoapp/yao/trace/types"
 )
 
 // Orchestrator handles parallel agent calls with different concurrency patterns
@@ -225,20 +227,14 @@ func (o *Orchestrator) callAgentWithContext(ctx *agentContext.Context, req *Requ
 		return &Result{Error: "nil request"}
 	}
 
-	result := &Result{
-		AgentID: req.AgentID,
-	}
-
 	// Get the agent using the getter function
 	if AgentGetterFunc == nil {
-		result.Error = "agent getter not initialized"
-		return result
+		return NewResult(req.AgentID, nil, fmt.Errorf("agent getter not initialized"))
 	}
 
 	agent, err := AgentGetterFunc(req.AgentID)
 	if err != nil {
-		result.Error = "failed to get agent: " + err.Error()
-		return result
+		return NewResult(req.AgentID, nil, fmt.Errorf("failed to get agent: %w", err))
 	}
 
 	// Mark this as an agent-to-agent fork call for proper source tracking
@@ -262,22 +258,41 @@ func (o *Orchestrator) callAgentWithContext(ctx *agentContext.Context, req *Requ
 		ctxOpts.OnMessage = req.Handler
 	}
 
-	// Execute the agent call with the provided context
-	// The agent.Stream method will use the context's Writer for output
+	// Add trace node for A2A call using the ORIGINAL parent context's trace
+	// (forked contexts have nil trace and nil Stack, so ctx.Trace() would create a new orphan trace)
+	parentTrace, _ := o.ctx.Trace()
+	var a2aNode types.Node
+	if parentTrace != nil {
+		a2aNode, _ = parentTrace.Add(
+			map[string]any{
+				"agent_id": req.AgentID,
+				"referer":  string(ctx.Referer),
+			},
+			types.TraceNodeOption{
+				Label:       fmt.Sprintf("Agent: %s", req.AgentID),
+				Type:        "agent_call",
+				Icon:        "smart_toy",
+				Description: fmt.Sprintf("A2A call to '%s'", req.AgentID),
+			},
+		)
+	}
+
 	resp, err := agent.Stream(ctx, req.Messages, ctxOpts)
 	if err != nil {
-		result.Error = "agent call failed: " + err.Error()
-		return result
+		if a2aNode != nil {
+			a2aNode.Fail(err)
+		}
+		return NewResult(req.AgentID, nil, fmt.Errorf("agent call failed: %w", err))
 	}
 
-	result.Response = resp
-
-	// Extract content from completion if available
-	if resp != nil && resp.Completion != nil {
-		result.Content = extractContentFromCompletion(resp.Completion)
+	if a2aNode != nil {
+		a2aNode.Complete(map[string]any{
+			"agent_id": req.AgentID,
+			"status":   "completed",
+		})
 	}
 
-	return result
+	return NewResult(req.AgentID, resp, nil)
 }
 
 // extractContentFromCompletion extracts the text content from a completion response

@@ -70,9 +70,9 @@ func TestIntegrationSchedulingFlow(t *testing.T) {
 		assert.Equal(t, "robot_integ_flow_clock", robot.MemberID)
 		assert.Equal(t, types.RobotIdle, robot.Status)
 
-		// Simulate clock trigger at matching time (09:00 on Wednesday)
+		// Simulate clock trigger at matching time (03:33 on Wednesday)
 		loc, _ := time.LoadLocation("Asia/Shanghai")
-		triggerTime := time.Date(2025, 1, 15, 9, 0, 0, 0, loc) // Wednesday 09:00
+		triggerTime := time.Date(2025, 1, 15, 3, 33, 0, 0, loc) // Wednesday 03:33
 
 		ctx := types.NewContext(context.Background(), nil)
 		err = m.Tick(ctx, triggerTime)
@@ -229,6 +229,7 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 	defer cleanupIntegrationRobots(t)
 
 	t.Run("clock trigger executes all phases P0-P5", func(t *testing.T) {
+		cleanupIntegrationRobots(t)
 		setupIntegrationRobotTimes(t, "robot_integ_phases_clock", "team_integ_phases")
 
 		// Track phases executed
@@ -250,7 +251,6 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 
 		err := m.Start()
 		require.NoError(t, err)
-		defer m.Stop()
 
 		// Trigger execution
 		ctx := types.NewContext(context.Background(), nil)
@@ -260,6 +260,9 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 		// Wait for execution
 		time.Sleep(500 * time.Millisecond)
 
+		// Stop manager before asserting to prevent ticker from triggering extra executions
+		m.Stop()
+
 		// Verify all 6 phases executed (P0-P5)
 		assert.Len(t, phasesExecuted, 6, "Should execute all 6 phases for clock trigger")
 		assert.Equal(t, types.PhaseInspiration, phasesExecuted[0], "Should start with P0")
@@ -267,6 +270,7 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 	})
 
 	t.Run("human trigger skips P0 and executes P1-P5", func(t *testing.T) {
+		cleanupIntegrationRobots(t)
 		setupIntegrationRobotIntervene(t, "robot_integ_phases_human", "team_integ_phases")
 
 		// Track phases executed
@@ -288,7 +292,6 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 
 		err := m.Start()
 		require.NoError(t, err)
-		defer m.Stop()
 
 		// Trigger execution via human trigger
 		ctx := types.NewContext(context.Background(), nil)
@@ -297,6 +300,9 @@ func TestIntegrationPhaseProgression(t *testing.T) {
 
 		// Wait for execution
 		time.Sleep(500 * time.Millisecond)
+
+		// Stop manager before asserting to prevent ticker from triggering extra executions
+		m.Stop()
 
 		// Verify 5 phases executed (P1-P5, skipping P0)
 		assert.Len(t, phasesExecuted, 5, "Should execute 5 phases for human trigger")
@@ -369,7 +375,7 @@ func setupIntegrationRobotTimes(t *testing.T, memberID, teamID string) {
 		},
 		"clock": map[string]interface{}{
 			"mode":    "times",
-			"times":   []string{"09:00", "14:00", "17:00"},
+			"times":   []string{"03:33"},
 			"days":    []string{"Mon", "Tue", "Wed", "Thu", "Fri"},
 			"tz":      "Asia/Shanghai",
 			"timeout": "30m",
@@ -460,7 +466,7 @@ func setupIntegrationRobotHighQuota(t *testing.T, memberID, teamID string) {
 		},
 		"clock": map[string]interface{}{
 			"mode":  "times",
-			"times": []string{"09:00"},
+			"times": []string{"03:33"},
 			"tz":    "Asia/Shanghai",
 		},
 	}

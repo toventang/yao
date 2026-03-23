@@ -1,7 +1,6 @@
 package types
 
 import (
-	"github.com/yaoapp/gou/connector/openai"
 	"github.com/yaoapp/yao/agent/assistant"
 	searchTypes "github.com/yaoapp/yao/agent/search/types"
 	store "github.com/yaoapp/yao/agent/store/types"
@@ -23,11 +22,10 @@ type DSL struct {
 	// If not set, fallback to the first connector that supports the required capabilities
 	System *System `json:"system,omitempty" yaml:"system,omitempty"`
 
-	// Global External Settings - model capabilities, tools, etc.
+	// Global External Settings
 	// ===============================
-	Models map[string]openai.Capabilities `json:"models,omitempty" yaml:"models,omitempty"` // The model capabilities configuration
-	KB     *store.KBSetting               `json:"kb,omitempty" yaml:"kb,omitempty"`         // The knowledge base configuration loaded from agent/kb.yml
-	Search *searchTypes.Config            `json:"search,omitempty" yaml:"search,omitempty"` // The search configuration loaded from agent/search.yao
+	KB     *store.KBSetting    `json:"kb,omitempty" yaml:"kb,omitempty"`         // The knowledge base configuration loaded from agent/kb.yml
+	Search *searchTypes.Config `json:"search,omitempty" yaml:"search,omitempty"` // The search configuration loaded from agent/search.yao
 
 	// Internal
 	// ===============================

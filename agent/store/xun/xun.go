@@ -168,9 +168,18 @@ func (store *Xun) getAssistantTable() string {
 func (store *Xun) parseJSONFields(data map[string]interface{}, fields []string) {
 	for _, field := range fields {
 		if val := data[field]; val != nil {
-			if strVal, ok := val.(string); ok && strVal != "" {
+			var jsonStr string
+			switch v := val.(type) {
+			case string:
+				jsonStr = v
+			case []byte:
+				jsonStr = string(v)
+			default:
+				continue
+			}
+			if jsonStr != "" {
 				var parsed interface{}
-				if err := jsoniter.UnmarshalFromString(strVal, &parsed); err == nil {
+				if err := jsoniter.UnmarshalFromString(jsonStr, &parsed); err == nil {
 					data[field] = parsed
 				}
 			}

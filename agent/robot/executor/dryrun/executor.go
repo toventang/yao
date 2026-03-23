@@ -234,5 +234,10 @@ func (e *Executor) Reset() {
 	e.currentCount.Store(0)
 }
 
+// Resume is not supported in dry-run mode
+func (e *Executor) Resume(ctx *robottypes.Context, execID string, reply string) error {
+	return fmt.Errorf("resume is not supported in dry-run executor")
+}
+
 // Verify Executor implements types.Executor
 var _ types.Executor = (*Executor)(nil)

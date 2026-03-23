@@ -27,7 +27,7 @@ func TestValidatorValidateWithContext(t *testing.T) {
 
 	t.Run("validates with no rules - passes with valid output", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -46,7 +46,7 @@ func TestValidatorValidateWithContext(t *testing.T) {
 
 	t.Run("validates with no rules - incomplete with empty output", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -63,7 +63,7 @@ func TestValidatorValidateWithContext(t *testing.T) {
 
 	t.Run("validates with rule-based validation - passes", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -82,7 +82,7 @@ func TestValidatorValidateWithContext(t *testing.T) {
 
 	t.Run("validates with rule-based validation - fails", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -103,7 +103,7 @@ func TestValidatorValidateWithContext(t *testing.T) {
 
 	t.Run("validates with semantic validation", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -136,7 +136,7 @@ func TestValidatorIsComplete(t *testing.T) {
 
 	t.Run("complete when passed with valid output", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -152,7 +152,7 @@ func TestValidatorIsComplete(t *testing.T) {
 
 	t.Run("not complete when passed but empty output", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -168,7 +168,7 @@ func TestValidatorIsComplete(t *testing.T) {
 
 	t.Run("not complete when validation failed", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -186,7 +186,7 @@ func TestValidatorIsComplete(t *testing.T) {
 
 	t.Run("not complete when score below threshold", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		config.ValidationThreshold = 0.9 // High threshold
 		validator := standard.NewValidator(ctx, robot, config)
 
@@ -217,7 +217,7 @@ func TestValidatorCheckNeedReply(t *testing.T) {
 
 	t.Run("no reply needed when complete", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -235,7 +235,7 @@ func TestValidatorCheckNeedReply(t *testing.T) {
 
 	t.Run("reply needed when validation failed with suggestions", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -257,7 +257,7 @@ func TestValidatorCheckNeedReply(t *testing.T) {
 
 	t.Run("reply needed when output is empty but passed", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -290,7 +290,7 @@ func TestValidatorConvertStringRule(t *testing.T) {
 
 	t.Run("converts 'valid JSON' rule", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -311,7 +311,7 @@ func TestValidatorConvertStringRule(t *testing.T) {
 
 	t.Run("converts 'must contain' rule", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -330,7 +330,7 @@ func TestValidatorConvertStringRule(t *testing.T) {
 
 	t.Run("converts 'not empty' rule", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -352,7 +352,7 @@ func TestValidatorConvertStringRule(t *testing.T) {
 
 	t.Run("converts 'json array' rule", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -382,7 +382,7 @@ func TestValidatorParseRules(t *testing.T) {
 
 	t.Run("parses JSON assertion rules", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -401,7 +401,7 @@ func TestValidatorParseRules(t *testing.T) {
 
 	t.Run("parses regex rules", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -420,7 +420,7 @@ func TestValidatorParseRules(t *testing.T) {
 
 	t.Run("parses json_path rules", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -447,7 +447,7 @@ func TestValidatorParseRules(t *testing.T) {
 
 	t.Run("parses type rules with path", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -481,7 +481,7 @@ func TestValidatorSemanticValidation(t *testing.T) {
 
 	t.Run("semantic validation with expected output", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -506,7 +506,7 @@ func TestValidatorSemanticValidation(t *testing.T) {
 
 	t.Run("semantic validation with complex criteria", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -547,7 +547,7 @@ func TestValidatorMergeResults(t *testing.T) {
 
 	t.Run("both rule and semantic validation pass", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -566,7 +566,7 @@ func TestValidatorMergeResults(t *testing.T) {
 
 	t.Run("rule passes but semantic fails", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{
@@ -586,7 +586,7 @@ func TestValidatorMergeResults(t *testing.T) {
 
 	t.Run("rule fails - semantic not run", func(t *testing.T) {
 		robot := createValidatorTestRobot(t)
-		config := standard.DefaultRunConfig()
+		config := standard.DefaultValidatorConfig()
 		validator := standard.NewValidator(ctx, robot, config)
 
 		task := &types.Task{

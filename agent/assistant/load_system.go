@@ -256,20 +256,11 @@ func resolveSystemConnector(agentID string) string {
 
 // findCapableConnector finds the first connector that supports tool calling
 func findCapableConnector() string {
-	// Get all registered connectors
 	for id, conn := range connector.Connectors {
 		if !conn.Is(connector.OPENAI) {
 			continue
 		}
 
-		// Check from modelCapabilities (user-defined in models.yml)
-		if caps, exists := modelCapabilities[id]; exists {
-			if caps.ToolCalls {
-				return id
-			}
-		}
-
-		// Check capabilities from connector's Options
 		if connOpenAI, ok := conn.(*gouOpenAI.Connector); ok {
 			if connOpenAI.Options.Capabilities != nil && connOpenAI.Options.Capabilities.ToolCalls {
 				return id
@@ -277,7 +268,6 @@ func findCapableConnector() string {
 		}
 	}
 
-	// No capable connector found, return empty
 	return ""
 }
 

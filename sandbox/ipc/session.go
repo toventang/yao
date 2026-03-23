@@ -24,23 +24,24 @@ func (s *Session) SetContext(ctx *AgentContext) {
 
 // Close closes the session and cleans up resources
 func (s *Session) Close() error {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if s.Conn != nil {
-		s.Conn.Close()
-	}
-	if s.Listener != nil {
-		s.Listener.Close()
-	}
-	// Remove socket file
-	os.Remove(s.SocketPath)
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.Conn != nil {
+			s.Conn.Close()
+		}
+		if s.Listener != nil {
+			s.Listener.Close()
+		}
+		os.Remove(s.SocketPath)
+	})
 	return nil
 }
 
 // serve handles incoming connections
 func (s *Session) serve(ctx context.Context) {
-	defer s.cleanup()
+	defer s.Close()
 
 	for {
 		select {
@@ -49,10 +50,8 @@ func (s *Session) serve(ctx context.Context) {
 		default:
 		}
 
-		// Accept connection with deadline to allow context cancellation check
 		conn, err := s.Listener.Accept()
 		if err != nil {
-			// Check if context was cancelled
 			select {
 			case <-ctx.Done():
 				return
@@ -64,17 +63,6 @@ func (s *Session) serve(ctx context.Context) {
 		s.Conn = conn
 		s.handleConnection(ctx, conn)
 	}
-}
-
-// cleanup cleans up session resources
-func (s *Session) cleanup() {
-	if s.Conn != nil {
-		s.Conn.Close()
-	}
-	if s.Listener != nil {
-		s.Listener.Close()
-	}
-	os.Remove(s.SocketPath)
 }
 
 // handleConnection handles a single connection

@@ -17,6 +17,7 @@ func TestPhaseEnum(t *testing.T) {
 }
 
 func TestAllPhases(t *testing.T) {
+	// AllPhases is the execution pipeline — PhaseHost is excluded (it is a cross-phase service role)
 	assert.Len(t, types.AllPhases, 6)
 	assert.Equal(t, types.PhaseInspiration, types.AllPhases[0])
 	assert.Equal(t, types.PhaseGoals, types.AllPhases[1])
@@ -24,6 +25,10 @@ func TestAllPhases(t *testing.T) {
 	assert.Equal(t, types.PhaseRun, types.AllPhases[3])
 	assert.Equal(t, types.PhaseDelivery, types.AllPhases[4])
 	assert.Equal(t, types.PhaseLearning, types.AllPhases[5])
+
+	// AllConfigurablePhases includes PhaseHost for configuration validation
+	assert.Len(t, types.AllConfigurablePhases, 7)
+	assert.Contains(t, types.AllConfigurablePhases, types.PhaseHost)
 }
 
 func TestClockModeEnum(t *testing.T) {

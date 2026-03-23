@@ -266,11 +266,12 @@ func NewStatusResponse(s *robotapi.RobotState) *StatusResponse {
 
 // ExecutionFilter - query params for listing executions
 type ExecutionFilter struct {
-	Status      string `form:"status"`       // pending | running | paused | completed | failed | cancelled
-	TriggerType string `form:"trigger_type"` // clock | human | event
-	Keyword     string `form:"keyword"`      // search in execution details
-	Page        int    `form:"page"`
-	PageSize    int    `form:"pagesize"`
+	Status        string `form:"status"`         // pending | running | paused | completed | failed | cancelled
+	ExcludeStatus string `form:"exclude_status"` // comma-separated statuses to exclude, e.g. "confirming,waiting"
+	TriggerType   string `form:"trigger_type"`   // clock | human | event
+	Keyword       string `form:"keyword"`        // search in execution details
+	Page          int    `form:"page"`
+	PageSize      int    `form:"pagesize"`
 }
 
 // ExecutionResponse - single execution response

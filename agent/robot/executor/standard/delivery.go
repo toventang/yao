@@ -7,41 +7,32 @@ import (
 	"time"
 
 	"github.com/yaoapp/gou/model"
+	kunlog "github.com/yaoapp/kun/log"
+	robotevents "github.com/yaoapp/yao/agent/robot/events"
 	robottypes "github.com/yaoapp/yao/agent/robot/types"
+	"github.com/yaoapp/yao/event"
 )
 
 // RunDelivery executes P4: Delivery phase
-// Calls the Delivery Agent to generate content, then routes to Delivery Center
-//
-// Input:
-//   - Full execution context (P0-P3)
-//   - Robot config
-//
-// Output:
-//   - DeliveryResult with content and channel results
 //
 // Process:
 //  1. Call Delivery Agent with full execution context
 //  2. Agent generates DeliveryContent (summary, body, attachments)
-//  3. Route content to Delivery Center for actual delivery
+//  3. Push delivery event for asynchronous routing via handlers
 func (e *Executor) RunDelivery(ctx *robottypes.Context, exec *robottypes.Execution, _ interface{}) error {
-	// Get robot for identity and resources
 	robot := exec.GetRobot()
 	if robot == nil {
 		return fmt.Errorf("robot not found in execution")
 	}
 
-	// Update UI field with i18n
 	locale := getEffectiveLocale(robot, exec.Input)
 	e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "generating_delivery"))
 
-	// Get agent ID for delivery phase
-	agentID := "__yao.delivery" // default
+	agentID := "__yao.delivery"
 	if robot.Config != nil && robot.Config.Resources != nil {
 		agentID = robot.Config.Resources.GetPhaseAgent(robottypes.PhaseDelivery)
 	}
 
-	// Build input for Delivery Agent
 	formatter := NewInputFormatter()
 	userContent := formatter.FormatDeliveryInput(exec, robot)
 
@@ -49,18 +40,15 @@ func (e *Executor) RunDelivery(ctx *robottypes.Context, exec *robottypes.Executi
 		return fmt.Errorf("no content available for delivery generation")
 	}
 
-	// Call Delivery Agent
 	caller := NewAgentCaller()
+	caller.Connector = robot.LanguageModel
 	result, err := caller.CallWithMessages(ctx, agentID, userContent)
 	if err != nil {
 		return fmt.Errorf("delivery agent (%s) call failed: %w", agentID, err)
 	}
 
-	// Parse response as JSON
-	// Delivery Agent returns: { "content": { "summary": "...", "body": "...", "attachments": [...] } }
 	data, err := result.GetJSON()
 	if err != nil {
-		// Fallback: if not JSON, create minimal content from raw text
 		content := result.GetText()
 		if content == "" {
 			return fmt.Errorf("delivery agent returned empty response")
@@ -73,78 +61,53 @@ func (e *Executor) RunDelivery(ctx *robottypes.Context, exec *robottypes.Executi
 			},
 			Success: true,
 		}
-		return e.routeToDeliveryCenter(ctx, exec, robot)
+		return e.pushDeliveryEvent(ctx, exec, robot)
 	}
 
-	// Build DeliveryContent from JSON
 	content := parseDeliveryContent(data)
 	if content == nil {
 		return fmt.Errorf("delivery agent (%s) returned invalid content", agentID)
 	}
 
-	// Build DeliveryResult
 	exec.Delivery = &robottypes.DeliveryResult{
 		RequestID: generateRequestID(exec.ID),
 		Content:   content,
 		Success:   true,
 	}
 
-	// Route to Delivery Center for actual delivery
-	return e.routeToDeliveryCenter(ctx, exec, robot)
+	return e.pushDeliveryEvent(ctx, exec, robot)
 }
 
-// routeToDeliveryCenter sends content to the Delivery Center for actual delivery
-// The Delivery Center decides which channels to use based on robot/user preferences
-//
-// Delivery logic:
-// 1. Manager email: ALWAYS send to manager if manager_id is set (mandatory)
-// 2. Additional targets: Append configured email/webhook/process targets
-func (e *Executor) routeToDeliveryCenter(ctx *robottypes.Context, exec *robottypes.Execution, robot *robottypes.Robot) error {
-	if exec.Delivery == nil || exec.Delivery.Content == nil {
-		return fmt.Errorf("no delivery content to route")
-	}
-
-	// Build final delivery preferences by merging manager email + configured targets
+// pushDeliveryEvent pushes a delivery event to the event bus.
+// Registered handlers (see events/handlers.go) route to email/webhook/process channels.
+func (e *Executor) pushDeliveryEvent(ctx *robottypes.Context, exec *robottypes.Execution, robot *robottypes.Robot) error {
 	prefs := buildDeliveryPreferences(robot)
-	if prefs == nil || !hasActiveChannels(prefs) {
-		exec.Delivery.Success = true
-		return nil
-	}
 
-	// Update UI field to show delivery is in progress
-	locale := getEffectiveLocale(robot, exec.Input)
-	e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "sending_delivery"))
-
-	// Create Delivery Center and execute
-	center := NewDeliveryCenter()
-	results, err := center.Deliver(ctx, exec.Delivery.Content, &robottypes.DeliveryContext{
-		MemberID:    exec.MemberID,
-		ExecutionID: exec.ID,
-		TriggerType: exec.TriggerType,
-		TeamID:      exec.TeamID,
-	}, prefs, robot)
-
-	// Update delivery result
-	exec.Delivery.Results = results
-	now := time.Now()
-	exec.Delivery.SentAt = &now
-
-	if err != nil {
-		exec.Delivery.Success = false
-		exec.Delivery.Error = err.Error()
-		return err
-	}
-
-	// Check if all channels succeeded
-	allSuccess := true
-	for _, r := range results {
-		if !r.Success {
-			allSuccess = false
-			break
+	chatID := exec.ChatID
+	var extra map[string]any
+	if exec.Input != nil && exec.Input.Data != nil {
+		if sourceChatID, ok := exec.Input.Data["chat_id"].(string); ok && sourceChatID != "" {
+			if channel, ok := exec.Input.Data["channel"].(string); ok && channel != "" {
+				chatID = channel + ":" + sourceChatID
+			}
+		}
+		if e, ok := exec.Input.Data["extra"].(map[string]any); ok {
+			extra = e
 		}
 	}
-	exec.Delivery.Success = allSuccess
 
+	_, err := event.Push(ctx.Context, robotevents.Delivery, robotevents.DeliveryPayload{
+		ExecutionID: exec.ID,
+		MemberID:    exec.MemberID,
+		TeamID:      exec.TeamID,
+		ChatID:      chatID,
+		Content:     exec.Delivery.Content,
+		Preferences: prefs,
+		Extra:       extra,
+	})
+	if err != nil {
+		kunlog.Error("delivery event push failed: execution=%s error=%v", exec.ID, err)
+	}
 	return nil
 }
 
@@ -154,26 +117,20 @@ func parseDeliveryContent(data map[string]interface{}) *robottypes.DeliveryConte
 		return nil
 	}
 
-	// Try to get content object
 	contentData, ok := data["content"].(map[string]interface{})
 	if !ok {
-		// Fallback: maybe the data itself is the content
 		contentData = data
 	}
 
 	content := &robottypes.DeliveryContent{}
 
-	// Parse summary
 	if summary, ok := contentData["summary"].(string); ok {
 		content.Summary = summary
 	}
-
-	// Parse body
 	if body, ok := contentData["body"].(string); ok {
 		content.Body = body
 	}
 
-	// Parse attachments
 	if attachments, ok := contentData["attachments"].([]interface{}); ok {
 		for _, att := range attachments {
 			if attMap, ok := att.(map[string]interface{}); ok {
@@ -185,7 +142,6 @@ func parseDeliveryContent(data map[string]interface{}) *robottypes.DeliveryConte
 		}
 	}
 
-	// Validate: at least summary or body should be present
 	if content.Summary == "" && content.Body == "" {
 		return nil
 	}
@@ -193,7 +149,6 @@ func parseDeliveryContent(data map[string]interface{}) *robottypes.DeliveryConte
 	return content
 }
 
-// parseDeliveryAttachment parses a single attachment from the agent response
 func parseDeliveryAttachment(data map[string]interface{}) *robottypes.DeliveryAttachment {
 	if data == nil {
 		return nil
@@ -214,7 +169,6 @@ func parseDeliveryAttachment(data map[string]interface{}) *robottypes.DeliveryAt
 		att.File = file
 	}
 
-	// At minimum, need title and file
 	if att.Title == "" || att.File == "" {
 		return nil
 	}
@@ -222,21 +176,17 @@ func parseDeliveryAttachment(data map[string]interface{}) *robottypes.DeliveryAt
 	return att
 }
 
-// generateRequestID generates a unique request ID for delivery tracking
 func generateRequestID(execID string) string {
 	return fmt.Sprintf("dlv-%s-%d", execID, time.Now().UnixNano()%1000000)
 }
 
-// getTaskDescription extracts a description from task messages
 func getTaskDescription(task robottypes.Task) string {
 	if len(task.Messages) == 0 {
 		return task.GoalRef
 	}
 
-	// Try to get text from first message
 	for _, msg := range task.Messages {
 		if content, ok := msg.Content.(string); ok && content != "" {
-			// Truncate if too long
 			if len(content) > 100 {
 				return content[:97] + "..."
 			}
@@ -244,7 +194,6 @@ func getTaskDescription(task robottypes.Task) string {
 		}
 	}
 
-	// Fallback to goal reference
 	if task.GoalRef != "" {
 		return task.GoalRef
 	}
@@ -252,12 +201,10 @@ func getTaskDescription(task robottypes.Task) string {
 	return "Task " + task.ID
 }
 
-// truncateSummary truncates text to maxLen characters
 func truncateSummary(text string, maxLen int) string {
 	if len(text) <= maxLen {
 		return text
 	}
-	// Find last space before maxLen to avoid cutting words
 	truncated := text[:maxLen]
 	if idx := strings.LastIndex(truncated, " "); idx > maxLen/2 {
 		return truncated[:idx] + "..."
@@ -265,26 +212,6 @@ func truncateSummary(text string, maxLen int) string {
 	return truncated + "..."
 }
 
-// hasActiveChannels checks if any delivery channel is configured
-func hasActiveChannels(prefs *robottypes.DeliveryPreferences) bool {
-	if prefs == nil {
-		return false
-	}
-	if prefs.Email != nil && prefs.Email.Enabled && len(prefs.Email.Targets) > 0 {
-		return true
-	}
-	if prefs.Webhook != nil && prefs.Webhook.Enabled && len(prefs.Webhook.Targets) > 0 {
-		return true
-	}
-	if prefs.Process != nil && prefs.Process.Enabled && len(prefs.Process.Targets) > 0 {
-		return true
-	}
-	return false
-}
-
-// buildDeliveryPreferences builds the final delivery preferences by:
-// 1. Always including manager email if manager_id is set (mandatory)
-// 2. Appending all configured email/webhook/process targets
 func buildDeliveryPreferences(robot *robottypes.Robot) *robottypes.DeliveryPreferences {
 	if robot == nil {
 		return nil
@@ -292,26 +219,22 @@ func buildDeliveryPreferences(robot *robottypes.Robot) *robottypes.DeliveryPrefe
 
 	prefs := &robottypes.DeliveryPreferences{}
 
-	// Step 1: Get manager email (mandatory if manager_id is set)
 	managerEmail := robot.ManagerEmail
 	if managerEmail == "" && robot.ManagerID != "" {
 		managerEmail = getManagerEmail(robot.ManagerID)
 		if managerEmail != "" {
-			robot.ManagerEmail = managerEmail // Cache for future use
+			robot.ManagerEmail = managerEmail
 		}
 	}
 
-	// Step 2: Build email targets (manager first, then configured targets)
 	var emailTargets []robottypes.EmailTarget
 
-	// Add manager email as first target (mandatory)
 	if managerEmail != "" {
 		emailTargets = append(emailTargets, robottypes.EmailTarget{
 			To: []string{managerEmail},
 		})
 	}
 
-	// Append configured email targets
 	if robot.Config != nil && robot.Config.Delivery != nil && robot.Config.Delivery.Email != nil {
 		for _, target := range robot.Config.Delivery.Email.Targets {
 			if len(target.To) > 0 {
@@ -320,7 +243,6 @@ func buildDeliveryPreferences(robot *robottypes.Robot) *robottypes.DeliveryPrefe
 		}
 	}
 
-	// Set email preference if we have any targets
 	if len(emailTargets) > 0 {
 		prefs.Email = &robottypes.EmailPreference{
 			Enabled: true,
@@ -328,14 +250,12 @@ func buildDeliveryPreferences(robot *robottypes.Robot) *robottypes.DeliveryPrefe
 		}
 	}
 
-	// Step 3: Copy webhook preferences from config (if enabled)
 	if robot.Config != nil && robot.Config.Delivery != nil && robot.Config.Delivery.Webhook != nil {
 		if robot.Config.Delivery.Webhook.Enabled && len(robot.Config.Delivery.Webhook.Targets) > 0 {
 			prefs.Webhook = robot.Config.Delivery.Webhook
 		}
 	}
 
-	// Step 4: Copy process preferences from config (if enabled)
 	if robot.Config != nil && robot.Config.Delivery != nil && robot.Config.Delivery.Process != nil {
 		if robot.Config.Delivery.Process.Enabled && len(robot.Config.Delivery.Process.Targets) > 0 {
 			prefs.Process = robot.Config.Delivery.Process
@@ -345,8 +265,6 @@ func buildDeliveryPreferences(robot *robottypes.Robot) *robottypes.DeliveryPrefe
 	return prefs
 }
 
-// getManagerEmail retrieves the manager's email from __yao.member table by member_id
-// manager_id in Robot refers to a member_id in __yao.member table
 func getManagerEmail(managerID string) string {
 	if managerID == "" {
 		return ""
@@ -382,7 +300,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 
 	var sb strings.Builder
 
-	// Robot identity
 	if robot != nil && robot.Config != nil && robot.Config.Identity != nil {
 		sb.WriteString("## Robot Identity\n\n")
 		sb.WriteString(fmt.Sprintf("- **Role**: %s\n", robot.Config.Identity.Role))
@@ -394,7 +311,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 		sb.WriteString("\n")
 	}
 
-	// Trigger type
 	sb.WriteString("## Execution Context\n\n")
 	sb.WriteString(fmt.Sprintf("- **Trigger**: %s\n", exec.TriggerType))
 	sb.WriteString(fmt.Sprintf("- **Status**: %s\n", exec.Status))
@@ -405,25 +321,21 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 	}
 	sb.WriteString("\n")
 
-	// Inspiration (P0) - for clock trigger
 	if exec.Inspiration != nil && exec.Inspiration.Content != "" {
 		sb.WriteString("## Inspiration (P0)\n\n")
 		sb.WriteString(exec.Inspiration.Content)
 		sb.WriteString("\n\n")
 	}
 
-	// Goals (P1)
 	if exec.Goals != nil && exec.Goals.Content != "" {
 		sb.WriteString("## Goals (P1)\n\n")
 		sb.WriteString(exec.Goals.Content)
 		sb.WriteString("\n\n")
 	}
 
-	// Tasks (P2)
 	if len(exec.Tasks) > 0 {
 		sb.WriteString("## Tasks (P2)\n\n")
 		for i, task := range exec.Tasks {
-			// Extract task description from messages if available
 			taskDesc := getTaskDescription(task)
 			sb.WriteString(fmt.Sprintf("%d. **%s** - %s\n", i+1, task.ID, taskDesc))
 			sb.WriteString(fmt.Sprintf("   - Executor: %s (%s)\n", task.ExecutorID, task.ExecutorType))
@@ -435,7 +347,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 		sb.WriteString("\n")
 	}
 
-	// Results (P3) - detailed
 	if len(exec.Results) > 0 {
 		sb.WriteString("## Results (P3)\n\n")
 
@@ -453,7 +364,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 
 			sb.WriteString(fmt.Sprintf("- **Duration**: %dms\n", result.Duration))
 
-			// Validation
 			if result.Validation != nil {
 				if result.Validation.Passed {
 					sb.WriteString(fmt.Sprintf("- **Validation**: ✓ Passed (score: %.2f)\n", result.Validation.Score))
@@ -467,7 +377,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 				}
 			}
 
-			// Output
 			if result.Output != nil {
 				sb.WriteString("\n**Output**:\n")
 				if output, err := json.MarshalIndent(result.Output, "", "  "); err == nil {
@@ -479,7 +388,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 				}
 			}
 
-			// Error
 			if result.Error != "" {
 				sb.WriteString(fmt.Sprintf("\n**Error**: %s\n", result.Error))
 			}
@@ -487,7 +395,6 @@ func (f *InputFormatter) FormatDeliveryInput(exec *robottypes.Execution, robot *
 			sb.WriteString("\n")
 		}
 
-		// Summary
 		sb.WriteString(fmt.Sprintf("### Summary\n\n- **Total Tasks**: %d\n- **Succeeded**: %d\n- **Failed**: %d\n\n",
 			len(exec.Results), successCount, failCount))
 	}

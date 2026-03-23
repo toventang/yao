@@ -67,6 +67,25 @@ setup_buildx() {
     fi
 }
 
+# Build single-arch image (amd64 only, for Chrome which has no arm64 build)
+build_amd64() {
+    local IMAGE_NAME=$1
+    local DOCKERFILE=$2
+    local PUSH_FLAG=$3
+
+    echo ""
+    echo "=== Building $IMAGE_NAME (linux/amd64 only) ==="
+
+    BUILD_ARGS="--platform linux/amd64 -t ${REGISTRY}/${IMAGE_NAME}:latest"
+    if [ "$PUSH_FLAG" = "true" ]; then
+        BUILD_ARGS="$BUILD_ARGS --push"
+    else
+        BUILD_ARGS="$BUILD_ARGS --load"
+    fi
+
+    docker buildx build $BUILD_ARGS -f "$DOCKERFILE" .
+}
+
 # Build multi-arch image
 build_multiarch() {
     local IMAGE_NAME=$1
@@ -105,6 +124,27 @@ case $TOOL in
     build_multiarch "sandbox-claude" "claude/Dockerfile" "$PUSH"
     build_multiarch "sandbox-claude-full" "claude/Dockerfile.full" "$PUSH"
     ;;
+  claude-vnc)
+    echo ""
+    echo "=== Building Claude VNC images (Browser + Desktop) ==="
+    build_multiarch "sandbox-claude-browser" "browser/Dockerfile" "$PUSH"
+    build_multiarch "sandbox-claude-desktop" "desktop/Dockerfile" "$PUSH"
+    ;;
+  browser)
+    echo ""
+    echo "=== Building Claude Browser image ==="
+    build_multiarch "sandbox-claude-browser" "browser/Dockerfile" "$PUSH"
+    ;;
+  desktop)
+    echo ""
+    echo "=== Building Claude Desktop image ==="
+    build_multiarch "sandbox-claude-desktop" "desktop/Dockerfile" "$PUSH"
+    ;;
+  chrome)
+    echo ""
+    echo "=== Building Claude Chrome image (amd64 only) ==="
+    build_amd64 "sandbox-claude-chrome" "chrome/Dockerfile" "$PUSH"
+    ;;
   cursor)
     echo ""
     echo "=== Building Cursor images ==="
@@ -116,14 +156,29 @@ case $TOOL in
     # Claude
     build_multiarch "sandbox-claude" "claude/Dockerfile" "$PUSH"
     build_multiarch "sandbox-claude-full" "claude/Dockerfile.full" "$PUSH"
+    # Claude VNC variants
+    build_multiarch "sandbox-claude-browser" "browser/Dockerfile" "$PUSH"
+    build_multiarch "sandbox-claude-desktop" "desktop/Dockerfile" "$PUSH"
+    # Chrome (amd64 only - Google Chrome has no arm64 Linux build)
+    build_amd64 "sandbox-claude-chrome" "chrome/Dockerfile" "$PUSH"
     # Cursor (uncomment when ready)
     # build_multiarch "sandbox-cursor" "cursor/Dockerfile" "$PUSH"
     ;;
+  v2)
+    echo "V2 images have moved to the tai repo: tai/docker/sandbox/build.sh"
+    echo "See: https://github.com/yaoapp/tai/tree/main/docker/sandbox"
+    exit 0
+    ;;
   *)
     echo "Unknown tool: $TOOL"
-    echo "Usage: $0 [claude|cursor|all] [true|false]"
+    echo "Usage: $0 [claude|claude-vnc|browser|desktop|chrome|cursor|v2|all] [true|false]"
     echo "  $0 claude        # Build Claude images locally"
     echo "  $0 claude true   # Build and push Claude images"
+    echo "  $0 claude-vnc    # Build Claude VNC images (Browser + Desktop)"
+    echo "  $0 browser       # Build Claude Browser image only"
+    echo "  $0 desktop       # Build Claude Desktop image only"
+    echo "  $0 chrome        # Build Claude Chrome image (amd64 only)"
+    echo "  $0 v2            # Build Sandbox V2 images (base + test)"
     echo "  $0 all true      # Build and push all images"
     exit 1
     ;;
@@ -142,9 +197,25 @@ if [ "$PUSH" = "true" ]; then
         echo "  - ${REGISTRY}/sandbox-claude:latest"
         echo "  - ${REGISTRY}/sandbox-claude-full:latest"
         ;;
+      claude-vnc)
+        echo "  - ${REGISTRY}/sandbox-claude-browser:latest"
+        echo "  - ${REGISTRY}/sandbox-claude-desktop:latest"
+        ;;
+      browser)
+        echo "  - ${REGISTRY}/sandbox-claude-browser:latest"
+        ;;
+      desktop)
+        echo "  - ${REGISTRY}/sandbox-claude-desktop:latest"
+        ;;
+      chrome)
+        echo "  - ${REGISTRY}/sandbox-claude-chrome:latest"
+        ;;
       all)
         echo "  - ${REGISTRY}/sandbox-claude:latest"
         echo "  - ${REGISTRY}/sandbox-claude-full:latest"
+        echo "  - ${REGISTRY}/sandbox-claude-browser:latest"
+        echo "  - ${REGISTRY}/sandbox-claude-desktop:latest"
+        echo "  - ${REGISTRY}/sandbox-claude-chrome:latest"
         ;;
     esac
 fi

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/yaoapp/gou/connector"
 	agentContext "github.com/yaoapp/yao/agent/context"
 )
 
@@ -34,6 +35,12 @@ The following tools are NOT available in this environment and you must NOT use t
 
 Focus on using the core tools: Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch.
 
+## User Attachments
+
+User-uploaded files (images, documents, code files, etc.) are placed in /workspace/.attachments/
+When the user references an attached file, read it from this directory using the Read or Bash tool.
+For image files, you can view them directly as Claude supports vision on local files.
+
 ## GitHub CLI (gh) Usage
 
 When working with GitHub and a token is provided:
@@ -41,6 +48,14 @@ When working with GitHub and a token is provided:
 2. Then use gh commands normally (gh repo create, gh pr create, etc.)
 3. Do NOT use curl to call GitHub API directly - always prefer gh CLI
 `
+
+// claudeArgWhitelist maps package.yao sandbox.arguments keys to Claude CLI flags.
+// Only keys listed here are passed through; everything else is ignored.
+var claudeArgWhitelist = map[string]string{
+	"max_turns":        "--max-turns",        // Maximum conversation turns
+	"disallowed_tools": "--disallowed-tools", // Comma-separated tool blacklist (e.g. "WebSearch,WebFetch")
+	"allowed_tools":    "--allowedTools",     // Comma-separated tool whitelist (e.g. "Bash,Read,Write")
+}
 
 // BuildCommand builds the Claude CLI command and environment variables
 // Uses stdin with --input-format stream-json for unlimited prompt length
@@ -102,10 +117,13 @@ func BuildCommandWithContinuation(messages []agentContext.Message, opts *Options
 		claudeArgs = append(claudeArgs, "--continue")
 	}
 
-	// Add max_turns if specified
+	// Pass through whitelisted arguments to Claude CLI flags.
+	// Map: package.yao arguments key → Claude CLI flag
 	if opts != nil && opts.Arguments != nil {
-		if maxTurns, ok := opts.Arguments["max_turns"]; ok {
-			claudeArgs = append(claudeArgs, "--max-turns", fmt.Sprintf("%v", maxTurns))
+		for key, flag := range claudeArgWhitelist {
+			if val, ok := opts.Arguments[key]; ok {
+				claudeArgs = append(claudeArgs, flag, fmt.Sprintf("%v", val))
+			}
 		}
 	}
 
@@ -121,6 +139,10 @@ func BuildCommandWithContinuation(messages []agentContext.Message, opts *Options
 	// System prompt may contain quotes, newlines, special characters that break shell quoting
 	var bashCmd strings.Builder
 
+	// Ensure $HOME/.Xauthority exists for PyAutoGUI/Xlib (HOME=/workspace).
+	// Xvfb runs without auth, but Xlib requires the file to exist.
+	bashCmd.WriteString("touch /home/sandbox/.Xauthority 2>/dev/null; touch \"$HOME/.Xauthority\" 2>/dev/null\n")
+
 	// If we have a system prompt (first request only), write it to a temp file via heredoc first
 	// then use --append-system-prompt-file
 	if systemPrompt != "" {
@@ -131,11 +153,13 @@ func BuildCommandWithContinuation(messages []agentContext.Message, opts *Options
 	}
 
 	// Build claude command with all arguments
+	// Append 2>&1 to the claude command so stderr is merged into stdout;
+	// Docker's stdcopy discards the stderr stream, making errors invisible.
 	bashCmd.WriteString("cat << 'INPUTEOF' | claude -p")
 	for _, arg := range claudeArgs {
-		// Quote arguments that might contain special characters
 		bashCmd.WriteString(fmt.Sprintf(" %q", arg))
 	}
+	bashCmd.WriteString(" 2>&1")
 	bashCmd.WriteString("\n")
 	bashCmd.WriteString(string(inputJSONL))
 	bashCmd.WriteString("\nINPUTEOF")
@@ -306,9 +330,47 @@ func buildEnvironment(opts *Options, systemPrompt string) map[string]string {
 	// Session data is stored in $HOME/.claude/ (i.e., /workspace/.claude/)
 	env["HOME"] = "/workspace"
 
-	// claude-proxy runs on localhost:3456, Claude CLI connects to it
-	env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:3456"
-	env["ANTHROPIC_API_KEY"] = "dummy" // Proxy doesn't verify this
+	// Fix Python user-site-packages: changing HOME from /home/sandbox to /workspace
+	// breaks Python's ability to find packages installed via pip --user (e.g., playwright,
+	// pyautogui, playwright-stealth) which live in /home/sandbox/.local/lib/pythonX.Y/site-packages/
+	env["PYTHONPATH"] = "/home/sandbox/.local/lib/python3.12/site-packages"
+
+	// Fix X11 auth: PyAutoGUI/Xlib looks for $HOME/.Xauthority, but HOME=/workspace
+	// so it fails to find /home/sandbox/.Xauthority created during image build.
+	// Explicitly set XAUTHORITY to the correct path.
+	env["XAUTHORITY"] = "/home/sandbox/.Xauthority"
+
+	if opts.ConnectorType == "anthropic" {
+		// Anthropic mode: Claude CLI connects directly to the Anthropic-compatible backend
+		// No proxy needed — the backend already speaks Anthropic Messages API
+		env["ANTHROPIC_BASE_URL"] = opts.ConnectorHost
+		env["ANTHROPIC_API_KEY"] = opts.ConnectorKey
+	} else {
+		// OpenAI mode (default): Claude CLI connects to claude-proxy on localhost:3456
+		// The proxy translates Anthropic Messages API → OpenAI Chat Completions API
+		env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:3456"
+		env["ANTHROPIC_API_KEY"] = "dummy" // Proxy doesn't verify this
+	}
+
+	// Set model environment variables from connector
+	// Claude CLI uses these to select the model for all roles
+	if opts.Model != "" {
+		env["ANTHROPIC_MODEL"] = opts.Model
+		env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opts.Model
+		env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = opts.Model
+		env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = opts.Model
+		env["CLAUDE_CODE_SUBAGENT_MODEL"] = opts.Model
+	}
+
+	// Pass secrets as environment variables for Claude CLI to use
+	// These are configured in package.yao sandbox.secrets (e.g., LLM_API_KEY, GITHUB_TOKEN)
+	// start-claude-proxy also exports them for the proxy process, but Claude CLI
+	// is launched via a separate docker exec, so it needs them passed explicitly here.
+	if len(opts.Secrets) > 0 {
+		for k, v := range opts.Secrets {
+			env[k] = v
+		}
+	}
 
 	// Note: System prompt and max_turns are passed via CLI flags in BuildCommand
 	// CLAUDE_SYSTEM_PROMPT environment variable is NOT supported by Claude CLI
@@ -325,11 +387,9 @@ func BuildProxyConfig(opts *Options) ([]byte, error) {
 		return nil, fmt.Errorf("options is required")
 	}
 
-	// Build backend URL - ensure it ends with /chat/completions
-	backendURL := opts.ConnectorHost
-	if !strings.HasSuffix(backendURL, "/chat/completions") {
-		backendURL = strings.TrimSuffix(backendURL, "/") + "/chat/completions"
-	}
+	// Build backend URL using the shared connector.BuildAPIURL helper
+	// so that the /v1 prefix is applied consistently with the agent LLM path.
+	backendURL := connector.BuildAPIURL(opts.ConnectorHost, "/chat/completions")
 
 	config := map[string]interface{}{
 		"backend": backendURL,

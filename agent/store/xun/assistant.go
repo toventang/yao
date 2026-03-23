@@ -99,6 +99,11 @@ func (store *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error)
 	} else {
 		data["description"] = nil
 	}
+	if assistant.Capabilities != "" {
+		data["capabilities"] = assistant.Capabilities
+	} else {
+		data["capabilities"] = nil
+	}
 	if assistant.Path != "" {
 		data["path"] = assistant.Path
 	} else {
@@ -140,31 +145,6 @@ func (store *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error)
 		data["__yao_tenant_id"] = nil
 	}
 
-	// Handle simple types
-	if assistant.Options != nil {
-		jsonStr, err := jsoniter.MarshalToString(assistant.Options)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal options: %w", err)
-		}
-		data["options"] = jsonStr
-	}
-
-	if assistant.Tags != nil {
-		jsonStr, err := jsoniter.MarshalToString(assistant.Tags)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal tags: %w", err)
-		}
-		data["tags"] = jsonStr
-	}
-
-	if assistant.Modes != nil {
-		jsonStr, err := jsoniter.MarshalToString(assistant.Modes)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal modes: %w", err)
-		}
-		data["modes"] = jsonStr
-	}
-
 	// DefaultMode is a simple string field
 	if assistant.DefaultMode != "" {
 		data["default_mode"] = assistant.DefaultMode
@@ -172,8 +152,12 @@ func (store *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error)
 		data["default_mode"] = nil
 	}
 
-	// Handle interface{} fields - they should already be in the correct format
+	// Handle all JSON fields uniformly via marshalJSONFields.
+	// Uses isNil() to correctly skip typed nils stored in interface{}.
 	jsonFields := map[string]interface{}{
+		"options":           assistant.Options,
+		"tags":              assistant.Tags,
+		"modes":             assistant.Modes,
 		"prompts":           assistant.Prompts,
 		"prompt_presets":    assistant.PromptPresets,
 		"connector_options": assistant.ConnectorOptions,
@@ -181,20 +165,16 @@ func (store *Xun) SaveAssistant(assistant *types.AssistantModel) (string, error)
 		"db":                assistant.DB,
 		"mcp":               assistant.MCP,
 		"workflow":          assistant.Workflow,
+		"sandbox":           assistant.Sandbox,
 		"placeholder":       assistant.Placeholder,
 		"locales":           assistant.Locales,
 		"uses":              assistant.Uses,
 		"search":            assistant.Search,
+		"dependencies":      assistant.Dependencies,
 	}
 
-	for field, value := range jsonFields {
-		if value != nil {
-			jsonStr, err := jsoniter.MarshalToString(value)
-			if err != nil {
-				return "", fmt.Errorf("failed to marshal %s: %w", field, err)
-			}
-			data[field] = jsonStr
-		}
+	if err := marshalJSONFields(data, jsonFields); err != nil {
+		return "", err
 	}
 
 	// Update or insert
@@ -243,14 +223,14 @@ func (store *Xun) UpdateAssistant(assistantID string, updates map[string]interfa
 	data := make(map[string]interface{})
 
 	// List of fields that need JSON marshaling
-	jsonFields := []string{"options", "tags", "modes", "prompts", "prompt_presets", "connector_options", "kb", "db", "mcp", "workflow", "placeholder", "locales", "uses", "search"}
+	jsonFields := []string{"options", "tags", "modes", "prompts", "prompt_presets", "connector_options", "kb", "db", "mcp", "workflow", "sandbox", "placeholder", "locales", "uses", "search", "dependencies"}
 	jsonFieldSet := make(map[string]bool)
 	for _, field := range jsonFields {
 		jsonFieldSet[field] = true
 	}
 
 	// List of nullable string fields
-	nullableStringFields := []string{"name", "avatar", "description", "path", "source", "default_mode", "__yao_created_by", "__yao_updated_by", "__yao_team_id", "__yao_tenant_id"}
+	nullableStringFields := []string{"name", "avatar", "description", "capabilities", "path", "source", "default_mode", "__yao_created_by", "__yao_updated_by", "__yao_team_id", "__yao_tenant_id"}
 	nullableFieldSet := make(map[string]bool)
 	for _, field := range nullableStringFields {
 		nullableFieldSet[field] = true
@@ -265,14 +245,14 @@ func (store *Xun) UpdateAssistant(assistantID string, updates map[string]interfa
 
 		// Handle JSON fields
 		if jsonFieldSet[key] {
-			if value != nil {
+			if isNil(value) {
+				data[key] = nil
+			} else {
 				jsonStr, err := jsoniter.MarshalToString(value)
 				if err != nil {
 					return fmt.Errorf("failed to marshal %s: %w", key, err)
 				}
 				data[key] = jsonStr
-			} else {
-				data[key] = nil
 			}
 		} else {
 			// Handle regular fields
@@ -349,6 +329,7 @@ func (store *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) 
 		qb.Where(func(qb query.Query) {
 			qb.Where("name", "like", fmt.Sprintf("%%%s%%", filter.Keywords)).
 				OrWhere("description", "like", fmt.Sprintf("%%%s%%", filter.Keywords)).
+				OrWhere("capabilities", "like", fmt.Sprintf("%%%s%%", filter.Keywords)).
 				OrWhere("locales", "like", fmt.Sprintf("%%%s%%", filter.Keywords))
 		})
 	}
@@ -391,6 +372,21 @@ func (store *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) 
 	// Apply built_in filter if provided
 	if filter.BuiltIn != nil {
 		qb.Where("built_in", *filter.BuiltIn)
+	}
+
+	// Apply sandbox filter (true = has sandbox config, false = no sandbox config)
+	// MySQL JSON columns distinguish between SQL NULL and JSON literal null.
+	// CAST(sandbox AS CHAR) returns 'null' for JSON null and NULL for SQL NULL.
+	if filter.Sandbox != nil {
+		if *filter.Sandbox {
+			qb.WhereNotNull("sandbox").
+				WhereRaw("CAST(`sandbox` AS CHAR) <> 'null'")
+		} else {
+			qb.Where(func(qb query.Query) {
+				qb.WhereNull("sandbox").
+					OrWhereRaw("CAST(`sandbox` AS CHAR) = 'null'")
+			})
+		}
 	}
 
 	// Apply custom query filter function (for permission filtering)
@@ -448,7 +444,7 @@ func (store *Xun) GetAssistants(filter types.AssistantFilter, locale ...string) 
 
 	// Convert rows to types.AssistantModel slice
 	assistants := make([]*types.AssistantModel, 0, len(rows))
-	jsonFields := []string{"tags", "options", "prompts", "prompt_presets", "connector_options", "workflow", "kb", "mcp", "placeholder", "locales", "uses", "search"}
+	jsonFields := []string{"tags", "options", "prompts", "prompt_presets", "connector_options", "workflow", "sandbox", "kb", "mcp", "placeholder", "locales", "uses", "search", "dependencies"}
 
 	for _, row := range rows {
 		data := row.ToMap()
@@ -521,7 +517,7 @@ func (store *Xun) GetAssistant(assistantID string, fields []string, locale ...st
 	}
 
 	// Parse JSON fields
-	jsonFields := []string{"tags", "modes", "options", "prompts", "prompt_presets", "connector_options", "workflow", "kb", "db", "mcp", "placeholder", "locales", "uses", "search"}
+	jsonFields := []string{"tags", "modes", "options", "prompts", "prompt_presets", "connector_options", "workflow", "sandbox", "kb", "db", "mcp", "placeholder", "locales", "uses", "search", "dependencies"}
 	store.parseJSONFields(data, jsonFields)
 
 	// Convert map to types.AssistantModel
@@ -536,6 +532,7 @@ func (store *Xun) GetAssistant(assistantID string, fields []string, locale ...st
 		BuiltIn:              getBool(data, "built_in"),
 		Sort:                 getInt(data, "sort"),
 		Description:          getString(data, "description"),
+		Capabilities:         getString(data, "capabilities"),
 		DefaultMode:          getString(data, "default_mode"),
 		Readonly:             getBool(data, "readonly"),
 		Public:               getBool(data, "public"),
@@ -636,6 +633,13 @@ func (store *Xun) GetAssistant(assistantID string, fields []string, locale ...st
 		}
 	}
 
+	if sandbox, has := data["sandbox"]; has && sandbox != nil {
+		sb, err := types.ToSandbox(sandbox)
+		if err == nil {
+			model.Sandbox = sb
+		}
+	}
+
 	if placeholder, has := data["placeholder"]; has && placeholder != nil {
 		raw, err := jsoniter.Marshal(placeholder)
 		if err == nil {
@@ -672,6 +676,16 @@ func (store *Xun) GetAssistant(assistantID string, fields []string, locale ...st
 			var s searchTypes.Config
 			if err := jsoniter.Unmarshal(raw, &s); err == nil {
 				model.Search = &s
+			}
+		}
+	}
+
+	if deps, has := data["dependencies"]; has && deps != nil {
+		raw, err := jsoniter.Marshal(deps)
+		if err == nil {
+			var d map[string]string
+			if err := jsoniter.Unmarshal(raw, &d); err == nil {
+				model.Dependencies = d
 			}
 		}
 	}
@@ -836,6 +850,13 @@ func (store *Xun) translate(model *types.AssistantModel, assistantID string, loc
 	if translated := i18n.Translate(assistantID, locale, model.Description); translated != nil {
 		if s, ok := translated.(string); ok {
 			model.Description = s
+		}
+	}
+
+	// Translate capabilities
+	if translated := i18n.Translate(assistantID, locale, model.Capabilities); translated != nil {
+		if s, ok := translated.(string); ok {
+			model.Capabilities = s
 		}
 	}
 

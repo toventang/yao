@@ -320,6 +320,22 @@ func (s *Service) UserID(clientID, subject string) (string, error) {
 	return userIDStr, nil
 }
 
+// copyFingerprint copies the subject→userID fingerprint mapping from one
+// clientID to another so that tokens issued under a different clientID
+// (e.g. Device Flow) can resolve the same userID.
+func (s *Service) copyFingerprint(srcClientID, dstClientID, subject string) {
+	srcKey := s.userFingerprintKey(srcClientID, subject)
+	userID, exists := s.store.Get(srcKey)
+	if !exists {
+		return
+	}
+	dstKey := s.userFingerprintKey(dstClientID, subject)
+	if _, already := s.store.Get(dstKey); already {
+		return
+	}
+	s.store.Set(dstKey, userID, 0)
+}
+
 // MakeAuthorizationCode generates a new authorization code with specific parameters and stores it
 
 // ============================================================================
@@ -536,6 +552,127 @@ func (s *Service) getAuthorizationCodeData(code string) (map[string]interface{},
 // consumeAuthorizationCode retrieves and deletes authorization code (prevents reuse)
 func (s *Service) consumeAuthorizationCode(code string) error {
 	s.store.Del(s.authorizationCodeKey(code))
+	return nil
+}
+
+// deviceCodeKey generates a key for device code storage
+func (s *Service) deviceCodeKey(code string) string {
+	return fmt.Sprintf("%soauth:device_code:%s", s.prefix, code)
+}
+
+// userCodeKey generates a key for user code storage (reverse mapping)
+func (s *Service) userCodeKey(code string) string {
+	return fmt.Sprintf("%soauth:user_code:%s", s.prefix, code)
+}
+
+// storeDeviceCode stores device code data and user_code -> device_code reverse mapping
+func (s *Service) storeDeviceCode(deviceCode, userCode, clientID, scope string) error {
+	ttl := s.config.Token.DeviceCodeLifetime
+
+	codeData := map[string]interface{}{
+		"client_id":  clientID,
+		"user_code":  userCode,
+		"scope":      scope,
+		"status":     "pending",
+		"issued_at":  time.Now().Unix(),
+		"expires_at": time.Now().Add(ttl).Unix(),
+	}
+	if err := s.store.Set(s.deviceCodeKey(deviceCode), codeData, ttl); err != nil {
+		return err
+	}
+
+	reverseData := map[string]interface{}{
+		"device_code": deviceCode,
+	}
+	return s.store.Set(s.userCodeKey(userCode), reverseData, ttl)
+}
+
+// getDeviceCodeData retrieves device code data from store
+func (s *Service) getDeviceCodeData(deviceCode string) (map[string]interface{}, error) {
+	data, exists := s.store.Get(s.deviceCodeKey(deviceCode))
+	if !exists {
+		return nil, &types.ErrorResponse{
+			Code:             types.ErrorExpiredToken,
+			ErrorDescription: "Device code not found or expired",
+		}
+	}
+
+	codeInfo, ok := data.(map[string]interface{})
+	if !ok {
+		if m, ok := data.(primitive.M); ok {
+			codeInfo = map[string]interface{}(m)
+		} else {
+			return nil, &types.ErrorResponse{
+				Code:             types.ErrorServerError,
+				ErrorDescription: "Invalid device code data format",
+			}
+		}
+	}
+	return codeInfo, nil
+}
+
+// authorizeDeviceCode marks a device code as authorized via user_code lookup
+func (s *Service) authorizeDeviceCode(userCode, subject string, extraClaims map[string]interface{}) error {
+	reverseData, exists := s.store.Get(s.userCodeKey(userCode))
+	if !exists {
+		return &types.ErrorResponse{
+			Code:             types.ErrorInvalidGrant,
+			ErrorDescription: "Invalid or expired user code",
+		}
+	}
+
+	var deviceCode string
+	switch v := reverseData.(type) {
+	case map[string]interface{}:
+		deviceCode, _ = v["device_code"].(string)
+	case primitive.M:
+		deviceCode, _ = v["device_code"].(string)
+	}
+	if deviceCode == "" {
+		return &types.ErrorResponse{
+			Code:             types.ErrorServerError,
+			ErrorDescription: "Invalid user code mapping",
+		}
+	}
+
+	codeData, err := s.getDeviceCodeData(deviceCode)
+	if err != nil {
+		return err
+	}
+
+	codeData["status"] = "authorized"
+	codeData["subject"] = subject
+	if extraClaims != nil {
+		codeData["extra_claims"] = extraClaims
+	}
+
+	// Re-store with remaining TTL
+	expiresAt, _ := codeData["expires_at"].(int64)
+	if expiresAt == 0 {
+		if f, ok := codeData["expires_at"].(float64); ok {
+			expiresAt = int64(f)
+		}
+	}
+	remaining := time.Until(time.Unix(expiresAt, 0))
+	if remaining <= 0 {
+		return &types.ErrorResponse{
+			Code:             types.ErrorExpiredToken,
+			ErrorDescription: "Device code has expired",
+		}
+	}
+
+	return s.store.Set(s.deviceCodeKey(deviceCode), codeData, remaining)
+}
+
+// consumeDeviceCode deletes both device_code and user_code entries
+func (s *Service) consumeDeviceCode(deviceCode string) error {
+	codeData, _ := s.getDeviceCodeData(deviceCode)
+	if codeData != nil {
+		if uc, ok := codeData["user_code"].(string); ok && uc != "" {
+			s.store.Del(s.userCodeKey(uc))
+		}
+	}
+	s.store.Del(s.deviceCodeKey(deviceCode))
 	return nil
 }
 

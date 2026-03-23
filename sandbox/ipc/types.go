@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"sync"
 )
 
 // Session represents an IPC session for a sandbox container
@@ -15,6 +16,7 @@ type Session struct {
 	Context    *AgentContext       // Agent context
 	MCPTools   map[string]*MCPTool // Authorized MCP tools
 	cancel     context.CancelFunc  // Cancel function for cleanup
+	closeOnce  sync.Once           // Ensures cleanup runs exactly once
 }
 
 // AgentContext holds context information for the agent

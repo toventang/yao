@@ -201,9 +201,15 @@ func parseToolCalls(toolCalls []interface{}) []agentContext.ToolCall {
 }
 
 // buildCompletionOptions creates CompletionOptions from JS opts map
+// BuildCompletionOptions builds CompletionOptions from a connector and raw opts map.
+// Exported for reuse by gRPC handlers.
+func BuildCompletionOptions(conn connector.Connector, opts map[string]interface{}) *agentContext.CompletionOptions {
+	return buildCompletionOptions(conn, opts)
+}
+
 func buildCompletionOptions(conn connector.Connector, opts map[string]interface{}) *agentContext.CompletionOptions {
 	// Get capabilities from connector
-	capabilities := GetCapabilitiesFromConn(conn, nil)
+	capabilities := GetCapabilitiesFromConn(conn)
 
 	completionOptions := &agentContext.CompletionOptions{
 		Capabilities: capabilities,
@@ -735,12 +741,6 @@ func (api *JSAPI) executeRace(requests []*Request) []interface{} {
 	}
 
 	return []interface{}{result}
-}
-
-// executeSingleRequest executes a single LLM request using the original context
-// This is used for single calls (not batch)
-func (api *JSAPI) executeSingleRequest(request *Request) interface{} {
-	return api.StreamWithHandler(request.Connector, request.Messages, request.Options, request.Handler)
 }
 
 // executeSingleRequestWithForkedContext executes a single LLM request with a forked context

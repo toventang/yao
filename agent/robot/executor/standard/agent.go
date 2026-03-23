@@ -6,9 +6,21 @@ import (
 	"github.com/yaoapp/gou/text"
 	"github.com/yaoapp/yao/agent/assistant"
 	agentcontext "github.com/yaoapp/yao/agent/context"
+	"github.com/yaoapp/yao/agent/output/message"
 	robottypes "github.com/yaoapp/yao/agent/robot/types"
 	oauthtypes "github.com/yaoapp/yao/openapi/oauth/types"
 )
+
+// StreamCallback receives text chunks during streaming agent calls.
+// Return 0 to continue, non-zero to stop.
+type StreamCallback func(chunk *StreamChunk) int
+
+// StreamChunk represents a single chunk in a streaming response.
+type StreamChunk struct {
+	Type    string // "text", "thinking", "event"
+	Content string
+	Delta   bool
+}
 
 // AgentCaller provides unified interface for calling AI assistants
 // It wraps the Yao Assistant framework and handles:
@@ -30,6 +42,13 @@ type AgentCaller struct {
 	// ChatID is used for multi-turn conversations to maintain session state
 	// If empty, each call is independent (no history)
 	ChatID string
+
+	// Connector overrides the assistant's default LLM connector (from Robot.LanguageModel).
+	// When non-empty, passed as opts.Connector to ast.Stream so the agent uses the Robot's model.
+	Connector string
+
+	// log is an optional structured logger; when set, Call emits agent-call logs.
+	log *execLogger
 }
 
 // NewAgentCaller creates a new AgentCaller with default settings (single-call mode)
@@ -78,16 +97,13 @@ func (r *CallResult) GetText() string {
 	if r.Content != "" {
 		return r.Content
 	}
-	// If Next is a string, return it
 	if s, ok := r.Next.(string); ok {
 		return s
 	}
-	// If Next has a "content" field, return it
 	if m, ok := r.Next.(map[string]interface{}); ok {
 		if content, ok := m["content"].(string); ok {
 			return content
 		}
-		// Also check "data" field (common pattern in Next hook)
 		if data, ok := m["data"].(map[string]interface{}); ok {
 			if content, ok := data["content"].(string); ok {
 				return content
@@ -103,10 +119,8 @@ func (r *CallResult) GetText() string {
 // 2. Content parsed using gou/text.ExtractJSON (fault-tolerant)
 // Returns the parsed data and any error
 func (r *CallResult) GetJSON() (map[string]interface{}, error) {
-	// Try Next hook data first
 	if r.Next != nil {
 		if m, ok := r.Next.(map[string]interface{}); ok {
-			// Check for "data" wrapper (common in Next hook)
 			if data, ok := m["data"].(map[string]interface{}); ok {
 				return data, nil
 			}
@@ -114,7 +128,6 @@ func (r *CallResult) GetJSON() (map[string]interface{}, error) {
 		}
 	}
 
-	// Try parsing Content using gou/text (handles markdown blocks, JSON, YAML)
 	if r.Content != "" {
 		data := text.ExtractJSON(r.Content)
 		if data != nil {
@@ -174,6 +187,7 @@ func (c *AgentCaller) Call(ctx *robottypes.Context, assistantID string, messages
 			History: c.SkipHistory,
 			Search:  c.SkipSearch,
 		},
+		Connector: c.Connector,
 	}
 
 	// Convert robot context to agent context
@@ -203,6 +217,10 @@ func (c *AgentCaller) Call(ctx *robottypes.Context, assistantID string, messages
 		}
 	}
 
+	if c.log != nil {
+		c.log.logAgentCall(assistantID, result)
+	}
+
 	return result, nil
 }
 
@@ -230,6 +248,145 @@ func (c *AgentCaller) CallWithSystemAndUser(ctx *robottypes.Context, assistantID
 		},
 	}
 	return c.Call(ctx, assistantID, messages)
+}
+
+// CallStream calls an assistant with messages and streams text chunks via callback.
+// The callback receives each text delta in real-time while the response is being generated.
+// After streaming completes, the full CallResult is returned.
+func (c *AgentCaller) CallStream(ctx *robottypes.Context, assistantID string, messages []agentcontext.Message, streamFn StreamCallback) (*CallResult, error) {
+	ast, err := assistant.Get(assistantID)
+	if err != nil {
+		return nil, fmt.Errorf("assistant not found: %s: %w", assistantID, err)
+	}
+
+	opts := &agentcontext.Options{
+		Skip: &agentcontext.Skip{
+			Output:  c.SkipOutput,
+			History: c.SkipHistory,
+			Search:  c.SkipSearch,
+		},
+		Connector: c.Connector,
+	}
+
+	// Hook OnMessage to intercept streaming chunks and forward to callback
+	if streamFn != nil {
+		opts.OnMessage = func(msg *message.Message) int {
+			if msg == nil {
+				return 0
+			}
+			switch msg.Type {
+			case message.TypeText:
+				if msg.Delta {
+					content, _ := msg.Props["content"].(string)
+					if content != "" {
+						return streamFn(&StreamChunk{Type: "text", Content: content, Delta: true})
+					}
+				}
+			case message.TypeThinking:
+				if msg.Delta {
+					content, _ := msg.Props["content"].(string)
+					if content != "" {
+						return streamFn(&StreamChunk{Type: "thinking", Content: content, Delta: true})
+					}
+				}
+			}
+			return 0
+		}
+	}
+
+	agentCtx := c.buildAgentContext(ctx)
+	defer agentCtx.Release()
+
+	response, err := ast.Stream(agentCtx, messages, opts)
+	if err != nil {
+		return nil, fmt.Errorf("assistant call failed: %w", err)
+	}
+
+	result := &CallResult{Response: response}
+	if response.Next != nil {
+		result.Next = response.Next
+	}
+	if response.Completion != nil {
+		if content, ok := response.Completion.Content.(string); ok {
+			result.Content = content
+		}
+	}
+
+	if c.log != nil {
+		c.log.logAgentCall(assistantID, result)
+	}
+
+	return result, nil
+}
+
+// CallWithMessagesStream is a convenience method that streams a single user input.
+func (c *AgentCaller) CallWithMessagesStream(ctx *robottypes.Context, assistantID string, userContent string, streamFn StreamCallback) (*CallResult, error) {
+	messages := []agentcontext.Message{
+		{
+			Role:    agentcontext.RoleUser,
+			Content: userContent,
+		},
+	}
+	return c.CallStream(ctx, assistantID, messages, streamFn)
+}
+
+// CallStreamRaw calls an assistant with streaming, passing raw message.Message objects
+// to the callback without any type filtering or degradation. This preserves all CUI
+// message protocol fields (chunk_id, message_id, block_id, delta_path, etc.)
+// for direct SSE passthrough to the frontend.
+func (c *AgentCaller) CallStreamRaw(ctx *robottypes.Context, assistantID string, messages []agentcontext.Message, onMessage agentcontext.OnMessageFunc) (*CallResult, error) {
+	ast, err := assistant.Get(assistantID)
+	if err != nil {
+		return nil, fmt.Errorf("assistant not found: %s: %w", assistantID, err)
+	}
+
+	opts := &agentcontext.Options{
+		Skip: &agentcontext.Skip{
+			Output:  c.SkipOutput,
+			History: c.SkipHistory,
+			Search:  c.SkipSearch,
+		},
+		Connector: c.Connector,
+	}
+
+	if onMessage != nil {
+		opts.OnMessage = onMessage
+	}
+
+	agentCtx := c.buildAgentContext(ctx)
+	defer agentCtx.Release()
+
+	response, err := ast.Stream(agentCtx, messages, opts)
+	if err != nil {
+		return nil, fmt.Errorf("assistant call failed: %w", err)
+	}
+
+	result := &CallResult{Response: response}
+	if response.Next != nil {
+		result.Next = response.Next
+	}
+	if response.Completion != nil {
+		if content, ok := response.Completion.Content.(string); ok {
+			result.Content = content
+		}
+	}
+
+	if c.log != nil {
+		c.log.logAgentCall(assistantID, result)
+	}
+
+	return result, nil
+}
+
+// CallWithMessagesStreamRaw is a convenience method that streams raw messages for a single user input.
+func (c *AgentCaller) CallWithMessagesStreamRaw(ctx *robottypes.Context, assistantID string, userContent string, onMessage agentcontext.OnMessageFunc) (*CallResult, error) {
+	messages := []agentcontext.Message{
+		{
+			Role:    agentcontext.RoleUser,
+			Content: userContent,
+		},
+	}
+	return c.CallStreamRaw(ctx, assistantID, messages, onMessage)
 }
 
 // buildAgentContext converts robot context to agent context

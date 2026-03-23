@@ -2,12 +2,13 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -17,18 +18,22 @@ import (
 	"github.com/yaoapp/gou/mcp"
 	"github.com/yaoapp/gou/plugin"
 	"github.com/yaoapp/gou/schedule"
-	"github.com/yaoapp/gou/server/http"
 	"github.com/yaoapp/gou/store"
 	"github.com/yaoapp/gou/task"
 	"github.com/yaoapp/gou/websocket"
 	"github.com/yaoapp/kun/log"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/engine"
+	yaogrpc "github.com/yaoapp/yao/grpc"
+	_ "github.com/yaoapp/yao/grpc/auth"
+	sandboxhandler "github.com/yaoapp/yao/grpc/sandbox"
 	"github.com/yaoapp/yao/openapi"
+	sandbox "github.com/yaoapp/yao/sandbox/v2"
 	ischedule "github.com/yaoapp/yao/schedule"
 	"github.com/yaoapp/yao/service"
 	"github.com/yaoapp/yao/setup"
 	"github.com/yaoapp/yao/share"
+
 	itask "github.com/yaoapp/yao/task"
 )
 
@@ -52,26 +57,29 @@ var startCmd = &cobra.Command{
 
 		// Setup
 		isnew := false
-		if setup.IsEmptyDir(config.Conf.Root) {
 
-			// In Yao App
+		// Check if current directory is a Yao app root
+		if !setup.IsYaoApp(config.Conf.Root) {
+
+			// Check if we're inside a Yao app (subdirectory)
 			if setup.InYaoApp(config.Conf.Root) {
 				fmt.Println(color.RedString(L("Please run the command in the root directory of project")))
 				os.Exit(1)
 			}
 
-			// Install the init app
-			if err := install(); err != nil {
-				fmt.Println(color.RedString(L("Install: %s"), err.Error()))
+			// Not in a Yao app, check if empty to install
+			if setup.IsEmptyDir(config.Conf.Root) {
+				// Install the init app
+				if err := install(); err != nil {
+					fmt.Println(color.RedString(L("Install: %s"), err.Error()))
+					os.Exit(1)
+				}
+				isnew = true
+			} else {
+				// Directory not empty and no app.yao
+				fmt.Println(color.RedString("The app.yao file is missing"))
 				os.Exit(1)
 			}
-			isnew = true
-		}
-
-		// Is Yao App
-		if !setup.IsYaoApp(config.Conf.Root) {
-			fmt.Println(color.RedString("The app.yao file is missing"))
-			os.Exit(1)
 		}
 
 		// force debug
@@ -79,30 +87,13 @@ var startCmd = &cobra.Command{
 			config.Development()
 		}
 
-		startTime := time.Now()
-
 		// load the application engine
-		var progressCallback func(string, string)
-		if config.Conf.Mode == "development" {
-			fmt.Println(color.CyanString("Loading application engine..."))
-			progressCallback = func(name string, duration string) {
-				fmt.Printf("  %s %s %s\n", color.GreenString("✓"), name, color.GreenString("(%s)", duration))
-			}
-		}
-
 		loadWarnings, err := engine.Load(config.Conf, engine.LoadOption{
 			Action: "start",
-		}, progressCallback)
+		})
 		if err != nil {
 			fmt.Println(color.RedString(L("Load: %s"), err.Error()))
 			os.Exit(1)
-		}
-
-		loadDuration := time.Since(startTime)
-		if config.Conf.Mode == "development" {
-			fmt.Printf("\n%s Engine loaded successfully in %s\n\n",
-				color.GreenString("✓"),
-				color.CyanString("%v", loadDuration))
 		}
 
 		port := fmt.Sprintf(":%d", config.Conf.Port)
@@ -140,50 +131,24 @@ var startCmd = &cobra.Command{
 
 		// print the messages under the development mode
 		if mode == "development" {
-
-			// Start Studio Server
-			// Yao Studio will be deprecated in the future
-			// go func() {
-
-			// 	err = studio.Load(config.Conf)
-			// 	if err != nil {
-			// 		// fmt.Println(color.RedString(L("Studio Load: %s"), err.Error()))
-			// 		log.Error("Studio Load: %s", err.Error())
-			// 		return
-			// 	}
-
-			// 	err := studio.Start(config.Conf)
-			// 	if err != nil {
-			// 		log.Error("Studio Start: %s", err.Error())
-			// 		return
-			// 	}
-			// }()
-			// defer studio.Stop()
-
 			printApis(false)
 			printTasks(false)
 			printSchedules(false)
 			printConnectors(false)
 			printStores(false)
 			printMCPs(false)
-			// printStudio(false, host)
-
 		}
 
 		root, _ := adminRoot()
 		endpoints := []setup.Endpoint{{URL: fmt.Sprintf("http://%s%s", "127.0.0.1", port), Interface: "localhost"}}
 		switch host {
 		case "0.0.0.0":
-			// All interfaces
 			if values, err := setup.Endpoints(config.Conf); err == nil {
 				endpoints = append(endpoints, values...)
 			}
-			break
 		case "127.0.0.1":
 			// Localhost only
-			break
 		default:
-			// Filter by the host IP
 			matched := false
 			endpoints = []setup.Endpoint{}
 			if values, err := setup.Endpoints(config.Conf); err == nil {
@@ -200,18 +165,6 @@ var startCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Println(color.WhiteString("\n---------------------------------"))
-		fmt.Println(color.WhiteString(L("Access Points")))
-		fmt.Println(color.WhiteString("---------------------------------"))
-		for _, endpoint := range endpoints {
-			fmt.Println(color.CyanString("\n%s", endpoint.Interface))
-			fmt.Println(color.WhiteString("--------------------------"))
-			fmt.Println(color.WhiteString(L("Website")), color.GreenString(" %s", endpoint.URL))
-			fmt.Println(color.WhiteString(L("Admin")), color.GreenString(" %s/%s/login/admin", endpoint.URL, strings.Trim(root, "/")))
-			fmt.Println(color.WhiteString(L("API")), color.GreenString(" %s/api", endpoint.URL))
-		}
-		fmt.Println("")
-
 		// Print welcome message for the new application
 		if isnew {
 			printWelcome()
@@ -225,25 +178,72 @@ var startCmd = &cobra.Command{
 		ischedule.Start()
 		defer ischedule.Stop()
 
-		// Start HTTP Server
-		srv, err := service.Start(config.Conf)
-		defer func() {
-			service.Stop(srv)
-			fmt.Println(color.GreenString(L("✨Exited successfully!")))
-		}()
+		// Pre-flight: detect port conflicts before attempting to start servers.
+		if occupied, proc := portOccupied(config.Conf.Host, config.Conf.Port); occupied {
+			fmt.Println(color.RedString(L("Fatal: HTTP port %d is already in use%s"), config.Conf.Port, proc))
+			return
+		}
+		if strings.ToLower(config.Conf.GRPC.Enabled) != "off" {
+			for _, h := range yaogrpc.ExpandHosts(config.Conf.GRPC.Host) {
+				if occupied, proc := portOccupied(h, config.Conf.GRPC.Port); occupied {
+					fmt.Println(color.RedString(L("Fatal: gRPC port %d is already in use%s"), config.Conf.GRPC.Port, proc))
+					return
+				}
+			}
+		}
 
+		// Wire gRPC heartbeat → sandbox Manager so container liveness is tracked.
+		yaogrpc.SetSandboxOnBeat(func(data *sandboxhandler.HeartbeatData) string {
+			sandbox.M().Heartbeat(data.SandboxID, true, int(data.RunningProcs))
+			return "ok"
+		})
+
+		// Start all servers (gRPC + HTTP) as a single unit.
+		// Start() blocks until HTTP port is bound (READY) or returns error.
+		svc, err := service.Start(config.Conf, service.ServerHooks{
+			Start: yaogrpc.StartServer,
+			Stop:  yaogrpc.Stop,
+			Addrs: yaogrpc.Addr,
+		})
 		if err != nil {
 			fmt.Println(color.RedString(L("Fatal: %s"), err.Error()))
-			os.Exit(1)
+			return
 		}
+
+		// Access Points (printed after servers are up so addresses are known)
+		fmt.Println(color.WhiteString("\n---------------------------------"))
+		fmt.Println(color.WhiteString(L("Access Points")))
+		fmt.Println(color.WhiteString("---------------------------------"))
+
+		if grpcAddrs := svc.HookAddrs(); len(grpcAddrs) > 0 {
+			fmt.Println(color.CyanString("\ngRPC"))
+			fmt.Println(color.WhiteString("--------------------------"))
+			for _, addr := range grpcAddrs {
+				fmt.Println(color.WhiteString(L("Server")), color.GreenString(" %s", addr))
+			}
+		}
+
+		apiRoot := "/api"
+		if openapi.Server != nil {
+			apiRoot = openapi.Server.Config.BaseURL
+		}
+		for _, endpoint := range endpoints {
+			fmt.Println(color.CyanString("\n%s", endpoint.Interface))
+			fmt.Println(color.WhiteString("--------------------------"))
+			fmt.Println(color.WhiteString(L("Website")), color.GreenString(" %s", endpoint.URL))
+			fmt.Println(color.WhiteString(L("Dashboard")), color.GreenString(" %s/%s/auth/entry", endpoint.URL, strings.Trim(root, "/")))
+			if openapi.Server != nil {
+				fmt.Println(color.WhiteString(L("OpenAPI")), color.GreenString(" %s%s", endpoint.URL, apiRoot))
+			} else {
+				fmt.Println(color.WhiteString(L("API")), color.GreenString(" %s%s", endpoint.URL, apiRoot))
+			}
+		}
+		fmt.Println("")
 
 		// Start watching
 		watchDone := make(chan uint8, 1)
 		if mode == "development" && !startDisableWatching {
-			// fmt.Println(color.WhiteString("\n---------------------------------"))
-			// fmt.Println(color.WhiteString(L("Watching")))
-			// fmt.Println(color.WhiteString("---------------------------------"))
-			go service.Watch(srv, watchDone)
+			go svc.Watch(watchDone)
 		}
 
 		// Print the messages under the production mode
@@ -267,31 +267,15 @@ var startCmd = &cobra.Command{
 			fmt.Printf("\n")
 		}
 
+		fmt.Println(color.GreenString(L("Server is up and running...")))
+		fmt.Println(color.GreenString("Ctrl+C to stop"))
+
 		for {
 			select {
-			case v := <-srv.Event():
-
-				switch v {
-				case http.READY:
-					fmt.Println(color.GreenString(L("✨Server is up and running...")))
-					fmt.Println(color.GreenString("✨Ctrl+C to stop"))
-					break
-
-				case http.CLOSED:
-					fmt.Println(color.GreenString(L("✨Exited successfully!")))
-					watchDone <- 1
-					return
-
-				case http.ERROR:
-					color.Red("Fatal: check the error information in the log")
-					watchDone <- 1
-					return
-
-				default:
-					fmt.Println("Signal:", v)
-				}
-
 			case <-interrupt:
+				fmt.Println(color.WhiteString("\nShutting down..."))
+				svc.Stop()
+				fmt.Println(color.GreenString(L("✨Exited successfully!")))
 				watchDone <- 1
 				return
 			}
@@ -346,9 +330,9 @@ func printWelcome() {
 	fmt.Println(color.CyanString("\n---------------------------------"))
 	fmt.Println(color.CyanString(L("🎉 Welcome to Yao 🎉 ")))
 	fmt.Println(color.CyanString("---------------------------------"))
-	fmt.Println(color.WhiteString("📚 Documentation:     "), color.CyanString("https://yaoapps.com/docs"))
-	fmt.Println(color.WhiteString("🏡 Join Yao Community:"), color.CyanString("https://yaoapps.com/community"))
-	fmt.Println(color.WhiteString("💬 Build App via Chat:"), color.CyanString("https://moapi.ai"))
+	fmt.Println(color.WhiteString("📚 Documentation:        "), color.CyanString("https://yaoapps.com/docs"))
+	fmt.Println(color.WhiteString("🏡 Join Yao Community:   "), color.CyanString("https://yaoapps.com/community"))
+	fmt.Println(color.WhiteString("🤖 Build Your Digital Workforce:"), color.CyanString("https://yaoagents.com"))
 	fmt.Println("")
 }
 
@@ -387,34 +371,11 @@ func printStores(silent bool) {
 	}
 
 	fmt.Println(color.WhiteString("\n---------------------------------"))
-	fmt.Println(color.WhiteString(L("Stores List (%d)"), len(connector.Connectors)))
+	fmt.Println(color.WhiteString(L("Stores List (%d)"), len(store.Pools)))
 	fmt.Println(color.WhiteString("---------------------------------"))
 	for name := range store.Pools {
 		fmt.Print(color.CyanString("[Store]"))
 		fmt.Print(color.WhiteString(" %s\t loaded\n", name))
-	}
-}
-
-func printStudio(silent bool, host string) {
-
-	if silent {
-		log.Info("[Studio] http://%s:%d", host, config.Conf.Studio.Port)
-		if config.Conf.Studio.Auto {
-			log.Info("[Studio] Secret: %s", config.Conf.Studio.Secret)
-		}
-		return
-	}
-
-	fmt.Println(color.WhiteString("\n---------------------------------"))
-	fmt.Println(color.WhiteString(L("Yao Studio Server")))
-	fmt.Println(color.WhiteString("---------------------------------"))
-	fmt.Print(color.CyanString("HOST  : "))
-	fmt.Print(color.WhiteString(" %s\n", config.Conf.Host))
-	fmt.Print(color.CyanString("PORT  : "))
-	fmt.Print(color.WhiteString(" %d\n", config.Conf.Studio.Port))
-	if config.Conf.Studio.Auto {
-		fmt.Print(color.CyanString("SECRET: "))
-		fmt.Print(color.WhiteString(" %s\n", config.Conf.Studio.Secret))
 	}
 }
 
@@ -493,16 +454,14 @@ func printApis(silent bool) {
 		return
 	}
 
+	// Skip detailed API list when OpenAPI is enabled
+	if openapi.Server != nil {
+		return
+	}
+
 	fmt.Println(color.WhiteString("\n---------------------------------"))
 	fmt.Println(color.WhiteString(L("APIs List")))
 	fmt.Println(color.WhiteString("---------------------------------"))
-
-	// Show OpenAPI mode info if enabled
-	if openapi.Server != nil {
-		fmt.Println(color.CyanString("\nOpenAPI Mode: %s", apiRoot))
-		fmt.Println(color.WhiteString("Developer APIs: %s/api/*", apiRoot))
-		fmt.Println(color.WhiteString("Widgets: %s/__yao/*", apiRoot))
-	}
 
 	for _, api := range api.APIs { // API info
 		if len(api.HTTP.Paths) <= 0 {
@@ -658,6 +617,18 @@ func colorMehtod(method string) string {
 	default:
 		return color.WhiteString(method)
 	}
+}
+
+// portOccupied probes whether host:port is already bound.
+// Returns (true, " (pid XXXX)") when occupied, (false, "") otherwise.
+func portOccupied(host string, port int) (bool, string) {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return true, fmt.Sprintf(" (%s)", err.Error())
+	}
+	ln.Close()
+	return false, ""
 }
 
 func init() {

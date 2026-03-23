@@ -39,6 +39,10 @@ type Executor interface {
 	// Execute runs execution with auto-generated ID (for direct calls)
 	Execute(ctx *Context, robot *Robot, trigger TriggerType, data interface{}) (*Execution, error)
 
+	// Resume resumes a suspended execution with human-provided input.
+	// Returns ErrExecutionSuspended if the execution suspends again during resume.
+	Resume(ctx *Context, execID string, reply string) error
+
 	// Metrics and control (for monitoring and testing)
 	ExecCount() int    // total execution count
 	CurrentCount() int // currently running count

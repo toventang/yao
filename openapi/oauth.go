@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -58,6 +59,7 @@ func (openapi *OpenAPI) attachOAuth(base *gin.RouterGroup) {
 
 	// Device Authorization Flow - RFC 8628
 	oauth.POST("/device_authorization", openapi.oauthDeviceAuthorization)
+	oauth.POST("/device/authorize", openapi.oauthDeviceAuthorize)
 
 	// Pushed Authorization Request - RFC 9126
 	oauth.POST("/par", openapi.oauthPushedAuthorizationRequest)
@@ -206,10 +208,14 @@ func (openapi *OpenAPI) handleStandardTokenGrant(c *gin.Context, grantType strin
 		}
 
 	case types.GrantTypeClientCredentials:
-		// No code needed for client credentials
 		code = ""
 
-		// Validate that client supports client credentials grant
+		// RFC 6749 §4.4: client_credentials requires confidential client
+		if clientInfo.ClientType == types.ClientTypePublic {
+			response.RespondWithSecureError(c, response.StatusUnauthorized, response.ErrUnauthorizedClient)
+			return
+		}
+
 		if !openapi.clientSupportsGrantType(clientInfo, types.GrantTypeClientCredentials) {
 			response.RespondWithSecureError(c, response.StatusUnauthorized, response.ErrUnauthorizedClient)
 			return
@@ -523,22 +529,122 @@ func (openapi *OpenAPI) oauthDeleteClient(c *gin.Context) {
 // oauthDeviceAuthorization handles device authorization - RFC 8628
 func (openapi *OpenAPI) oauthDeviceAuthorization(c *gin.Context) {
 	clientID := c.PostForm("client_id")
-
 	if clientID == "" {
-		response.RespondWithError(c, response.StatusBadRequest, response.ErrInvalidRequest)
+		response.RespondWithSecureError(c, response.StatusBadRequest, response.ErrInvalidRequest)
 		return
 	}
 
-	// TODO: Implement device authorization logic
-	deviceResponse := &response.DeviceAuthorizationResponse{
-		DeviceCode:      "generated-device-code",
-		UserCode:        "USER-CODE",
-		VerificationURI: "https://example.com/device",
-		ExpiresIn:       900, // 15 minutes
-		Interval:        5,   // 5 seconds
+	scope := c.PostForm("scope")
+	oauthService := openapi.OAuth
+
+	res, err := oauthService.DeviceAuthorization(c, clientID, scope)
+	if err != nil {
+		if oauthErr, ok := err.(*response.ErrorResponse); ok {
+			response.RespondWithSecureError(c, response.StatusBadRequest, oauthErr)
+		} else {
+			response.RespondWithSecureError(c, response.StatusBadRequest, response.ErrInvalidRequest)
+		}
+		return
 	}
 
-	response.RespondWithSuccess(c, response.StatusOK, deviceResponse)
+	response.RespondWithSecureSuccess(c, response.StatusOK, res)
+}
+
+// oauthDeviceAuthorize allows an authenticated user to authorize a pending device code.
+func (openapi *OpenAPI) oauthDeviceAuthorize(c *gin.Context) {
+	tokenStr := extractBearerToken(c)
+	if tokenStr == "" {
+		response.RespondWithSecureError(c, response.StatusUnauthorized, &response.ErrorResponse{
+			Code:             types.ErrorInvalidGrant,
+			ErrorDescription: "Bearer token required",
+		})
+		return
+	}
+	svc, ok := openapi.OAuth.(*oauth.Service)
+	if !ok {
+		response.RespondWithSecureError(c, response.StatusInternalServerError, &response.ErrorResponse{
+			Code:             types.ErrorServerError,
+			ErrorDescription: "OAuth service unavailable",
+		})
+		return
+	}
+
+	tokenClaims, err := svc.VerifyToken(tokenStr)
+	if err != nil || tokenClaims == nil {
+		response.RespondWithSecureError(c, response.StatusUnauthorized, &response.ErrorResponse{
+			Code:             types.ErrorInvalidGrant,
+			ErrorDescription: "Invalid or expired token",
+		})
+		return
+	}
+
+	if tokenClaims.Subject == "" {
+		response.RespondWithSecureError(c, response.StatusUnauthorized, &response.ErrorResponse{
+			Code:             types.ErrorInvalidGrant,
+			ErrorDescription: "Token has no subject",
+		})
+		return
+	}
+
+	extraClaims := tokenClaims.Extra
+	if extraClaims == nil {
+		extraClaims = make(map[string]interface{})
+	}
+
+	teamID := tokenClaims.TeamID
+	if teamID == "" {
+		switch v := extraClaims["team_id"].(type) {
+		case string:
+			teamID = v
+		case float64:
+			teamID = fmt.Sprintf("%.0f", v)
+		}
+	}
+	if teamID != "" {
+		extraClaims["team_id"] = teamID
+	}
+
+	tenantID := tokenClaims.TenantID
+	if tenantID == "" {
+		if v, ok := extraClaims["tenant_id"].(string); ok {
+			tenantID = v
+		}
+	}
+	if tenantID != "" {
+		extraClaims["tenant_id"] = tenantID
+	}
+
+	if tokenClaims.ClientID != "" {
+		extraClaims["authorizer_client_id"] = tokenClaims.ClientID
+	}
+
+	userCode := c.PostForm("user_code")
+	if userCode == "" {
+		userCode = c.Query("user_code")
+	}
+	if userCode == "" {
+		var body struct {
+			UserCode string `json:"user_code"`
+		}
+		if c.ShouldBindJSON(&body) == nil {
+			userCode = body.UserCode
+		}
+	}
+	if userCode == "" {
+		response.RespondWithSecureError(c, response.StatusBadRequest, response.ErrInvalidRequest)
+		return
+	}
+
+	if err := svc.AuthorizeDevice(c, userCode, tokenClaims.Subject, extraClaims); err != nil {
+		if oauthErr, ok := err.(*response.ErrorResponse); ok {
+			response.RespondWithSecureError(c, response.StatusBadRequest, oauthErr)
+		} else {
+			response.RespondWithSecureError(c, response.StatusBadRequest, response.ErrInvalidGrant)
+		}
+		return
+	}
+
+	response.RespondWithSecureSuccess(c, response.StatusOK, map[string]string{"status": "authorized"})
 }
 
 // oauthPushedAuthorizationRequest handles PAR - RFC 9126
@@ -639,4 +745,17 @@ func (openapi *OpenAPI) getParam(c *gin.Context, key string) string {
 	}
 	// Then try to get from POST form data (POST request)
 	return c.PostForm(key)
+}
+
+// extractBearerToken reads the access token from Authorization header or cookie,
+// matching the same logic as guard.getAccessToken.
+func extractBearerToken(c *gin.Context) string {
+	if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	cookieName := response.GetCookieName("access_token")
+	if cookie, err := c.Cookie(cookieName); err == nil && cookie != "" {
+		return strings.TrimPrefix(cookie, "Bearer ")
+	}
+	return ""
 }

@@ -8,8 +8,8 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/yaoapp/gou/connector"
-	gouOpenAI "github.com/yaoapp/gou/connector/openai"
 	"github.com/yaoapp/gou/http"
+	goullm "github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/kun/log"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
@@ -129,21 +129,15 @@ type Provider struct {
 	adapters []adapters.CapabilityAdapter
 }
 
-// buildAPIURL builds the complete API URL from host and endpoint
-// If host ends with /, it's used as-is (user has specified full path)
-// Otherwise, /v1 prefix is added automatically (standard for OpenAI-compatible APIs)
+// buildAPIURL builds the complete API URL from host and endpoint.
+// Delegates to the shared connector.BuildAPIURL for consistent URL building
+// across the agent LLM path and the sandbox proxy path.
 func buildAPIURL(host, endpoint string) string {
-	// If host ends with /, use it as-is (user has specified full path like /v1/ or /api/)
-	// Otherwise, add /v1 prefix (standard for OpenAI-compatible APIs)
-	if !strings.HasSuffix(host, "/") {
-		endpoint = "/v1" + endpoint
-	}
-	host = strings.TrimSuffix(host, "/")
-	return host + endpoint
+	return connector.BuildAPIURL(host, endpoint)
 }
 
 // New create a new OpenAI provider with capability adapters
-func New(conn connector.Connector, capabilities *gouOpenAI.Capabilities) *Provider {
+func New(conn connector.Connector, capabilities *goullm.Capabilities) *Provider {
 	return &Provider{
 		Provider: base.NewProvider(conn, capabilities),
 		adapters: buildAdapters(capabilities),
@@ -151,7 +145,7 @@ func New(conn connector.Connector, capabilities *gouOpenAI.Capabilities) *Provid
 }
 
 // buildAdapters builds capability adapters based on model capabilities
-func buildAdapters(cap *gouOpenAI.Capabilities) []adapters.CapabilityAdapter {
+func buildAdapters(cap *goullm.Capabilities) []adapters.CapabilityAdapter {
 	if cap == nil {
 		return []adapters.CapabilityAdapter{}
 	}
@@ -188,7 +182,7 @@ func buildAdapters(cap *gouOpenAI.Capabilities) []adapters.CapabilityAdapter {
 }
 
 // detectReasoningFormat detects the reasoning format based on capabilities
-func detectReasoningFormat(cap *gouOpenAI.Capabilities) adapters.ReasoningFormat {
+func detectReasoningFormat(cap *goullm.Capabilities) adapters.ReasoningFormat {
 	// TODO: Implement better detection logic
 	// For now, default to OpenAI o1 format if reasoning is supported
 	if cap.Reasoning {

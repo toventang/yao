@@ -1,51 +1,66 @@
 package robot
 
 import (
+	"context"
+
 	"github.com/yaoapp/yao/agent/robot/cache"
 	"github.com/yaoapp/yao/agent/robot/dedup"
+	"github.com/yaoapp/yao/agent/robot/events/integrations"
+	"github.com/yaoapp/yao/agent/robot/events/integrations/telegram"
 	"github.com/yaoapp/yao/agent/robot/executor"
+	"github.com/yaoapp/yao/agent/robot/logger"
 	"github.com/yaoapp/yao/agent/robot/manager"
 	"github.com/yaoapp/yao/agent/robot/plan"
 	"github.com/yaoapp/yao/agent/robot/pool"
 	"github.com/yaoapp/yao/agent/robot/store"
+	robottypes "github.com/yaoapp/yao/agent/robot/types"
 )
 
 var (
-	// Global instances (will be initialized in Init)
-	globalManager  *manager.Manager
-	globalCache    *cache.Cache
-	globalPool     *pool.Pool
-	globalDedup    *dedup.Dedup
-	globalStore    *store.Store
-	globalExecutor executor.Executor
-	globalPlan     *plan.Plan
+	log = logger.New("robot")
+
+	globalManager    *manager.Manager
+	globalCache      *cache.Cache
+	globalPool       *pool.Pool
+	globalDedup      *dedup.Dedup
+	globalStore      *store.Store
+	globalExecutor   executor.Executor
+	globalPlan       *plan.Plan
+	globalDispatcher *integrations.Dispatcher
 )
 
 // Init initializes the robot agent system
-// Stub: placeholder (will be implemented in Phase 3)
 func Init() error {
-	// Initialize global instances
 	globalCache = cache.New()
 	globalDedup = dedup.New()
 	globalStore = store.New()
-	globalPool = pool.New() // Default pool size
+	globalPool = pool.New()
 	globalExecutor = executor.New()
 	globalManager = manager.New()
 	globalPlan = plan.New()
 
-	// TODO Phase 3: Start manager and pool
-	// return globalManager.Start()
+	// Load robots into cache from database before starting dispatcher
+	rCtx := robottypes.NewContext(context.Background(), nil)
+	if err := globalCache.Load(rCtx); err != nil {
+		log.Warn("robot.Init: cache load failed (will rely on config events): %v", err)
+	}
+
+	adapters := map[string]integrations.Adapter{
+		"telegram": telegram.NewAdapter(),
+	}
+	globalDispatcher = integrations.NewDispatcher(globalCache, adapters)
+	if err := globalDispatcher.Start(context.Background()); err != nil {
+		return err
+	}
 
 	return nil
 }
 
 // Shutdown gracefully shuts down the robot agent system
-// Stub: placeholder (will be implemented in Phase 3)
 func Shutdown() error {
-	// TODO Phase 3: Stop manager and pool
-	// if globalManager != nil {
-	//     return globalManager.Stop()
-	// }
+	if globalDispatcher != nil {
+		globalDispatcher.Stop()
+	}
 	return nil
 }
 

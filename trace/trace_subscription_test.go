@@ -24,9 +24,10 @@ func TestSubscription(t *testing.T) {
 			defer trace.Remove(ctx, d.DriverType, traceID, d.DriverOptions...)
 
 			// Subscribe to updates
-			updates, err := manager.Subscribe()
+			updates, cancel, err := manager.Subscribe()
 			assert.NoError(t, err)
 			assert.NotNil(t, updates)
+			defer cancel()
 
 			// Collect updates in background
 			var receivedUpdates []*types.TraceUpdate
@@ -146,9 +147,10 @@ func TestSubscribeFrom(t *testing.T) {
 
 			// Real scenario: User refreshes page and resumes from last known timestamp
 			// This should replay events from resumeTimestamp onwards
-			updates, err := manager.SubscribeFrom(resumeTimestamp)
+			updates, cancelSub, err := manager.SubscribeFrom(resumeTimestamp)
 			assert.NoError(t, err)
 			assert.NotNil(t, updates)
+			defer cancelSub()
 
 			// Collect updates
 			var receivedUpdates []*types.TraceUpdate
@@ -233,14 +235,17 @@ func TestMultipleSubscribers(t *testing.T) {
 			defer trace.Remove(ctx, d.DriverType, traceID, d.DriverOptions...)
 
 			// Create multiple subscribers
-			sub1, err := manager.Subscribe()
+			sub1, cancel1, err := manager.Subscribe()
 			assert.NoError(t, err)
+			defer cancel1()
 
-			sub2, err := manager.Subscribe()
+			sub2, cancel2, err := manager.Subscribe()
 			assert.NoError(t, err)
+			defer cancel2()
 
-			sub3, err := manager.Subscribe()
+			sub3, cancel3, err := manager.Subscribe()
 			assert.NoError(t, err)
+			defer cancel3()
 
 			// Collect updates from all subscribers
 			var wg sync.WaitGroup

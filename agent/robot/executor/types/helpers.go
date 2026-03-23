@@ -16,6 +16,9 @@ func BuildTriggerInput(trigger robottypes.TriggerType, data interface{}) *robott
 		input.Clock = robottypes.NewClockContext(time.Now(), "")
 
 	case robottypes.TriggerHuman:
+		if existing, ok := data.(*robottypes.TriggerInput); ok {
+			return existing
+		}
 		if req, ok := data.(*robottypes.InterveneRequest); ok {
 			input.Action = req.Action
 			input.Messages = req.Messages
@@ -27,6 +30,7 @@ func BuildTriggerInput(trigger robottypes.TriggerType, data interface{}) *robott
 			input.EventType = req.EventType
 			input.Data = req.Data
 		}
+
 	}
 
 	return input

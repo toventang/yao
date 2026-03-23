@@ -72,11 +72,12 @@ type LogEntry struct {
 
 // RequestLogger provides request-scoped async logging
 type RequestLogger struct {
-	assistantID string
-	chatID      string
-	requestID   string
-	shortID     string // Short version of requestID for display
-	startTime   time.Time
+	assistantIDStack []string // Stack-based: delegate calls push, pop on exit; top = current
+	chatID           string
+	requestID        string
+	shortID          string // Short version of requestID for display
+	parentID         string // Parent request ID for A2A tree structure
+	startTime        time.Time
 
 	ch     chan LogEntry
 	done   chan struct{}
@@ -86,19 +87,38 @@ type RequestLogger struct {
 	mu     sync.RWMutex
 }
 
+// LoggerOption configures a RequestLogger
+type LoggerOption func(*RequestLogger)
+
+// WithParentID sets the parent request ID for A2A tree structure
+func WithParentID(parentID string) LoggerOption {
+	return func(l *RequestLogger) {
+		l.parentID = parentID
+	}
+}
+
 // noopLogger is a shared no-op logger instance
 var noopLogger = &RequestLogger{noop: true}
 
+// NoopLogger returns a shared no-op RequestLogger that silently discards all
+// log calls. Use when a non-nil logger is required but no actual logging is
+// desired (e.g., fallback when StreamRequest.Logger is nil).
+func NoopLogger() *RequestLogger { return noopLogger }
+
 // NewRequestLogger creates a new request-scoped logger with async processing
-func NewRequestLogger(assistantID, chatID, requestID string) *RequestLogger {
+func NewRequestLogger(assistantID, chatID, requestID string, opts ...LoggerOption) *RequestLogger {
 	l := &RequestLogger{
-		assistantID: assistantID,
-		chatID:      chatID,
-		requestID:   requestID,
-		shortID:     shortID(requestID),
-		startTime:   time.Now(),
-		ch:          make(chan LogEntry, 100), // Buffered channel
-		done:        make(chan struct{}),
+		assistantIDStack: []string{assistantID},
+		chatID:           chatID,
+		requestID:        requestID,
+		shortID:          shortID(requestID),
+		startTime:        time.Now(),
+		ch:               make(chan LogEntry, 100), // Buffered channel
+		done:             make(chan struct{}),
+	}
+
+	for _, opt := range opts {
+		opt(l)
 	}
 
 	// Start consumer goroutine
@@ -112,12 +132,35 @@ func Noop() *RequestLogger {
 	return noopLogger
 }
 
-// SetAssistantID sets the assistant ID (called when entering Stream)
+// SetAssistantID pushes a new assistant ID onto the stack (called when entering Stream).
+// Each SetAssistantID must be paired with a RestoreAssistantID on exit.
 func (l *RequestLogger) SetAssistantID(id string) {
 	if l.noop {
 		return
 	}
-	l.assistantID = id
+	l.mu.Lock()
+	l.assistantIDStack = append(l.assistantIDStack, id)
+	l.mu.Unlock()
+}
+
+// RestoreAssistantID pops the current assistant ID, reverting to the previous one.
+// Safe to call even if the stack has only one entry (the initial ID is never removed).
+func (l *RequestLogger) RestoreAssistantID() {
+	if l.noop {
+		return
+	}
+	l.mu.Lock()
+	if len(l.assistantIDStack) > 1 {
+		l.assistantIDStack = l.assistantIDStack[:len(l.assistantIDStack)-1]
+	}
+	l.mu.Unlock()
+}
+
+func (l *RequestLogger) currentAssistantID() string {
+	if len(l.assistantIDStack) == 0 {
+		return ""
+	}
+	return l.assistantIDStack[len(l.assistantIDStack)-1]
 }
 
 // Close closes the logger and waits for all entries to be processed
@@ -148,12 +191,13 @@ func (l *RequestLogger) consume() {
 func (l *RequestLogger) processEntry(entry LogEntry) {
 	if config.IsDevelopment() {
 		l.printDev(entry)
+		l.writeLog(entry, true)
 	} else {
-		l.printProd(entry)
+		l.writeLog(entry, false)
 	}
 }
 
-// printDev prints colorful output for development mode
+// printDev prints colored output to stdout in development mode
 func (l *RequestLogger) printDev(entry LogEntry) {
 	switch entry.Level {
 	case LogLevelTrace:
@@ -169,10 +213,13 @@ func (l *RequestLogger) printDev(entry LogEntry) {
 	}
 }
 
-// printProd logs to kun/log for production mode
-func (l *RequestLogger) printProd(entry LogEntry) {
+// writeLog writes structured events to kun/log
+func (l *RequestLogger) writeLog(entry LogEntry, devMode bool) {
 	prefix := fmt.Sprintf("[AGENT] %s ", l.shortID)
-
+	if devMode {
+		kunlog.Trace("%s%s", prefix, entry.Message)
+		return
+	}
 	switch entry.Level {
 	case LogLevelTrace:
 		kunlog.Trace("%s%s", prefix, entry.Message)
@@ -263,18 +310,18 @@ func (l *RequestLogger) Start() {
 		return
 	}
 
+	kunlog.Trace("[AGENT] Request %s started: assistant=%s, chat=%s, request=%s",
+		l.shortID, l.currentAssistantID(), shortID(l.chatID), shortID(l.requestID))
+
 	if !config.IsDevelopment() {
-		kunlog.Trace("[AGENT] Request %s started: assistant=%s, chat=%s, request=%s",
-			l.shortID, l.assistantID, shortID(l.chatID), shortID(l.requestID))
 		return
 	}
 
-	// Development: colorful output (direct print, not through channel for immediate display)
 	fmt.Println()
 	fmt.Printf("%s%s%s\n", colorBoldCyan, strings.Repeat("═", 60), colorReset)
-	fmt.Printf("%s  🚀 AGENT REQUEST %s%s\n", colorBoldCyan, l.shortID, colorReset)
+	fmt.Printf("%s  AGENT REQUEST %s%s\n", colorBoldCyan, l.shortID, colorReset)
 	fmt.Printf("%s%s%s\n", colorBoldCyan, strings.Repeat("─", 60), colorReset)
-	fmt.Printf("%s  Assistant: %s%s%s\n", colorGray, colorWhite, l.assistantID, colorReset)
+	fmt.Printf("%s  Assistant: %s%s%s\n", colorGray, colorWhite, l.currentAssistantID(), colorReset)
 	fmt.Printf("%s  Chat ID:   %s%s%s\n", colorGray, colorWhite, l.chatID, colorReset)
 	fmt.Printf("%s  Request:   %s%s%s\n", colorGray, colorWhite, l.requestID, colorReset)
 	fmt.Printf("%s  Time:      %s%s%s\n", colorGray, colorWhite, l.startTime.Format("15:04:05.000"), colorReset)
@@ -289,28 +336,28 @@ func (l *RequestLogger) End(success bool, err error) {
 
 	duration := time.Since(l.startTime)
 
+	if success {
+		kunlog.Trace("[AGENT] Request %s completed: assistant=%s, duration=%v",
+			l.shortID, l.currentAssistantID(), duration.Round(time.Millisecond))
+	} else {
+		kunlog.Error("[AGENT] Request %s failed: assistant=%s, duration=%v, error=%v",
+			l.shortID, l.currentAssistantID(), duration.Round(time.Millisecond), err)
+	}
+
 	if !config.IsDevelopment() {
-		if success {
-			kunlog.Trace("[AGENT] Request %s completed: assistant=%s, duration=%v",
-				l.shortID, l.assistantID, duration.Round(time.Millisecond))
-		} else {
-			kunlog.Trace("[AGENT] Request %s failed: assistant=%s, duration=%v, error=%v",
-				l.shortID, l.assistantID, duration.Round(time.Millisecond), err)
-		}
 		return
 	}
 
-	// Development: colorful output (direct print for immediate display)
 	fmt.Printf("%s%s%s\n", colorCyan, strings.Repeat("─", 60), colorReset)
 	if success {
-		fmt.Printf("%s  ✅ REQUEST %s COMPLETED%s\n", colorBoldGreen, l.shortID, colorReset)
+		fmt.Printf("%s  REQUEST %s COMPLETED%s\n", colorBoldGreen, l.shortID, colorReset)
 	} else {
-		fmt.Printf("%s  ❌ REQUEST %s FAILED%s\n", colorBoldRed, l.shortID, colorReset)
+		fmt.Printf("%s  REQUEST %s FAILED%s\n", colorBoldRed, l.shortID, colorReset)
 		if err != nil {
 			fmt.Printf("%s  Error: %s%v%s\n", colorGray, colorRed, err, colorReset)
 		}
 	}
-	fmt.Printf("%s  Assistant: %s%s%s\n", colorGray, colorWhite, l.assistantID, colorReset)
+	fmt.Printf("%s  Assistant: %s%s%s\n", colorGray, colorWhite, l.currentAssistantID(), colorReset)
 	fmt.Printf("%s  Duration:  %s%v%s\n", colorGray, colorWhite, duration.Round(time.Millisecond), colorReset)
 	fmt.Printf("%s%s%s\n", colorCyan, strings.Repeat("─", 60), colorReset)
 	fmt.Println()
@@ -323,12 +370,13 @@ func (l *RequestLogger) Phase(name string) {
 	}
 
 	elapsed := time.Since(l.startTime).Round(time.Millisecond)
+	kunlog.Trace("[AGENT] %s Phase: %s (+%v)", l.shortID, name, elapsed)
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  ▶ %s%s %s[+%v]%s\n", colorBoldBlue, name, colorReset, colorGray, elapsed, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Phase: %s (+%v)", l.shortID, name, elapsed)
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  > %s%s %s[+%v]%s\n", colorBoldBlue, name, colorReset, colorGray, elapsed, colorReset)
 }
 
 // PhaseComplete logs the completion of a phase
@@ -338,12 +386,13 @@ func (l *RequestLogger) PhaseComplete(name string) {
 	}
 
 	elapsed := time.Since(l.startTime).Round(time.Millisecond)
+	kunlog.Trace("[AGENT] %s Phase completed: %s (+%v)", l.shortID, name, elapsed)
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  ✓ %s%s %s[+%v]%s\n", colorGreen, name, colorReset, colorGray, elapsed, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Phase completed: %s (+%v)", l.shortID, name, elapsed)
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  + %s%s %s[+%v]%s\n", colorGreen, name, colorReset, colorGray, elapsed, colorReset)
 }
 
 // PhaseSkip logs a skipped phase (development only)
@@ -351,9 +400,12 @@ func (l *RequestLogger) PhaseSkip(name, reason string) {
 	if l.noop {
 		return
 	}
-	if config.IsDevelopment() {
-		fmt.Printf("%s  ⊘ %s (%s)%s\n", colorGray, name, reason, colorReset)
+
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  - %s (%s)%s\n", colorGray, name, reason, colorReset)
 }
 
 // LLMStart logs the start of an LLM call
@@ -363,17 +415,18 @@ func (l *RequestLogger) LLMStart(connector, model string, messageCount int) {
 	}
 
 	elapsed := time.Since(l.startTime).Round(time.Millisecond)
+	kunlog.Trace("[AGENT] %s LLM call: connector=%s, model=%s, messages=%d (+%v)", l.shortID, connector, model, messageCount, elapsed)
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  🤖 LLM Call%s %s[+%v]%s\n", colorBoldMagenta, colorReset, colorGray, elapsed, colorReset)
-		fmt.Printf("%s    Connector: %s%s%s\n", colorGray, colorWhite, connector, colorReset)
-		if model != "" {
-			fmt.Printf("%s    Model: %s%s%s\n", colorGray, colorWhite, model, colorReset)
-		}
-		fmt.Printf("%s    Messages: %s%d%s\n", colorGray, colorWhite, messageCount, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s LLM call: connector=%s, model=%s, messages=%d (+%v)", l.shortID, connector, model, messageCount, elapsed)
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  LLM Call%s %s[+%v]%s\n", colorBoldMagenta, colorReset, colorGray, elapsed, colorReset)
+	fmt.Printf("%s    Connector: %s%s%s\n", colorGray, colorWhite, connector, colorReset)
+	if model != "" {
+		fmt.Printf("%s    Model: %s%s%s\n", colorGray, colorWhite, model, colorReset)
+	}
+	fmt.Printf("%s    Messages: %s%d%s\n", colorGray, colorWhite, messageCount, colorReset)
 }
 
 // LLMComplete logs the completion of an LLM call
@@ -388,15 +441,17 @@ func (l *RequestLogger) LLMComplete(tokens int, hasToolCalls bool) {
 		status = "tool_calls"
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  ✓ LLM Response (%s)%s", colorGreen, status, colorReset)
-		if tokens > 0 {
-			fmt.Printf(" %s[tokens: %d]%s", colorGray, tokens, colorReset)
-		}
-		fmt.Printf(" %s[+%v]%s\n", colorGray, elapsed, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s LLM response: status=%s, tokens=%d (+%v)", l.shortID, status, tokens, elapsed)
+	kunlog.Trace("[AGENT] %s LLM response: status=%s, tokens=%d (+%v)", l.shortID, status, tokens, elapsed)
+
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  + LLM Response (%s)%s", colorGreen, status, colorReset)
+	if tokens > 0 {
+		fmt.Printf(" %s[tokens: %d]%s", colorGray, tokens, colorReset)
+	}
+	fmt.Printf(" %s[+%v]%s\n", colorGray, elapsed, colorReset)
 }
 
 // ToolStart logs the start of tool execution
@@ -405,11 +460,13 @@ func (l *RequestLogger) ToolStart(toolName string) {
 		return
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  🔧 Tool: %s%s\n", colorYellow, toolName, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Tool call: %s", l.shortID, toolName)
+	kunlog.Trace("[AGENT] %s Tool call: %s", l.shortID, toolName)
+
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  Tool: %s%s\n", colorYellow, toolName, colorReset)
 }
 
 // ToolComplete logs the completion of tool execution
@@ -418,18 +475,20 @@ func (l *RequestLogger) ToolComplete(toolName string, success bool) {
 		return
 	}
 
-	if config.IsDevelopment() {
-		if success {
-			fmt.Printf("%s    ✓ %s completed%s\n", colorGreen, toolName, colorReset)
-		} else {
-			fmt.Printf("%s    ✗ %s failed%s\n", colorRed, toolName, colorReset)
-		}
+	if success {
+		kunlog.Trace("[AGENT] %s Tool completed: %s", l.shortID, toolName)
 	} else {
-		if success {
-			kunlog.Trace("[AGENT] %s Tool completed: %s", l.shortID, toolName)
-		} else {
-			kunlog.Trace("[AGENT] %s Tool failed: %s", l.shortID, toolName)
-		}
+		kunlog.Error("[AGENT] %s Tool failed: %s", l.shortID, toolName)
+	}
+
+	if !config.IsDevelopment() {
+		return
+	}
+
+	if success {
+		fmt.Printf("%s    + %s completed%s\n", colorGreen, toolName, colorReset)
+	} else {
+		fmt.Printf("%s    x %s failed%s\n", colorRed, toolName, colorReset)
 	}
 }
 
@@ -440,12 +499,13 @@ func (l *RequestLogger) HookStart(hookName string) {
 	}
 
 	elapsed := time.Since(l.startTime).Round(time.Millisecond)
+	kunlog.Trace("[AGENT] %s Hook: %s (+%v)", l.shortID, hookName, elapsed)
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  🪝 Hook: %s%s %s[+%v]%s\n", colorMagenta, hookName, colorReset, colorGray, elapsed, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Hook: %s (+%v)", l.shortID, hookName, elapsed)
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  Hook: %s%s %s[+%v]%s\n", colorMagenta, hookName, colorReset, colorGray, elapsed, colorReset)
 }
 
 // HookComplete logs the completion of a hook
@@ -454,11 +514,13 @@ func (l *RequestLogger) HookComplete(hookName string) {
 		return
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s    ✓ %s done%s\n", colorGreen, hookName, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Hook completed: %s", l.shortID, hookName)
+	kunlog.Trace("[AGENT] %s Hook completed: %s", l.shortID, hookName)
+
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s    + %s done%s\n", colorGreen, hookName, colorReset)
 }
 
 // Cleanup logs resource cleanup
@@ -467,11 +529,12 @@ func (l *RequestLogger) Cleanup(resource string) {
 		return
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s    ✓ %s%s\n", colorGray, resource, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Cleanup: %s", l.shortID, resource)
+	kunlog.Trace("[AGENT] %s Cleanup: %s", l.shortID, resource)
+
+	if !config.IsDevelopment() {
+		return
 	}
+	fmt.Printf("%s    + %s%s\n", colorGray, resource, colorReset)
 }
 
 // HistoryLoad logs history loading
@@ -480,11 +543,12 @@ func (l *RequestLogger) HistoryLoad(count, maxSize int) {
 		return
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s    Loaded %d/%d history messages%s\n", colorGray, count, maxSize, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s History loaded: %d/%d messages", l.shortID, count, maxSize)
+	kunlog.Trace("[AGENT] %s History loaded: %d/%d messages", l.shortID, count, maxSize)
+
+	if !config.IsDevelopment() {
+		return
 	}
+	fmt.Printf("%s    Loaded %d/%d history messages%s\n", colorGray, count, maxSize, colorReset)
 }
 
 // HistoryOverlap logs overlap detection
@@ -494,11 +558,12 @@ func (l *RequestLogger) HistoryOverlap(overlapCount int) {
 	}
 
 	if overlapCount > 0 {
-		if config.IsDevelopment() {
-			fmt.Printf("%s    Removed %d overlapping messages%s\n", colorYellow, overlapCount, colorReset)
-		} else {
-			kunlog.Trace("[AGENT] %s History overlap removed: %d messages", l.shortID, overlapCount)
+		kunlog.Trace("[AGENT] %s History overlap removed: %d messages", l.shortID, overlapCount)
+
+		if !config.IsDevelopment() {
+			return
 		}
+		fmt.Printf("%s    Removed %d overlapping messages%s\n", colorYellow, overlapCount, colorReset)
 	}
 }
 
@@ -508,11 +573,13 @@ func (l *RequestLogger) Release() {
 		return
 	}
 
-	if config.IsDevelopment() {
-		fmt.Printf("%s  🧹 RELEASE %s%s %s(%s)%s\n", colorBoldYellow, l.shortID, colorReset, colorGray, l.assistantID, colorReset)
-	} else {
-		kunlog.Trace("[AGENT] %s Release started", l.shortID)
+	kunlog.Trace("[AGENT] %s Release started", l.shortID)
+
+	if !config.IsDevelopment() {
+		return
 	}
+
+	fmt.Printf("%s  RELEASE %s%s %s(%s)%s\n", colorBoldYellow, l.shortID, colorReset, colorGray, l.currentAssistantID(), colorReset)
 }
 
 // =============================================================================

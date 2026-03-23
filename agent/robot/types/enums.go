@@ -11,12 +11,19 @@ const (
 	PhaseRun         Phase = "run"         // P3
 	PhaseDelivery    Phase = "delivery"    // P4
 	PhaseLearning    Phase = "learning"    // P5
+	PhaseHost        Phase = "host"        // V2: Host Agent (human interaction)
 )
 
-// AllPhases for iteration
+// AllPhases lists phases in execution order (PhaseHost is excluded — it is a cross-phase service role, not a pipeline stage)
 var AllPhases = []Phase{
 	PhaseInspiration, PhaseGoals, PhaseTasks,
 	PhaseRun, PhaseDelivery, PhaseLearning,
+}
+
+// AllConfigurablePhases lists phases that can be bound to custom agents
+var AllConfigurablePhases = []Phase{
+	PhaseInspiration, PhaseGoals, PhaseTasks,
+	PhaseRun, PhaseDelivery, PhaseLearning, PhaseHost,
 }
 
 // ClockMode - clock trigger mode
@@ -44,12 +51,14 @@ type ExecStatus string
 
 // ExecStatus constants define the execution status values
 const (
-	ExecPending   ExecStatus = "pending"
-	ExecRunning   ExecStatus = "running"
-	ExecPaused    ExecStatus = "paused"
-	ExecCompleted ExecStatus = "completed"
-	ExecFailed    ExecStatus = "failed"
-	ExecCancelled ExecStatus = "cancelled"
+	ExecPending    ExecStatus = "pending"
+	ExecRunning    ExecStatus = "running"
+	ExecPaused     ExecStatus = "paused"
+	ExecCompleted  ExecStatus = "completed"
+	ExecFailed     ExecStatus = "failed"
+	ExecCancelled  ExecStatus = "cancelled"
+	ExecConfirming ExecStatus = "confirming" // V2: awaiting human confirmation before running
+	ExecWaiting    ExecStatus = "waiting"    // V2: suspended, waiting for human input
 )
 
 // RobotStatus - matches __yao.member.robot_status
@@ -172,12 +181,13 @@ type TaskStatus string
 
 // TaskStatus constants define the task execution status values
 const (
-	TaskPending   TaskStatus = "pending"
-	TaskRunning   TaskStatus = "running"
-	TaskCompleted TaskStatus = "completed"
-	TaskFailed    TaskStatus = "failed"
-	TaskSkipped   TaskStatus = "skipped"
-	TaskCancelled TaskStatus = "cancelled"
+	TaskPending      TaskStatus = "pending"
+	TaskRunning      TaskStatus = "running"
+	TaskCompleted    TaskStatus = "completed"
+	TaskFailed       TaskStatus = "failed"
+	TaskSkipped      TaskStatus = "skipped"
+	TaskCancelled    TaskStatus = "cancelled"
+	TaskWaitingInput TaskStatus = "waiting_input" // V2: task suspended, waiting for human input
 )
 
 // InsertPosition - where to insert task in queue
@@ -203,6 +213,31 @@ const (
 	// ExecutorSandbox runs in container-isolated environment (NOT IMPLEMENTED)
 	// Requires Docker/gVisor/Firecracker infrastructure
 	ExecutorSandbox ExecutorMode = "sandbox"
+)
+
+// HostAction defines structured instructions from Host Agent to Manager
+type HostAction string
+
+// HostAction constants
+const (
+	HostActionConfirm   HostAction = "confirm"        // Confirm execution plan
+	HostActionAdjust    HostAction = "adjust"         // Adjust goals/tasks
+	HostActionAddTask   HostAction = "add_task"       // Inject a new task
+	HostActionSkip      HostAction = "skip"           // Skip waiting task
+	HostActionInjectCtx HostAction = "inject_context" // Add context to waiting task
+	HostActionCancel    HostAction = "cancel"         // Cancel execution
+)
+
+// InteractSource defines the source of an interact request
+type InteractSource string
+
+// InteractSource constants
+const (
+	InteractSourceUI      InteractSource = "ui"      // User via Mission Control UI
+	InteractSourceEmail   InteractSource = "email"   // Incoming email
+	InteractSourceWebhook InteractSource = "webhook" // External webhook
+	InteractSourceA2A     InteractSource = "a2a"     // Agent-to-agent
+	InteractSourceCron    InteractSource = "cron"    // Scheduled cron
 )
 
 // IsValid checks if the executor mode is valid

@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/yaoapp/gou/connector"
-	"github.com/yaoapp/gou/connector/openai"
+	"github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/yao/agent/context"
 )
 
@@ -12,11 +12,11 @@ import (
 // Provides common functionality for all LLM providers
 type Provider struct {
 	Connector    connector.Connector
-	Capabilities *openai.Capabilities
+	Capabilities *llm.Capabilities
 }
 
 // NewProvider create a new base provider
-func NewProvider(conn connector.Connector, capabilities *openai.Capabilities) *Provider {
+func NewProvider(conn connector.Connector, capabilities *llm.Capabilities) *Provider {
 	return &Provider{
 		Connector:    conn,
 		Capabilities: capabilities,

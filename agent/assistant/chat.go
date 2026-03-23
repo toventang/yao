@@ -349,6 +349,7 @@ func (ast *Assistant) EnsureChat(ctx *agentcontext.Context) error {
 		Status:      "active",
 		Share:       "private",
 		Sort:        0,
+		Metadata:    ctx.Metadata,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}

@@ -62,57 +62,38 @@ func ListExecutions(ctx *types.Context, memberID string, query *ExecutionQuery) 
 	}
 	query.applyDefaults()
 
-	// Build list options
 	opts := &store.ListOptions{
 		MemberID: memberID,
-		Limit:    query.PageSize,
-		Offset:   (query.Page - 1) * query.PageSize,
+		Page:     query.Page,
+		PageSize: query.PageSize,
 		OrderBy:  "start_time desc",
 	}
 
 	if query.Status != "" {
 		opts.Status = query.Status
 	}
+	if len(query.ExcludeStatuses) > 0 {
+		opts.ExcludeStatuses = query.ExcludeStatuses
+	}
 	if query.Trigger != "" {
 		opts.TriggerType = query.Trigger
 	}
 
-	// Query from store
-	records, err := getExecutionStore().List(context.Background(), opts)
+	result, err := getExecutionStore().List(context.Background(), opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list executions: %w", err)
 	}
 
-	// Convert to Execution slice
-	executions := make([]*types.Execution, 0, len(records))
-	for _, record := range records {
+	executions := make([]*types.Execution, 0, len(result.Data))
+	for _, record := range result.Data {
 		executions = append(executions, record.ToExecution())
-	}
-
-	// Get total count
-	// Note: For accurate total, ExecutionStore.List should return total count
-	// Current implementation returns estimated total based on returned records
-	total := len(records)
-	if total >= query.PageSize {
-		// Has more records, need to query total count
-		// For now, indicate there might be more by setting total to -1
-		// UI should handle this as "has more"
-		countOpts := &store.ListOptions{MemberID: memberID}
-		if query.Status != "" {
-			countOpts.Status = query.Status
-		}
-		if query.Trigger != "" {
-			countOpts.TriggerType = query.Trigger
-		}
-		allRecords, _ := getExecutionStore().List(context.Background(), countOpts)
-		total = len(allRecords)
 	}
 
 	return &ExecutionResult{
 		Data:     executions,
-		Total:    total,
-		Page:     query.Page,
-		PageSize: query.PageSize,
+		Total:    result.Total,
+		Page:     result.Page,
+		PageSize: result.PageSize,
 	}, nil
 }
 

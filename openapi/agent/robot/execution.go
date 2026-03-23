@@ -95,6 +95,14 @@ func ListExecutions(c *gin.Context) {
 	if filter.Status != "" {
 		query.Status = robottypes.ExecStatus(filter.Status)
 	}
+	if filter.ExcludeStatus != "" {
+		for _, s := range strings.Split(filter.ExcludeStatus, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				query.ExcludeStatuses = append(query.ExcludeStatuses, robottypes.ExecStatus(s))
+			}
+		}
+	}
 	if filter.TriggerType != "" {
 		query.Trigger = robottypes.TriggerType(filter.TriggerType)
 	}

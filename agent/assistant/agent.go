@@ -2,17 +2,20 @@ package assistant
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/yaoapp/gou/connector"
-	"github.com/yaoapp/gou/connector/openai"
+	goullm "github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/yao/agent/assistant/handlers"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
 	"github.com/yaoapp/yao/agent/llm"
 	"github.com/yaoapp/yao/agent/output/message"
 	agentsandbox "github.com/yaoapp/yao/agent/sandbox"
+	sandboxTypes "github.com/yaoapp/yao/agent/sandbox/v2/types"
+	infraV2 "github.com/yaoapp/yao/sandbox/v2"
 )
 
 // Stream stream the agent
@@ -54,6 +57,9 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 	} else {
 		opts = &context.Options{}
 	}
+
+	// Merge caller-provided metadata into ctx so sub-agent hooks can read it via ctx.metadata
+	ctx.MergeMetadata(opts.Metadata)
 
 	// Initialize stack and auto-handle completion/failure/restore
 	_, _, done := context.EnterStack(ctx, ast.ID, opts)
@@ -100,6 +106,7 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 
 		// Log end of request
 		ctx.Logger.End(finalStatus == context.StepStatusCompleted, finalError)
+		ctx.Logger.RestoreAssistantID()
 	}()
 
 	// Determine stream handler
@@ -158,7 +165,36 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 	var sandboxExecutor agentsandbox.Executor
 	var sandboxCleanup func()
 	var sandboxLoadingMsgID string
-	if ast.HasSandbox() {
+
+	// V2 sandbox state
+	var v2Runner sandboxTypes.Runner
+	var v2Computer infraV2.Computer
+	var v2LoadingMsgID string
+
+	if ast.HasSandboxV2() {
+		ctx.Logger.Phase("Sandbox V2")
+		var err error
+		var v2Cleanup func()
+		v2Runner, v2Computer, v2Cleanup, v2LoadingMsgID, err = ast.initSandboxV2(ctx, opts)
+		if err != nil {
+			ast.traceAgentFail(agentNode, err)
+			ast.sendStreamEndOnError(ctx, streamHandler, streamStartTime, err)
+			return nil, err
+		}
+		sandboxCleanup = v2Cleanup
+		ctx.Logger.PhaseComplete("Sandbox V2")
+		if v2Computer != nil {
+			ci := v2Computer.ComputerInfo()
+			ctx.Logger.Trace("Node: %s (%s)", ci.NodeID, ci.Kind)
+			if ci.BoxID != "" {
+				ctx.Logger.Trace("Computer: %s", ci.BoxID)
+			}
+			ctx.Logger.Trace("Workspace: %s", ast.SandboxV2.WorkspaceID)
+			if conn, _, err := ast.GetConnector(ctx, opts); err == nil && conn != nil {
+				ctx.Logger.Trace("Connector: %s", conn.ID())
+			}
+		}
+	} else if ast.HasSandbox() {
 		ctx.Logger.Phase("Sandbox")
 		var err error
 		sandboxExecutor, sandboxCleanup, sandboxLoadingMsgID, err = ast.initSandbox(ctx, opts)
@@ -178,6 +214,15 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 			sandboxCleanup()
 		}
 	}()
+
+	// ================================================
+	// Standalone Workspace Loading (no sandbox required)
+	// ================================================
+	// When no sandbox is configured but the user selected a workspace,
+	// load the workspace FS into context so hooks can access ctx.workspace.
+	if !ctx.HasWorkspace() {
+		ast.initStandaloneWorkspace(ctx)
+	}
 
 	// ================================================
 	//  Execute Create Hook
@@ -284,8 +329,25 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 
 		// Execute the LLM streaming call
 		// Choose between sandbox execution or direct LLM execution
-		if ast.HasSandbox() {
-			// Sandbox execution path (Claude CLI, Cursor CLI, etc.)
+		if ast.HasSandboxV2() && v2Runner != nil && v2Computer != nil && v2Runner.Name() != "yao" {
+			// V2 Sandbox execution path (non-yao runners replace LLM.Stream)
+			completionResponse, err = ast.executeSandboxV2Stream(ctx, &sandboxV2StreamParams{
+				Messages:     completionMessages,
+				AgentNode:    agentNode,
+				Handler:      streamHandler,
+				Runner:       v2Runner,
+				Computer:     v2Computer,
+				LoadingMsgID: v2LoadingMsgID,
+				Options:      opts,
+			})
+		} else if ast.HasSandboxV2() && v2Runner != nil && v2Runner.Name() == "yao" {
+			// V2 yao runner: Prepare is done, close loading, fall through to LLM
+			if v2LoadingMsgID != "" {
+				closeLoadingV2(ctx, v2LoadingMsgID, "")
+			}
+			completionResponse, err = ast.executeLLMStream(ctx, completionMessages, completionOptions, agentNode, streamHandler, opts)
+		} else if ast.HasSandbox() {
+			// V1 Sandbox execution path (Claude CLI, Cursor CLI, etc.)
 			completionResponse, err = ast.executeSandboxStream(ctx, completionMessages, agentNode, streamHandler, sandboxExecutor, sandboxLoadingMsgID)
 		} else {
 			// Direct LLM execution path
@@ -563,31 +625,34 @@ func (ast *Assistant) Stream(ctx *context.Context, inputMessages []context.Messa
 	return finalResponse, nil
 }
 
-// GetConnector get the connector object, capabilities, and error with priority: opts.Connector > ast.Connector
+// GetConnector get the connector object, capabilities, and error with priority:
+// opts.Connector > ast.Connector > defaultConnector (fallback)
 // Note: opts.Connector may be set by Create hook's applyOptionsAdjustments
 // Returns: (connector, capabilities, error)
-func (ast *Assistant) GetConnector(ctx *context.Context, opts ...*context.Options) (connector.Connector, *openai.Capabilities, error) {
-	// Determine connector ID with priority: opts.Connector > ast.Connector
+func (ast *Assistant) GetConnector(ctx *context.Context, opts ...*context.Options) (connector.Connector, *goullm.Capabilities, error) {
 	connectorID := ast.Connector
 	if len(opts) > 0 && opts[0] != nil && opts[0].Connector != "" {
 		connectorID = opts[0].Connector
 	}
 
-	// If empty, return error
+	if connectorID == "" {
+		connectorID = defaultConnector
+	}
+
 	if connectorID == "" {
 		return nil, nil, fmt.Errorf("connector not specified")
 	}
 
-	// Load gou connector
 	conn, err := connector.Select(connectorID)
+	if err != nil && connectorID != defaultConnector && defaultConnector != "" {
+		log.Printf("[Assistant] connector %q not found, falling back to default %q", connectorID, defaultConnector)
+		conn, err = connector.Select(defaultConnector)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Get connector capabilities from settings
-	// Uses unified capability getter: 1. User-defined models.yml, 2. connector's Setting()["capabilities"], 3. default
-	capabilities := llm.GetCapabilitiesFromConn(conn, modelCapabilities)
-
+	capabilities := llm.GetCapabilitiesFromConn(conn)
 	return conn, capabilities, nil
 }
 
@@ -644,12 +709,6 @@ func (ast *Assistant) sendAgentStreamEnd(ctx *context.Context, handler message.S
 		return
 	}
 
-	// Check if context is cancelled - if so, skip handler call to avoid blocking
-	if ctx.Context != nil && ctx.Context.Err() != nil {
-		ctx.Logger.Debug("Context cancelled, skipping sendAgentStreamEnd handler call")
-		return
-	}
-
 	endData := &message.EventStreamEndData{
 		RequestID:  ctx.RequestID(),
 		ContextID:  ctx.ID,
@@ -681,24 +740,16 @@ func (ast *Assistant) sendStreamEndOnError(ctx *context.Context, handler message
 // handleInterrupt handles the interrupt signal
 // This is called by the interrupt listener when a signal is received
 func (ast *Assistant) handleInterrupt(ctx *context.Context, signal *context.InterruptSignal) error {
-	// Handle based on interrupt type
 	switch signal.Type {
 	case context.InterruptForce:
-		// Force interrupt: context is already cancelled in handleSignal
-		// LLM streaming will detect ctx.Interrupt.Context().Done() and stop
-		ctx.Logger.Debug("Force interrupt: stopping current operations immediately")
-
+		ctx.Logger.Debug("Force interrupt received")
+		if ctx.Buffer != nil {
+			ctx.Buffer.FailCurrentStep(context.ResumeStatusInterrupted,
+				fmt.Errorf("interrupted by user"))
+		}
 	case context.InterruptGraceful:
-		ctx.Logger.Debug("Graceful interrupt: will process after current step completes")
-		// Graceful interrupt: let current operation complete
-		// The signal is stored in current/pending, can be checked at checkpoints
+		ctx.Logger.Debug("Graceful interrupt received: messages=%d", len(signal.Messages))
 	}
-
-	// TODO: Implement actual interrupt handling logic:
-	// 1. For graceful: wait for current step, then merge messages and restart
-	// 2. For force: immediately stop and restart with new messages
-	// 3. Call Interrupted Hook if configured
-	// 4. Decide whether to continue, restart, or abort based on Hook response
 
 	return nil
 }

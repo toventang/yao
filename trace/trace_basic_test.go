@@ -13,11 +13,8 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// Prepare test environment (initializes stores, models, etc.)
 	test.Prepare(&testing.T{}, config.Conf)
 	defer test.Clean()
-
-	// Run tests
 	os.Exit(m.Run())
 }
 
@@ -234,15 +231,17 @@ func TestContextCancellation(t *testing.T) {
 			defer trace.Release(traceID)
 			defer trace.Remove(context.Background(), d.DriverType, traceID, d.DriverOptions...)
 
-			// Cancel context
+			// Cancel the creation context — trace operations should still work.
+			// This is the core context-fork fix: trace managers no longer bind
+			// to the caller's context, so parent cancellation cannot break child ops.
 			cancel()
 
-			// Operations should fail with context error
-			_, err = manager.Add("test", types.TraceNodeOption{
+			node, err := manager.Add("test", types.TraceNodeOption{
 				Label: "Test",
 				Type:  "test",
 			})
-			assert.Error(t, err)
+			assert.NoError(t, err)
+			assert.NotNil(t, node)
 		})
 	}
 }

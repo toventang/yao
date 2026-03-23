@@ -96,10 +96,11 @@ type TriggerResult struct {
 
 // ExecutionQuery - query options for GetExecutions()
 type ExecutionQuery struct {
-	Status   types.ExecStatus  `json:"status,omitempty"`
-	Trigger  types.TriggerType `json:"trigger,omitempty"`
-	Page     int               `json:"page,omitempty"`
-	PageSize int               `json:"pagesize,omitempty"`
+	Status          types.ExecStatus   `json:"status,omitempty"`
+	ExcludeStatuses []types.ExecStatus `json:"exclude_statuses,omitempty"`
+	Trigger         types.TriggerType  `json:"trigger,omitempty"`
+	Page            int                `json:"page,omitempty"`
+	PageSize        int                `json:"pagesize,omitempty"`
 }
 
 // ExecutionResult - result of GetExecutions()

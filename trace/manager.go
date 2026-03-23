@@ -3,62 +3,56 @@ package trace
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	gonanoid "github.com/matoous/go-nanoid/v2"
 	"github.com/yaoapp/kun/log"
-	"github.com/yaoapp/yao/trace/pubsub"
+	"github.com/yaoapp/yao/event"
 	"github.com/yaoapp/yao/trace/types"
 )
 
-// manager implements the Manager interface with channel-based state management
+// manager implements the Manager interface.
+// State is protected by a mutex, replacing the old channel-based state worker.
+// This eliminates the context-cancel bug while maintaining thread safety.
 type manager struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	traceID      string
-	driver       types.Driver
-	stateCmdChan chan stateCommand // Single channel for all state mutations
-	autoArchive  bool              // Auto-archive on complete/fail
-	pubsub       *pubsub.PubSub    // Reference to independent pubsub service (for publishing only, doesn't own it)
+	mu          sync.Mutex
+	traceID     string
+	driver      types.Driver
+	state       *managerState
+	autoArchive bool
 }
 
-// NewManager creates a new trace manager instance
-// pubsubService: reference to independent pubsub service (manager doesn't own it, just publishes to it)
-func NewManager(ctx context.Context, traceID string, driver types.Driver, pubsubService *pubsub.PubSub, option *types.TraceOption) (types.Manager, error) {
-	// Create a cancellable context for the manager
-	managerCtx, cancel := context.WithCancel(ctx)
-
-	// Determine auto-archive setting
+// NewManager creates a new trace manager instance.
+func NewManager(ctx context.Context, traceID string, driver types.Driver, option *types.TraceOption) (types.Manager, error) {
 	autoArchive := false
 	if option != nil {
 		autoArchive = option.AutoArchive
 	}
 
 	m := &manager{
-		ctx:          managerCtx,
-		cancel:       cancel,
-		traceID:      traceID,
-		driver:       driver,
-		stateCmdChan: make(chan stateCommand, 100), // Buffered channel for performance
-		autoArchive:  autoArchive,
-		pubsub:       pubsubService, // Reference only, doesn't manage lifecycle
+		traceID:     traceID,
+		driver:      driver,
+		autoArchive: autoArchive,
+		state: &managerState{
+			spaces:      make(map[string]*types.TraceSpace),
+			traceStatus: types.TraceStatusPending,
+			updates:     make([]*types.TraceUpdate, 0, 100),
+		},
 	}
 
-	// Start state worker goroutine
-	go m.startStateWorker()
-
-	// Try to load existing updates from driver (for resumed traces)
+	// Load existing updates from driver (for resumed traces).
+	// Safe to access m.state directly here — no Queue yet, single goroutine.
 	if existingUpdates, err := driver.LoadUpdates(ctx, traceID, 0); err == nil && len(existingUpdates) > 0 {
 		log.Trace("[MANAGER] NewManager: loaded %d existing updates from driver for trace %s", len(existingUpdates), traceID)
-		m.stateSetUpdates(existingUpdates)
-		// Check if trace was already completed
+		m.state.updates = existingUpdates
 		for _, update := range existingUpdates {
 			if update.Type == types.UpdateTypeComplete {
 				log.Trace("[MANAGER] NewManager: trace %s was already completed, marking as completed", traceID)
-				m.stateMarkCompleted()
+				m.state.completed = true
 				if data, ok := update.Data.(*types.TraceCompleteData); ok {
 					log.Trace("[MANAGER] NewManager: setting trace status to %s", data.Status)
-					m.stateSetTraceStatus(data.Status)
+					m.state.traceStatus = data.Status
 				}
 				break
 			}
@@ -69,7 +63,6 @@ func NewManager(ctx context.Context, traceID string, driver types.Driver, pubsub
 		} else {
 			log.Trace("[MANAGER] NewManager: no existing updates found for trace %s, creating new trace", traceID)
 		}
-		// New trace - create and broadcast init event
 		now := time.Now().UnixMilli()
 		m.addUpdateAndBroadcast(&types.TraceUpdate{
 			Type:      types.UpdateTypeInit,
@@ -88,36 +81,24 @@ func genNodeID() string {
 	return id
 }
 
-// addUpdateAndBroadcast persists, adds to history, and publishes an update
+// addUpdateAndBroadcast persists, adds to history, and broadcasts via event service.
 func (m *manager) addUpdateAndBroadcast(update *types.TraceUpdate) {
-	// Persist to driver (synchronous - no race)
 	if err := m.driver.SaveUpdate(context.Background(), m.traceID, update); err != nil {
 		log.Trace("[MANAGER] addUpdateAndBroadcast: failed to save update type=%s for trace %s: %v", update.Type, m.traceID, err)
 	}
-	// else {
-	// log.Trace("[MANAGER] addUpdateAndBroadcast: successfully saved update type=%s for trace %s", update.Type, m.traceID)
-	// }
 
-	// Add to in-memory history
 	m.stateAddUpdate(update)
 
-	// Publish to independent PubSub service (manager just publishes, doesn't manage pubsub lifecycle)
-	if m.pubsub != nil {
-		m.pubsub.Publish(update)
-	}
+	// Broadcast to subscribers via event service (fire-and-forget, non-blocking).
+	// Uses Push with the update as payload so event.Subscribe filters can match by traceID.
+	event.Push(context.Background(), "trace.update", update)
 }
 
-// checkContext checks if context is cancelled
+// checkContext checks if the trace has been completed/released.
+// With event-based state management, the manager no longer binds a context.
+// Lifecycle is controlled by QueueCreate/QueueRelease.
 func (m *manager) checkContext() error {
-	select {
-	case <-m.ctx.Done():
-		// Context cancelled - just return the error
-		// Don't call handleCancellation here to avoid deadlock
-		// handleCancellation should be called explicitly when needed
-		return m.ctx.Err()
-	default:
-		return nil
-	}
+	return nil
 }
 
 // Add creates next sequential node - auto-joins if currently in parallel state
@@ -146,7 +127,7 @@ func (m *manager) Add(input types.TraceInput, option types.TraceNodeOption) (typ
 		}
 
 		// Save root node
-		if err := m.driver.SaveNode(m.ctx, m.traceID, rootNode); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, rootNode); err != nil {
 			return nil, fmt.Errorf("failed to save root node: %w", err)
 		}
 
@@ -209,14 +190,14 @@ func (m *manager) Add(input types.TraceInput, option types.TraceNodeOption) (typ
 	// Add to each parent's children
 	for _, parent := range currentNodes {
 		parent.Children = append(parent.Children, newNodeData)
-		if err := m.driver.SaveNode(m.ctx, m.traceID, parent); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, parent); err != nil {
 			// Log error but continue
 			m.Error("Failed to update parent node %s: %v", parent.ID, err)
 		}
 	}
 
 	// Save new node
-	if err := m.driver.SaveNode(m.ctx, m.traceID, newNodeData); err != nil {
+	if err := m.driver.SaveNode(context.Background(), m.traceID, newNodeData); err != nil {
 		return nil, err
 	}
 
@@ -309,7 +290,7 @@ func (m *manager) Parallel(parallelInputs []types.TraceParallelInput) ([]types.N
 	// Save all nodes in batch - collect errors
 	var saveErrors []error
 	for _, data := range nodeData {
-		if err := m.driver.SaveNode(m.ctx, m.traceID, data); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, data); err != nil {
 			saveErrors = append(saveErrors, fmt.Errorf("failed to save node %s: %w", data.ID, err))
 		}
 	}
@@ -320,7 +301,7 @@ func (m *manager) Parallel(parallelInputs []types.TraceParallelInput) ([]types.N
 	}
 
 	// Save parent node
-	if err := m.driver.SaveNode(m.ctx, m.traceID, parentNode); err != nil {
+	if err := m.driver.SaveNode(context.Background(), m.traceID, parentNode); err != nil {
 		return nil, fmt.Errorf("failed to save parent node: %w", err)
 	}
 
@@ -379,7 +360,7 @@ func (m *manager) log(level string, message string, args ...any) {
 			NodeID:    node.ID,
 		}
 		// Save log (ignore errors for non-critical logging)
-		_ = m.driver.SaveLog(m.ctx, m.traceID, log)
+		_ = m.driver.SaveLog(context.Background(), m.traceID, log)
 
 		// Broadcast log event
 		m.addUpdateAndBroadcast(&types.TraceUpdate{
@@ -403,7 +384,7 @@ func (m *manager) SetOutput(output types.TraceOutput) error {
 	for _, node := range nodes {
 		node.Output = output
 		node.UpdatedAt = now
-		if err := m.driver.SaveNode(m.ctx, m.traceID, node); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, node); err != nil {
 			return err
 		}
 
@@ -433,7 +414,7 @@ func (m *manager) SetMetadata(key string, value any) error {
 		}
 		node.Metadata[key] = value
 		node.UpdatedAt = now
-		if err := m.driver.SaveNode(m.ctx, m.traceID, node); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, node); err != nil {
 			return err
 		}
 
@@ -484,7 +465,7 @@ func (m *manager) Complete(output ...types.TraceOutput) error {
 		node.Status = types.StatusCompleted
 		node.EndTime = now
 		node.UpdatedAt = now
-		if err := m.driver.SaveNode(m.ctx, m.traceID, node); err != nil {
+		if err := m.driver.SaveNode(context.Background(), m.traceID, node); err != nil {
 			return err
 		}
 
@@ -515,7 +496,7 @@ func (m *manager) Fail(err error) error {
 		node.Status = types.StatusFailed
 		node.EndTime = now
 		node.UpdatedAt = now
-		if saveErr := m.driver.SaveNode(m.ctx, m.traceID, node); saveErr != nil {
+		if saveErr := m.driver.SaveNode(context.Background(), m.traceID, node); saveErr != nil {
 			return saveErr
 		}
 
@@ -544,7 +525,7 @@ func (m *manager) GetRootNode() (*types.TraceNode, error) {
 
 // GetNode returns a node by ID
 func (m *manager) GetNode(id string) (*types.TraceNode, error) {
-	return m.driver.LoadNode(m.ctx, m.traceID, id)
+	return m.driver.LoadNode(context.Background(), m.traceID, id)
 }
 
 // GetCurrentNodes returns current active nodes
@@ -580,7 +561,7 @@ func (m *manager) MarkComplete() error {
 
 	// Auto-archive if enabled
 	if m.autoArchive {
-		if err := m.driver.Archive(m.ctx, m.traceID); err != nil {
+		if err := m.driver.Archive(context.Background(), m.traceID); err != nil {
 			// Log error but don't fail the complete operation
 			m.Debug("Failed to auto-archive trace", map[string]any{
 				"trace_id": m.traceID,
@@ -609,7 +590,7 @@ func (m *manager) CreateSpace(option types.TraceSpaceOption) (*types.TraceSpace,
 	}
 
 	// Save to driver
-	if err := m.driver.SaveSpace(m.ctx, m.traceID, space); err != nil {
+	if err := m.driver.SaveSpace(context.Background(), m.traceID, space); err != nil {
 		return nil, err
 	}
 
@@ -636,7 +617,7 @@ func (m *manager) GetSpace(id string) (*types.TraceSpace, error) {
 	}
 
 	// Load from driver
-	space, err := m.driver.LoadSpace(m.ctx, m.traceID, id)
+	space, err := m.driver.LoadSpace(context.Background(), m.traceID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -657,7 +638,7 @@ func (m *manager) HasSpace(id string) bool {
 	}
 
 	// Check in driver
-	space, _ := m.driver.LoadSpace(m.ctx, m.traceID, id)
+	space, _ := m.driver.LoadSpace(context.Background(), m.traceID, id)
 	return space != nil
 }
 
@@ -673,7 +654,7 @@ func (m *manager) DeleteSpace(id string) error {
 	m.stateDeleteSpace(id)
 
 	// Delete from driver
-	if err := m.driver.DeleteSpace(m.ctx, m.traceID, id); err != nil {
+	if err := m.driver.DeleteSpace(context.Background(), m.traceID, id); err != nil {
 		return err
 	}
 
@@ -692,7 +673,7 @@ func (m *manager) DeleteSpace(id string) error {
 // ListSpaces returns all spaces
 func (m *manager) ListSpaces() []*types.TraceSpace {
 	// Load from driver to ensure we have all spaces
-	spaceIDs, err := m.driver.ListSpaces(m.ctx, m.traceID)
+	spaceIDs, err := m.driver.ListSpaces(context.Background(), m.traceID)
 	if err != nil {
 		// Fallback to cached spaces
 		return m.stateGetAllSpaces()
@@ -726,13 +707,13 @@ func (m *manager) SetSpaceValue(spaceID, key string, value any) error {
 
 	// Set value in driver (through state worker for concurrent safety)
 	err = m.stateExecuteSpaceOp(spaceID, func() error {
-		if err := m.driver.SetSpaceKey(m.ctx, m.traceID, spaceID, key, value); err != nil {
+		if err := m.driver.SetSpaceKey(context.Background(), m.traceID, spaceID, key, value); err != nil {
 			return err
 		}
 
 		// Update space timestamp
 		space.UpdatedAt = now
-		if err := m.driver.SaveSpace(m.ctx, m.traceID, space); err != nil {
+		if err := m.driver.SaveSpace(context.Background(), m.traceID, space); err != nil {
 			return err
 		}
 
@@ -760,7 +741,7 @@ func (m *manager) GetSpaceValue(spaceID, key string) (any, error) {
 	var result any
 	err := m.stateExecuteSpaceOp(spaceID, func() error {
 		var err error
-		result, err = m.driver.GetSpaceKey(m.ctx, m.traceID, spaceID, key)
+		result, err = m.driver.GetSpaceKey(context.Background(), m.traceID, spaceID, key)
 		return err
 	})
 	return result, err
@@ -770,7 +751,7 @@ func (m *manager) GetSpaceValue(spaceID, key string) (any, error) {
 func (m *manager) HasSpaceValue(spaceID, key string) bool {
 	var result bool
 	_ = m.stateExecuteSpaceOp(spaceID, func() error {
-		result = m.driver.HasSpaceKey(m.ctx, m.traceID, spaceID, key)
+		result = m.driver.HasSpaceKey(context.Background(), m.traceID, spaceID, key)
 		return nil
 	})
 	return result
@@ -786,7 +767,7 @@ func (m *manager) DeleteSpaceValue(spaceID, key string) error {
 
 	// Delete value from driver (through state worker for concurrent safety)
 	err := m.stateExecuteSpaceOp(spaceID, func() error {
-		return m.driver.DeleteSpaceKey(m.ctx, m.traceID, spaceID, key)
+		return m.driver.DeleteSpaceKey(context.Background(), m.traceID, spaceID, key)
 	})
 
 	if err != nil {
@@ -815,7 +796,7 @@ func (m *manager) ClearSpaceValues(spaceID string) error {
 
 	// Clear values from driver (through state worker for concurrent safety)
 	err := m.stateExecuteSpaceOp(spaceID, func() error {
-		return m.driver.ClearSpaceKeys(m.ctx, m.traceID, spaceID)
+		return m.driver.ClearSpaceKeys(context.Background(), m.traceID, spaceID)
 	})
 
 	if err != nil {
@@ -839,7 +820,7 @@ func (m *manager) ListSpaceKeys(spaceID string) []string {
 	var keys []string
 	_ = m.stateExecuteSpaceOp(spaceID, func() error {
 		var err error
-		keys, err = m.driver.ListSpaceKeys(m.ctx, m.traceID, spaceID)
+		keys, err = m.driver.ListSpaceKeys(context.Background(), m.traceID, spaceID)
 		return err
 	})
 	return keys
@@ -864,7 +845,7 @@ func (m *manager) GetTraceInfo() (*types.TraceInfo, error) {
 	if err := m.checkContext(); err != nil {
 		return nil, err
 	}
-	return m.driver.LoadTraceInfo(m.ctx, m.traceID)
+	return m.driver.LoadTraceInfo(context.Background(), m.traceID)
 }
 
 // GetAllNodes retrieves all nodes from storage
@@ -874,7 +855,7 @@ func (m *manager) GetAllNodes() ([]*types.TraceNode, error) {
 	}
 
 	// Load the root node tree from storage
-	rootNode, err := m.driver.LoadTrace(m.ctx, m.traceID)
+	rootNode, err := m.driver.LoadTrace(context.Background(), m.traceID)
 	if err != nil {
 		return nil, err
 	}
@@ -905,7 +886,7 @@ func (m *manager) GetNodeByID(nodeID string) (*types.TraceNode, error) {
 	if err := m.checkContext(); err != nil {
 		return nil, err
 	}
-	return m.driver.LoadNode(m.ctx, m.traceID, nodeID)
+	return m.driver.LoadNode(context.Background(), m.traceID, nodeID)
 }
 
 // GetAllLogs retrieves all logs from storage
@@ -913,7 +894,7 @@ func (m *manager) GetAllLogs() ([]*types.TraceLog, error) {
 	if err := m.checkContext(); err != nil {
 		return nil, err
 	}
-	return m.driver.LoadLogs(m.ctx, m.traceID, "")
+	return m.driver.LoadLogs(context.Background(), m.traceID, "")
 }
 
 // GetLogsByNode retrieves logs for a specific node from storage
@@ -921,7 +902,7 @@ func (m *manager) GetLogsByNode(nodeID string) ([]*types.TraceLog, error) {
 	if err := m.checkContext(); err != nil {
 		return nil, err
 	}
-	return m.driver.LoadLogs(m.ctx, m.traceID, nodeID)
+	return m.driver.LoadLogs(context.Background(), m.traceID, nodeID)
 }
 
 // GetAllSpaces retrieves all spaces from storage
@@ -931,7 +912,7 @@ func (m *manager) GetAllSpaces() ([]*types.TraceSpace, error) {
 	}
 
 	// Get all space IDs from driver
-	spaceIDs, err := m.driver.ListSpaces(m.ctx, m.traceID)
+	spaceIDs, err := m.driver.ListSpaces(context.Background(), m.traceID)
 	if err != nil {
 		return nil, err
 	}
@@ -939,7 +920,7 @@ func (m *manager) GetAllSpaces() ([]*types.TraceSpace, error) {
 	// Load all spaces
 	spaces := make([]*types.TraceSpace, 0, len(spaceIDs))
 	for _, spaceID := range spaceIDs {
-		space, err := m.driver.LoadSpace(m.ctx, m.traceID, spaceID)
+		space, err := m.driver.LoadSpace(context.Background(), m.traceID, spaceID)
 		if err != nil {
 			continue // Skip spaces that fail to load
 		}
@@ -958,7 +939,7 @@ func (m *manager) GetSpaceByID(spaceID string) (*types.TraceSpaceData, error) {
 	}
 
 	// Load space metadata
-	space, err := m.driver.LoadSpace(m.ctx, m.traceID, spaceID)
+	space, err := m.driver.LoadSpace(context.Background(), m.traceID, spaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -967,7 +948,7 @@ func (m *manager) GetSpaceByID(spaceID string) (*types.TraceSpaceData, error) {
 	}
 
 	// Load all keys in the space
-	keys, err := m.driver.ListSpaceKeys(m.ctx, m.traceID, spaceID)
+	keys, err := m.driver.ListSpaceKeys(context.Background(), m.traceID, spaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -975,7 +956,7 @@ func (m *manager) GetSpaceByID(spaceID string) (*types.TraceSpaceData, error) {
 	// Load all key-value pairs
 	data := make(map[string]any)
 	for _, key := range keys {
-		value, err := m.driver.GetSpaceKey(m.ctx, m.traceID, spaceID, key)
+		value, err := m.driver.GetSpaceKey(context.Background(), m.traceID, spaceID, key)
 		if err != nil {
 			continue // Skip keys that fail to load
 		}

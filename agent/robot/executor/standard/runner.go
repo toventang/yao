@@ -14,19 +14,21 @@ import (
 
 // Runner handles execution of individual tasks
 type Runner struct {
-	ctx       *robottypes.Context
-	robot     *robottypes.Robot
-	config    *RunConfig
-	validator *Validator // reusable validator instance
+	ctx    *robottypes.Context
+	robot  *robottypes.Robot
+	config *RunConfig
+	chatID string // execution-level chatID for conversation persistence (§8.4)
+	log    *execLogger
 }
 
 // NewRunner creates a new task runner
-func NewRunner(ctx *robottypes.Context, robot *robottypes.Robot, config *RunConfig) *Runner {
+func NewRunner(ctx *robottypes.Context, robot *robottypes.Robot, config *RunConfig, chatID string, execID string) *Runner {
 	return &Runner{
-		ctx:       ctx,
-		robot:     robot,
-		config:    config,
-		validator: NewValidator(ctx, robot, config),
+		ctx:    ctx,
+		robot:  robot,
+		config: config,
+		chatID: chatID,
+		log:    newExecLogger(robot, execID),
 	}
 }
 
@@ -61,78 +63,55 @@ func (r *Runner) BuildTaskContext(exec *robottypes.Execution, taskIndex int) *Ru
 	return ctx
 }
 
-// ExecuteWithRetry executes a task with the new multi-turn conversation flow:
-// 1. Call assistant and get result
-// 2. Validate result (determines: passed, complete, needReply, replyContent)
-// 3. If needReply, continue conversation with replyContent
-// 4. Repeat until complete or max turns exceeded
-func (r *Runner) ExecuteWithRetry(task *robottypes.Task, taskCtx *RunnerContext) *robottypes.TaskResult {
+// ExecuteTask executes a single task (V2 simplified: single call, no validation loop).
+// Success is determined purely by whether the call itself succeeds without error.
+// Quality evaluation is deferred to the Delivery Agent (P4) using ExpectedOutput.
+func (r *Runner) ExecuteTask(task *robottypes.Task, taskCtx *RunnerContext) *robottypes.TaskResult {
 	startTime := time.Now()
 
 	result := &robottypes.TaskResult{
 		TaskID: task.ID,
 	}
 
-	// For non-assistant tasks (MCP, Process), use simple single-call execution
+	// For non-assistant tasks (MCP, Process), single-call execution
 	if task.ExecutorType != robottypes.ExecutorAssistant {
 		output, err := r.executeNonAssistantTask(task, taskCtx)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("execution failed: %s", err.Error())
 			result.Duration = time.Since(startTime).Milliseconds()
+			r.log.logTaskOutput(task, result)
 			return result
 		}
 
 		result.Output = output
-
-		// For MCP tasks: only validate structure (no semantic validation needed)
-		// MCP tools return structured data - if execution succeeded, the result is valid
-		if task.ExecutorType == robottypes.ExecutorMCP {
-			validation := r.validateMCPOutput(task, output)
-			result.Validation = validation
-			result.Success = validation.Passed
-			result.Duration = time.Since(startTime).Milliseconds()
-			if !result.Success && validation != nil {
-				result.Error = fmt.Sprintf("validation failed: %v", validation.Issues)
-			}
-			return result
-		}
-
-		// For Process tasks: use full validation (semantic validation may still be useful)
-		validation := r.validator.ValidateWithContext(task, output, nil)
-		result.Validation = validation
-		// For Process tasks:
-		// - No multi-turn conversation, so Complete is determined by validation alone
-		// - Success if passed OR score meets threshold (for partial success scenarios)
-		result.Success = validation.Complete || (validation.Passed && validation.Score >= r.config.ValidationThreshold)
+		result.Success = true
 		result.Duration = time.Since(startTime).Milliseconds()
-
-		if !result.Success && validation != nil {
-			result.Error = fmt.Sprintf("validation failed: %v", validation.Issues)
-		}
+		r.log.logTaskOutput(task, result)
 		return result
 	}
 
-	// For assistant tasks, use multi-turn conversation flow
-	output, validation, err := r.executeAssistantWithMultiTurn(task, taskCtx)
+	// For assistant tasks, single call via conversation
+	output, callResult, err := r.executeAssistantTask(task, taskCtx)
 	if err != nil {
 		result.Success = false
 		result.Error = err.Error()
-		result.Output = output         // Preserve partial output for debugging
-		result.Validation = validation // Preserve validation result for debugging
 		result.Duration = time.Since(startTime).Milliseconds()
+		r.log.logTaskOutput(task, result)
 		return result
 	}
 
 	result.Output = output
-	result.Validation = validation
-	result.Success = validation.Complete && validation.Passed
+	result.Success = true
 	result.Duration = time.Since(startTime).Milliseconds()
 
-	if !result.Success && validation != nil {
-		result.Error = fmt.Sprintf("task incomplete: %v", validation.Issues)
+	// Check if assistant signals it needs human input (V2 suspend protocol)
+	if needInput, question := detectNeedMoreInfo(callResult); needInput {
+		result.NeedInput = true
+		result.InputQuestion = question
 	}
 
+	r.log.logTaskOutput(task, result)
 	return result
 }
 
@@ -148,122 +127,79 @@ func (r *Runner) executeNonAssistantTask(task *robottypes.Task, taskCtx *RunnerC
 	}
 }
 
-// executeAssistantWithMultiTurn executes an assistant task with multi-turn conversation support
-// This is the main execution flow for assistant tasks:
-// 1. Call assistant and get result
-// 2. Validate result (determines: passed, complete, needReply, replyContent)
-// 3. If needReply, continue conversation with replyContent
-// 4. Repeat until complete or max turns exceeded
-func (r *Runner) executeAssistantWithMultiTurn(task *robottypes.Task, taskCtx *RunnerContext) (interface{}, *robottypes.ValidationResult, error) {
-	// Create conversation for the entire task execution (shared across all turns)
-	chatID := fmt.Sprintf("robot-%s-task-%s", r.robot.MemberID, task.ID)
-	conv := NewConversation(task.ExecutorID, chatID, r.config.MaxTurnsPerTask)
+// executeAssistantTask executes an assistant task with a single conversation turn.
+// Returns the extracted output, the raw CallResult (for need_input detection), and any error.
+func (r *Runner) executeAssistantTask(task *robottypes.Task, taskCtx *RunnerContext) (interface{}, *CallResult, error) {
+	caller := NewAgentCaller()
+	caller.log = r.log
+	caller.Connector = r.robot.LanguageModel
+	caller.ChatID = r.chatID
 
-	// Add system prompt if available
-	if taskCtx.SystemPrompt != "" {
-		conv.WithSystemPrompt(taskCtx.SystemPrompt)
-	}
-
-	// Build initial messages
 	messages := r.BuildAssistantMessages(task, taskCtx)
 	input := r.FormatMessagesAsText(messages)
 
-	// Ensure we have valid input for the first turn
 	if strings.TrimSpace(input) == "" {
 		return nil, nil, fmt.Errorf("no valid input messages for task %s", task.ID)
 	}
 
-	var lastOutput interface{}
-	var lastValidation *robottypes.ValidationResult
-	var lastCallResult *CallResult
-
-	for turn := 1; turn <= r.config.MaxTurnsPerTask; turn++ {
-		// Phase 1: Call assistant
-		turnResult, err := conv.Turn(r.ctx, input)
-		if err != nil {
-			return lastOutput, lastValidation, fmt.Errorf("turn %d failed: %w", turn, err)
-		}
-
-		lastCallResult = turnResult.Result
-		lastOutput = r.extractOutput(lastCallResult)
-
-		// Phase 2: Validate result
-		lastValidation = r.validator.ValidateWithContext(task, lastOutput, lastCallResult)
-
-		// Check if complete
-		if lastValidation.Complete && lastValidation.Passed {
-			return lastOutput, lastValidation, nil // Success!
-		}
-
-		// Phase 3: Check if we should continue conversation
-		if !lastValidation.NeedReply {
-			// No need to continue, but not complete either
-			// This could be a validation failure that can't be fixed by conversation
-			if lastValidation.Passed {
-				// Passed but not complete (e.g., empty output)
-				return lastOutput, lastValidation, nil
-			}
-			// Failed and can't retry
-			return lastOutput, lastValidation, fmt.Errorf("validation failed: %v", lastValidation.Issues)
-		}
-
-		// Prepare next turn input
-		input = lastValidation.ReplyContent
-		if input == "" {
-			// Fallback: generate default reply
-			input = r.generateDefaultReply(lastValidation, task)
-		}
+	if taskCtx.SystemPrompt != "" {
+		input = "## Context\n\n" + taskCtx.SystemPrompt + "\n\n## Task\n\n" + input
 	}
 
-	// Max turns exceeded
-	if lastValidation == nil {
-		lastValidation = &robottypes.ValidationResult{
-			Passed:   false,
-			Complete: false,
-			Issues:   []string{fmt.Sprintf("max turns (%d) exceeded without completion", r.config.MaxTurnsPerTask)},
-		}
-	} else {
-		lastValidation.Issues = append(lastValidation.Issues,
-			fmt.Sprintf("max turns (%d) exceeded without completion", r.config.MaxTurnsPerTask))
+	r.log.logTaskInput(task, input)
+
+	result, err := caller.CallWithMessages(r.ctx, task.ExecutorID, input)
+	if err != nil {
+		return nil, nil, fmt.Errorf("assistant call failed: %w", err)
 	}
 
-	return lastOutput, lastValidation, fmt.Errorf("max turns (%d) exceeded without completion", r.config.MaxTurnsPerTask)
+	output := r.extractOutput(result)
+	return output, result, nil
+}
+
+// detectNeedMoreInfo checks if the assistant's response signals it needs human input.
+// The protocol: Next hook returns {data: {status: "need_input", question: "..."}}.
+// Also handles the unwrapped form {status: "need_input", question: "..."} for robustness.
+func detectNeedMoreInfo(result *CallResult) (bool, string) {
+	if result == nil || result.Next == nil {
+		return false, ""
+	}
+	m, ok := result.Next.(map[string]interface{})
+	if !ok {
+		return false, ""
+	}
+
+	// Unwrap "data" envelope if present (Next hook standard: {data: {status: ...}})
+	if data, ok := m["data"].(map[string]interface{}); ok {
+		m = data
+	}
+
+	status, _ := m["status"].(string)
+	if status != "need_input" {
+		return false, ""
+	}
+	question, _ := m["question"].(string)
+	if question == "" {
+		question = result.GetText()
+	}
+	return true, question
 }
 
 // extractOutput extracts the output from a CallResult
+// Priority: Next hook data > LLM Completion content
+// Next is the agent's formal A2A output (could be string, map, array, number, etc.)
+// Content is the raw LLM completion text (fallback only when Next is absent)
 func (r *Runner) extractOutput(result *CallResult) interface{} {
 	if result == nil {
 		return nil
 	}
-
-	// Try to extract structured JSON output
-	if data, err := result.GetJSON(); err == nil {
-		return data
+	if result.Next != nil {
+		return result.Next
 	}
-
-	// Fall back to text content
-	return result.GetText()
-}
-
-// generateDefaultReply generates a default reply when validation doesn't provide one
-func (r *Runner) generateDefaultReply(validation *robottypes.ValidationResult, task *robottypes.Task) string {
-	var sb strings.Builder
-
-	if len(validation.Issues) > 0 {
-		sb.WriteString("Please address the following issues:\n")
-		for _, issue := range validation.Issues {
-			sb.WriteString(fmt.Sprintf("- %s\n", issue))
-		}
-		sb.WriteString("\n")
+	if result.Content != "" {
+		return result.Content
 	}
-
-	if task.ExpectedOutput != "" {
-		sb.WriteString(fmt.Sprintf("Expected output: %s\n", task.ExpectedOutput))
-	}
-
-	sb.WriteString("\nPlease provide an improved response.")
-
-	return sb.String()
+	return nil
 }
 
 // ExecuteMCPTask executes a task using an MCP tool
@@ -325,7 +261,6 @@ func (r *Runner) ExecuteProcessTask(task *robottypes.Task, taskCtx *RunnerContex
 }
 
 // BuildAssistantMessages builds messages for an assistant task
-// Note: In the new multi-turn flow, validation feedback is handled via ValidateWithContext.ReplyContent
 func (r *Runner) BuildAssistantMessages(task *robottypes.Task, taskCtx *RunnerContext) []agentcontext.Message {
 	messages := make([]agentcontext.Message, 0)
 
@@ -404,57 +339,4 @@ func (r *Runner) FormatPreviousResultsAsContext(results []robottypes.TaskResult)
 	}
 
 	return sb.String()
-}
-
-// validateMCPOutput performs simple structure validation for MCP task output
-// MCP tools return structured data - if execution succeeded, the result is valid
-// Only validates that output is non-empty and has expected structure
-// Does NOT perform semantic validation (that's for Agent tasks only)
-func (r *Runner) validateMCPOutput(task *robottypes.Task, output interface{}) *robottypes.ValidationResult {
-	result := &robottypes.ValidationResult{
-		Passed:   true,
-		Score:    1.0,
-		Complete: true,
-	}
-
-	// Check if output is nil or empty
-	if output == nil {
-		result.Passed = false
-		result.Score = 0
-		result.Complete = false
-		result.Issues = append(result.Issues, "MCP tool returned nil output")
-		return result
-	}
-
-	// Check for empty output based on type
-	switch o := output.(type) {
-	case string:
-		if strings.TrimSpace(o) == "" {
-			result.Passed = false
-			result.Score = 0
-			result.Complete = false
-			result.Issues = append(result.Issues, "MCP tool returned empty string")
-			return result
-		}
-	case map[string]interface{}:
-		if len(o) == 0 {
-			result.Passed = false
-			result.Score = 0
-			result.Complete = false
-			result.Issues = append(result.Issues, "MCP tool returned empty object")
-			return result
-		}
-	case []interface{}:
-		if len(o) == 0 {
-			result.Passed = false
-			result.Score = 0
-			result.Complete = false
-			result.Issues = append(result.Issues, "MCP tool returned empty array")
-			return result
-		}
-	}
-
-	// MCP execution succeeded with non-empty output - validation passed
-	// No semantic validation needed for MCP tools
-	return result
 }

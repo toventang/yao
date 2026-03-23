@@ -319,6 +319,7 @@ func (ast *Assistant) executeSingleToolCall(ctx *agentContext.Context, toolCall 
 			result.Content = result.Error.Error()
 			result.IsRetryableError = true // Argument parsing error is retryable by LLM
 			ctx.Logger.Error("Failed to parse arguments: %v", err)
+			ctx.Logger.ToolComplete(toolCall.Function.Name, false)
 			if toolNode != nil {
 				toolNode.Fail(result.Error)
 			}
@@ -333,6 +334,7 @@ func (ast *Assistant) executeSingleToolCall(ctx *agentContext.Context, toolCall 
 			result.Content = result.Error.Error()
 			result.IsRetryableError = true // Type error is retryable by LLM
 			ctx.Logger.Error("Arguments must be an object, got %T", parsed)
+			ctx.Logger.ToolComplete(toolCall.Function.Name, false)
 			if toolNode != nil {
 				toolNode.Fail(result.Error)
 			}
@@ -346,6 +348,7 @@ func (ast *Assistant) executeSingleToolCall(ctx *agentContext.Context, toolCall 
 				result.Content = result.Error.Error()
 				result.IsRetryableError = true // Validation error is retryable by LLM
 				ctx.Logger.Error("Argument validation failed: %v", err)
+				ctx.Logger.ToolComplete(toolCall.Function.Name, false)
 				if toolNode != nil {
 					toolNode.Fail(result.Error)
 				}
@@ -393,7 +396,7 @@ func (ast *Assistant) executeSingleToolCall(ctx *agentContext.Context, toolCall 
 	}
 
 	result.Content = string(contentBytes)
-	ctx.Logger.ToolComplete(toolName, true)
+	ctx.Logger.ToolComplete(toolCall.Function.Name, true)
 
 	if toolNode != nil {
 		toolNode.Complete(map[string]any{
@@ -563,6 +566,7 @@ func (ast *Assistant) executeServerToolsParallelWithTrace(mcpCtx context.Context
 			Arguments: args,
 		})
 		callMap[toolName] = tc
+		ctx.Logger.ToolStart(tc.Function.Name)
 
 		// Add trace input for this tool
 		parallelInputs = append(parallelInputs, types.TraceParallelInput{
@@ -598,10 +602,14 @@ func (ast *Assistant) executeServerToolsParallelWithTrace(mcpCtx context.Context
 	mcpResponse, err := client.CallToolsParallel(mcpCtx, mcpCalls, ctx)
 	if err != nil {
 		ctx.Logger.Error("Parallel call failed: %v", err)
-		// Mark all trace nodes as failed
-		for _, node := range toolNodes {
+		for i, node := range toolNodes {
 			if node != nil {
 				node.Fail(err)
+			}
+			if i < len(mcpCalls) {
+				if tc, ok := callMap[mcpCalls[i].Name]; ok {
+					ctx.Logger.ToolComplete(tc.Function.Name, false)
+				}
 			}
 		}
 		return nil, true
@@ -631,6 +639,7 @@ func (ast *Assistant) executeServerToolsParallelWithTrace(mcpCtx context.Context
 			result.Content = result.Error.Error()
 			result.IsRetryableError = false // Serialization error is not retryable
 			hasErrors = true
+			ctx.Logger.ToolComplete(originalCall.Function.Name, false)
 			if toolNode != nil {
 				toolNode.Fail(result.Error)
 			}
@@ -643,11 +652,12 @@ func (ast *Assistant) executeServerToolsParallelWithTrace(mcpCtx context.Context
 				result.IsRetryableError = isRetryableToolError(result.Error)
 				hasErrors = true
 				ctx.Logger.Error("Tool call failed: %s - %s (retryable: %v)", toolName, result.Content, result.IsRetryableError)
+				ctx.Logger.ToolComplete(originalCall.Function.Name, false)
 				if toolNode != nil {
 					toolNode.Fail(result.Error)
 				}
 			} else {
-				// Success
+				ctx.Logger.ToolComplete(originalCall.Function.Name, true)
 				if toolNode != nil {
 					toolNode.Complete(map[string]any{
 						"result": mcpResult.Content,
@@ -670,6 +680,8 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 	ctx.Logger.Debug("Calling %d tools sequentially on server '%s'", len(toolCalls), serverID)
 
 	for _, tc := range toolCalls {
+		ctx.Logger.ToolStart(tc.Function.Name)
+
 		_, toolName, ok := ParseMCPToolName(tc.Function.Name)
 		if !ok {
 			results = append(results, ToolCallResult{
@@ -678,6 +690,7 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 				Content:    fmt.Sprintf("Invalid tool name format: %s", tc.Function.Name),
 				Error:      fmt.Errorf("invalid tool name format"),
 			})
+			ctx.Logger.ToolComplete(tc.Function.Name, false)
 			hasErrors = true
 			continue
 		}
@@ -727,6 +740,7 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 				}
 				results = append(results, result)
 				hasErrors = true
+				ctx.Logger.ToolComplete(tc.Function.Name, false)
 				if toolNode != nil {
 					toolNode.Fail(err)
 				}
@@ -747,6 +761,7 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 				}
 				results = append(results, result)
 				hasErrors = true
+				ctx.Logger.ToolComplete(tc.Function.Name, false)
 				if toolNode != nil {
 					toolNode.Fail(err)
 				}
@@ -765,6 +780,7 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 					}
 					results = append(results, result)
 					hasErrors = true
+					ctx.Logger.ToolComplete(tc.Function.Name, false)
 					if toolNode != nil {
 						toolNode.Fail(err)
 					}
@@ -788,6 +804,7 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 			result.IsRetryableError = isRetryableToolError(err)
 			hasErrors = true
 			ctx.Logger.Error("Tool call failed: %s - %v (retryable: %v)", toolName, err, result.IsRetryableError)
+			ctx.Logger.ToolComplete(tc.Function.Name, false)
 			if toolNode != nil {
 				toolNode.Fail(err)
 			}
@@ -806,11 +823,13 @@ func (ast *Assistant) executeServerToolsSequentialWithTrace(mcpCtx context.Conte
 				result.Content = fmt.Sprintf("Failed to serialize result: %v", err)
 				result.IsRetryableError = false // Serialization error is not retryable
 				hasErrors = true
+				ctx.Logger.ToolComplete(tc.Function.Name, false)
 				if toolNode != nil {
 					toolNode.Fail(err)
 				}
 			} else {
 				result.Content = string(contentBytes)
+				ctx.Logger.ToolComplete(tc.Function.Name, !mcpResult.IsError)
 				if toolNode != nil {
 					toolNode.Complete(map[string]any{
 						"result": mcpResult.Content,

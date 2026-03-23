@@ -162,71 +162,71 @@ func TestExecutionStoreList(t *testing.T) {
 	setupTestExecutionsForList(t, s, ctx)
 
 	t.Run("lists_all_records_without_filters", func(t *testing.T) {
-		records, err := s.List(ctx, nil)
+		result, err := s.List(ctx, nil)
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, len(records), 4)
+		assert.GreaterOrEqual(t, len(result.Data), 4)
 	})
 
 	t.Run("filters_by_member_id", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
+		result, err := s.List(ctx, &store.ListOptions{
 			MemberID: "member_list_001",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(records))
-		for _, r := range records {
+		assert.Equal(t, 2, len(result.Data))
+		for _, r := range result.Data {
 			assert.Equal(t, "member_list_001", r.MemberID)
 		}
 	})
 
 	t.Run("filters_by_team_id", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
+		result, err := s.List(ctx, &store.ListOptions{
 			TeamID: "team_list_001",
 		})
 		require.NoError(t, err)
-		assert.Equal(t, 3, len(records))
-		for _, r := range records {
+		assert.Equal(t, 3, len(result.Data))
+		for _, r := range result.Data {
 			assert.Equal(t, "team_list_001", r.TeamID)
 		}
 	})
 
 	t.Run("filters_by_status", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
+		result, err := s.List(ctx, &store.ListOptions{
 			Status: types.ExecCompleted,
 		})
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, len(records), 2)
-		for _, r := range records {
+		assert.GreaterOrEqual(t, len(result.Data), 2)
+		for _, r := range result.Data {
 			assert.Equal(t, types.ExecCompleted, r.Status)
 		}
 	})
 
 	t.Run("filters_by_trigger_type", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
+		result, err := s.List(ctx, &store.ListOptions{
 			TriggerType: types.TriggerHuman,
 		})
 		require.NoError(t, err)
-		assert.GreaterOrEqual(t, len(records), 1)
-		for _, r := range records {
+		assert.GreaterOrEqual(t, len(result.Data), 1)
+		for _, r := range result.Data {
 			assert.Equal(t, types.TriggerHuman, r.TriggerType)
 		}
 	})
 
-	t.Run("respects_limit", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
-			Limit: 2,
+	t.Run("respects_pagesize", func(t *testing.T) {
+		result, err := s.List(ctx, &store.ListOptions{
+			PageSize: 2,
 		})
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(records))
+		assert.Equal(t, 2, len(result.Data))
 	})
 
 	t.Run("combines_multiple_filters", func(t *testing.T) {
-		records, err := s.List(ctx, &store.ListOptions{
+		result, err := s.List(ctx, &store.ListOptions{
 			TeamID: "team_list_001",
 			Status: types.ExecCompleted,
 		})
 		require.NoError(t, err)
-		assert.Equal(t, 2, len(records))
-		for _, r := range records {
+		assert.Equal(t, 2, len(result.Data))
+		for _, r := range result.Data {
 			assert.Equal(t, "team_list_001", r.TeamID)
 			assert.Equal(t, types.ExecCompleted, r.Status)
 		}
@@ -1085,8 +1085,8 @@ func TestExecutionStoreListResults(t *testing.T) {
 	t.Run("respects_pagination", func(t *testing.T) {
 		result, err := s.ListResults(ctx, &store.ResultListOptions{
 			MemberID: "member_result_001",
-			Limit:    1,
-			Offset:   0,
+			PageSize: 1,
+			Page:     1,
 		})
 		require.NoError(t, err)
 		require.NotNil(t, result)

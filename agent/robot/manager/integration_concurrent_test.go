@@ -602,6 +602,10 @@ func (e *trackingExecutor) CurrentCount() int {
 	return 0
 }
 
+func (e *trackingExecutor) Resume(ctx *types.Context, execID string, reply string) error {
+	return fmt.Errorf("resume not supported in tracking executor")
+}
+
 func (e *trackingExecutor) Reset() {
 	atomic.StoreInt32(&e.count, 0)
 }
@@ -665,6 +669,10 @@ func (e *triggerTrackingExecutor) ExecCount() int {
 
 func (e *triggerTrackingExecutor) CurrentCount() int {
 	return 0
+}
+
+func (e *triggerTrackingExecutor) Resume(ctx *types.Context, execID string, reply string) error {
+	return fmt.Errorf("resume not supported in trigger tracking executor")
 }
 
 func (e *triggerTrackingExecutor) Reset() {

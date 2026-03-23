@@ -46,3 +46,8 @@ var ErrTaskPlanFailed = errors.New("task planning failed")
 
 // ErrDeliveryFailed indicates delivery failed
 var ErrDeliveryFailed = errors.New("delivery failed")
+
+// ErrExecutionSuspended is a sentinel error signaling that execution has been
+// suspended to wait for human input. The executor should persist state and
+// release its worker goroutine. NOT a failure — resumable via Resume().
+var ErrExecutionSuspended = errors.New("execution suspended: waiting for human input")

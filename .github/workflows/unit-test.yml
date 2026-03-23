@@ -45,6 +45,7 @@ env:
   OPENAI_TEST_KEY: ${{ secrets.OPENAI_TEST_KEY }}
   TEST_MOAPI_SECRET: ${{ secrets.OPENAI_TEST_KEY }}
   OPENAI_API_KEY: ${{ secrets.OPENAI_TEST_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   TEST_MOAPI_MIRROR: https://api.openai.com
 
   # DeepSeek API Configuration
@@ -65,6 +66,12 @@ env:
   CLAUDE_API_HOST: ${{ secrets.CLAUDE_API_HOST }}
   CLAUDE_SONNET_4: ${{ secrets.CLAUDE_SONNET_4 }}
   CLAUDE_SONNET_4_THINKING: ${{ secrets.CLAUDE_SONNET_4_THINKING }}
+
+  # Moonshot / Kimi API Configuration
+  MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+  MOONSHOT_PROXY: "https://api.moonshot.cn"
+  KIMI_CODE_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+  KIMI_CODE_PROXY: "https://api.kimi.com/coding"
 
   TAB_NAME: "::PET ADMIN"
   PAGE_SIZE: "20"
@@ -276,9 +283,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: 6
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
 
       - name: Setup Go Tools
         run: make tools
@@ -298,9 +303,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   # =============================================================================
-  # AI Tests (agent, aigc) - Run once with SQLite
+  # Agent Tests (agent, aigc) - Run once with SQLite
   # =============================================================================
-  ai-test:
+  agent-test:
     runs-on: ubuntu-latest
     services:
       qdrant:
@@ -411,9 +416,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: 6
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
 
       - name: Setup Go Tools
         run: make tools
@@ -441,13 +444,13 @@ jobs:
           docker pull yaoapp/sandbox-base:latest || true
           docker pull yaoapp/sandbox-claude:latest || true
 
-      - name: Run AI Tests (agent, aigc)
+      - name: Run Agent Tests (agent, aigc)
         env:
           YAO_SANDBOX_WORKSPACE: ${{ runner.temp }}/sandbox/workspace
           YAO_SANDBOX_IPC: ${{ runner.temp }}/sandbox/ipc
         run: |
           export YAO_SANDBOX_CONTAINER_USER="$(id -u):$(id -g)"
-          make unit-test-ai
+          make unit-test-agent
 
       - name: Codecov Report
         uses: codecov/codecov-action@v4
@@ -455,9 +458,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   # =============================================================================
-  # Robot E2E Tests (agent/robot/api) - Run TestE2E* with real LLM calls
+  # Robot Tests (all agent/robot/... packages) - Unit + E2E with real LLM calls
   # =============================================================================
-  robot-e2e-test:
+  robot-test:
     runs-on: ubuntu-latest
     services:
       mcp-everything:
@@ -543,9 +546,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: 6
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
 
       - name: Setup Go Tools
         run: make tools
@@ -556,8 +557,8 @@ jobs:
           echo "YAO_DB_DRIVER=sqlite3" >> $GITHUB_ENV
           echo "YAO_DB_PRIMARY=${{ github.WORKSPACE }}/../app/db/yao.db" >> $GITHUB_ENV
 
-      - name: Run Robot E2E Tests
-        run: make unit-test-robot-e2e
+      - name: Run Robot Tests (Unit + E2E)
+        run: make unit-test-robot
 
       - name: Codecov Report
         uses: codecov/codecov-action@v4
@@ -647,9 +648,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: 6
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
 
       - name: Setup Go Tools
         run: make tools
@@ -679,6 +678,227 @@ jobs:
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # =============================================================================
+  # Sandbox V2 Tests (tai SDK + workspace, Docker + K8s via k3d)
+  # Full sandbox/v2 integration tests are run locally.
+  # =============================================================================
+  sandbox-v2-test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: 123456
+          MONGO_INITDB_DATABASE: test
+
+    strategy:
+      matrix:
+        go: ["1.25"]
+    steps:
+      - name: Checkout Kun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_KUN }}
+          path: kun
+
+      - name: Checkout Xun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_XUN }}
+          path: xun
+
+      - name: Checkout Gou
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_GOU }}
+          path: gou
+
+      - name: Checkout V8Go
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/v8go
+          path: v8go
+
+      - name: Unzip libv8
+        run: |
+          files=$(find ./v8go -name "libv8*.zip")
+          for file in $files; do
+            dir=$(dirname "$file")
+            echo "Extracting $file to directory $dir"
+            unzip -o -d $dir $file
+            rm -rf $dir/__MACOSX
+          done
+
+      - name: Checkout Demo App
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-dev-app
+          path: app
+
+      - name: Checkout Extension
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-extensions-dev
+          path: extension
+
+      - name: Move Dependencies
+        run: |
+          mv kun ../
+          mv xun ../
+          mv gou ../
+          mv v8go ../
+          mv app ../
+          mv extension ../
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Apple Private Key
+        run: |
+          mkdir -p ../app/openapi/certs/apple
+          echo "${{ secrets.APPLE_PRIVATE_KEY_USER }}" > ../app/openapi/certs/apple/signin_client_secret_key.p8
+
+      - name: Setup Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Start Redis
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
+
+      - name: Setup Go Tools
+        run: make tools
+
+      - name: Setup ENV (SQLite)
+        run: |
+          mkdir -p ${{ github.WORKSPACE }}/../app/db
+          echo "YAO_DB_DRIVER=sqlite3" >> $GITHUB_ENV
+          echo "YAO_DB_PRIMARY=${{ github.WORKSPACE }}/../app/db/yao.db" >> $GITHUB_ENV
+
+      - name: Pull Test Images
+        run: |
+          docker pull yaoapp/tai-sandbox-test:latest || true
+          docker pull yaoapp/tai:latest
+          docker pull alpine:latest
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create k3d cluster
+        run: |
+          k3d cluster create tai-test --no-lb --wait --api-port 16443
+          kubectl wait --for=condition=Ready node --all --timeout=60s
+          k3d image import alpine:latest -c tai-test
+
+      - name: Start Tai Docker instance
+        run: |
+          docker run -d --name tai-docker \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -p 19100:19100 -p 8099:8099 -p 12375:12375 -p 16080:16080 \
+            yaoapp/tai:latest server -direct \
+            -grpc 0.0.0.0:19100 -http 0.0.0.0:8099 -vnc 0.0.0.0:16080 -docker 0.0.0.0:12375
+
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8099/healthz > /dev/null 2>&1; then
+              echo "Tai Docker HTTP ready"; break
+            fi
+            echo "Waiting for Tai Docker HTTP... ($i)"; sleep 1
+          done
+          curl -sf http://127.0.0.1:8099/healthz > /dev/null 2>&1 || {
+            echo "::error::Tai Docker HTTP failed"; docker logs tai-docker 2>&1; exit 1
+          }
+
+          for i in $(seq 1 15); do
+            if nc -z 127.0.0.1 19100 2>/dev/null; then
+              echo "Tai Docker gRPC ready"; break
+            fi
+            echo "Waiting for Tai Docker gRPC... ($i)"; sleep 1
+          done
+          nc -z 127.0.0.1 19100 2>/dev/null || {
+            echo "::error::Tai Docker gRPC failed"; docker logs tai-docker 2>&1; exit 1
+          }
+
+      - name: Generate kubeconfig for Tai K8s
+        run: |
+          K3D_IP=$(docker inspect k3d-tai-test-server-0 | jq -r '.[0].NetworkSettings.Networks["k3d-tai-test"].IPAddress')
+          echo "k3d server IP: ${K3D_IP}"
+
+          k3d kubeconfig get tai-test > /tmp/kubeconfig-k3d.yml
+
+          # Kubeconfig for tai-k8s container (uses k3d-internal IP)
+          sed "s|server: .*|server: https://${K3D_IP}:6443|" /tmp/kubeconfig-k3d.yml \
+            > /tmp/kubeconfig-tai-k8s.yml
+          echo "Container kubeconfig server:"
+          grep server: /tmp/kubeconfig-tai-k8s.yml
+
+          # Kubeconfig for test runner (uses localhost via port-mapped 6443)
+          sed 's|server: .*|server: https://127.0.0.1:6443|' /tmp/kubeconfig-k3d.yml \
+            > ${{ runner.temp }}/kubeconfig-tai.yml
+          echo "Test runner kubeconfig server:"
+          grep server: ${{ runner.temp }}/kubeconfig-tai.yml
+
+      - name: Start Tai K8s instance
+        run: |
+          K3D_IP=$(docker inspect k3d-tai-test-server-0 | jq -r '.[0].NetworkSettings.Networks["k3d-tai-test"].IPAddress')
+          echo "k3d server IP: ${K3D_IP}"
+
+          docker run -d --name tai-k8s \
+            --network k3d-tai-test \
+            -p 19101:19100 -p 8100:8099 -p 6443:16443 -p 16081:16080 \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v /tmp/kubeconfig-tai-k8s.yml:/etc/tai/kubeconfig.yml:ro \
+            -e TAI_K8S_UPSTREAM="tcp://${K3D_IP}:6443" \
+            -e TAI_KUBECONFIG=/etc/tai/kubeconfig.yml \
+            yaoapp/tai:latest server -direct \
+            -grpc 0.0.0.0:19100 -http 0.0.0.0:8099 -vnc 0.0.0.0:16080 -k8s 0.0.0.0:16443
+
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8100/healthz > /dev/null 2>&1; then
+              echo "Tai K8s HTTP ready"; break
+            fi
+            echo "Waiting for Tai K8s HTTP... ($i)"; sleep 1
+          done
+          curl -sf http://127.0.0.1:8100/healthz > /dev/null 2>&1 || {
+            echo "::error::Tai K8s HTTP failed"; docker logs tai-k8s 2>&1; exit 1
+          }
+
+          for i in $(seq 1 15); do
+            if nc -z 127.0.0.1 19101 2>/dev/null; then
+              echo "Tai K8s gRPC ready"; break
+            fi
+            echo "Waiting for Tai K8s gRPC... ($i)"; sleep 1
+          done
+          nc -z 127.0.0.1 19101 2>/dev/null || {
+            echo "::error::Tai K8s gRPC failed"; docker logs tai-k8s 2>&1; exit 1
+          }
+
+      - name: Run Sandbox V2 CI Tests (tai + workspace)
+        env:
+          TAI_TEST_HOST: "127.0.0.1"
+          TAI_TEST_DOCKER: "tcp://127.0.0.1:12375"
+          TAI_TEST_GRPC_PORT: "19100"
+          TAI_TEST_HTTP_PORT: "8099"
+          TAI_TEST_VNC_PORT: "16080"
+          TAI_TEST_DOCKER_PORT: "12375"
+          TAI_TEST_K8S_HOST: "127.0.0.1"
+          TAI_TEST_K8S_PORT: "6443"
+          TAI_TEST_K8S_GRPC_PORT: "19101"
+          TAI_TEST_KUBECONFIG: "${{ runner.temp }}/kubeconfig-tai.yml"
+          TAI_TEST_HOST_IP: "172.17.0.1"
+          SANDBOX_TEST_REMOTE_ADDR: "tai://127.0.0.1:19100"
+          SANDBOX_TEST_IMAGE: "yaoapp/tai-sandbox-test:latest"
+        run: make unit-test-sandbox-v2
+
+      - name: Codecov Report
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   # =============================================================================
   # Benchmark & Memory Leak Tests - Run with MySQL8.0 and SQLite3
@@ -770,9 +990,18 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: 6
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
+
+      - name: Install FFmpeg 7.x
+        run: |
+          wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ffmpeg-master-latest-linux64-gpl.tar.xz
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+
+      - name: Test FFmpeg
+        run: ffmpeg -version
 
       - name: Setup Go Tools
         run: make tools
@@ -943,17 +1172,24 @@ jobs:
           convert -version
 
       - name: Start Redis
-        uses: supercharge/redis-github-action@1.4.0
-        with:
-          redis-version: ${{ matrix.redis }}
+        run: docker run --name redis --publish 6379:6379 --detach redis:${{ matrix.redis }}
 
       - name: Start MongoDB
-        uses: supercharge/mongodb-github-action@1.8.0
-        with:
-          mongodb-version: ${{ matrix.mongo }}
-          mongodb-username: root
-          mongodb-password: 123456
-          mongodb-db: test
+        run: |
+          docker run --name mongodb --publish 27017:27017 \
+            -e MONGO_INITDB_DATABASE=test \
+            -e MONGO_INITDB_ROOT_USERNAME=root \
+            -e MONGO_INITDB_ROOT_PASSWORD=123456 \
+            --detach mongo:${{ matrix.mongo }}
+          # Wait for MongoDB to be ready
+          for i in $(seq 1 20); do
+            if docker exec mongodb mongosh --quiet --port 27017 --username root --password 123456 --eval "db.serverStatus()" > /dev/null 2>&1; then
+              echo "MongoDB is ready"
+              break
+            fi
+            echo "Waiting for MongoDB... ($i)"
+            sleep 1
+          done
 
       - name: Setup MySQL8.0 (connector)
         uses: ./.github/actions/setup-db
@@ -1016,3 +1252,212 @@ jobs:
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }} # not required for public repos
+
+  # =============================================================================
+  # Registry Client SDK Tests (requires Yao Registry Docker service)
+  # =============================================================================
+  registry-test:
+    runs-on: ubuntu-latest
+    services:
+      yao-registry:
+        image: yaoapp/registry:latest
+        ports:
+          - "8080:8080"
+        env:
+          REGISTRY_INIT_USER: yaoagents
+          REGISTRY_INIT_PASS: yaoagents
+    strategy:
+      matrix:
+        go: ["1.25"]
+    steps:
+      - name: Wait for Registry
+        run: |
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:8080/.well-known/yao-registry > /dev/null 2>&1; then
+              echo "Registry is ready"
+              break
+            fi
+            echo "Waiting for registry... ($i)"
+            sleep 1
+          done
+
+      - name: Checkout Kun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_KUN }}
+          path: kun
+
+      - name: Checkout Xun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_XUN }}
+          path: xun
+
+      - name: Checkout Gou
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_GOU }}
+          path: gou
+
+      - name: Checkout V8Go
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/v8go
+          path: v8go
+
+      - name: Unzip libv8
+        run: |
+          files=$(find ./v8go -name "libv8*.zip")
+          for file in $files; do
+            dir=$(dirname "$file")
+            echo "Extracting $file to directory $dir"
+            unzip -o -d $dir $file
+            rm -rf $dir/__MACOSX
+          done
+
+      - name: Checkout Demo App
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-dev-app
+          path: app
+
+      - name: Checkout Extension
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-extensions-dev
+          path: extension
+
+      - name: Move Dependencies
+        run: |
+          mv kun ../
+          mv xun ../
+          mv gou ../
+          mv v8go ../
+          mv app ../
+          mv extension ../
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Run Registry Client Tests
+        env:
+          YAO_REGISTRY_URL: http://localhost:8080
+          YAO_TEST_APPLICATION: ${{ github.workspace }}/../app
+        run: make unit-test-registry
+
+      - name: Codecov Report
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # =============================================================================
+  # gRPC Tests - Run once with SQLite (transport layer, no DB matrix needed)
+  # =============================================================================
+  grpc-test:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        env:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: 123456
+          MONGO_INITDB_DATABASE: test
+
+    strategy:
+      matrix:
+        go: ["1.25"]
+    steps:
+      - name: Checkout Kun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_KUN }}
+          path: kun
+
+      - name: Checkout Xun
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_XUN }}
+          path: xun
+
+      - name: Checkout Gou
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO_GOU }}
+          path: gou
+
+      - name: Checkout V8Go
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/v8go
+          path: v8go
+
+      - name: Unzip libv8
+        run: |
+          files=$(find ./v8go -name "libv8*.zip")
+          for file in $files; do
+            dir=$(dirname "$file")
+            echo "Extracting $file to directory $dir"
+            unzip -o -d $dir $file
+            rm -rf $dir/__MACOSX
+          done
+
+      - name: Checkout Demo App
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-dev-app
+          path: app
+
+      - name: Checkout Extension
+        uses: actions/checkout@v4
+        with:
+          repository: yaoapp/yao-extensions-dev
+          path: extension
+
+      - name: Move Dependencies
+        run: |
+          mv kun ../
+          mv xun ../
+          mv gou ../
+          mv v8go ../
+          mv app ../
+          mv extension ../
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Apple Private Key
+        run: |
+          mkdir -p ../app/openapi/certs/apple
+          echo "${{ secrets.APPLE_PRIVATE_KEY_USER }}" > ../app/openapi/certs/apple/signin_client_secret_key.p8
+
+      - name: Setup Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Start Redis
+        run: docker run --name redis --publish 6379:6379 --detach redis:6
+
+      - name: Setup Go Tools
+        run: make tools
+
+      - name: Setup ENV (SQLite)
+        run: |
+          mkdir -p ${{ github.WORKSPACE }}/../app/db
+          echo "YAO_DB_DRIVER=sqlite3" >> $GITHUB_ENV
+          echo "YAO_DB_PRIMARY=${{ github.WORKSPACE }}/../app/db/yao.db" >> $GITHUB_ENV
+
+      - name: Run gRPC Tests
+        run: make unit-test-grpc
+
+      - name: Codecov Report
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

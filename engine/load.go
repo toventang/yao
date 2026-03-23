@@ -1,15 +1,20 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/yaoapp/gou/application"
+	"github.com/yaoapp/gou/ffmpeg"
+	"github.com/yaoapp/gou/pdf"
 	"github.com/yaoapp/gou/process"
 	"github.com/yaoapp/kun/exception"
 	"github.com/yaoapp/yao/agent"
@@ -21,30 +26,33 @@ import (
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/connector"
 	"github.com/yaoapp/yao/data"
+	"github.com/yaoapp/yao/event"
 	"github.com/yaoapp/yao/flow"
 	"github.com/yaoapp/yao/fs"
 	"github.com/yaoapp/yao/i18n"
 	"github.com/yaoapp/yao/kb"
 	"github.com/yaoapp/yao/mcp"
 	"github.com/yaoapp/yao/messenger"
-	"github.com/yaoapp/yao/moapi"
 	"github.com/yaoapp/yao/model"
+	"github.com/yaoapp/yao/monitor"
 	"github.com/yaoapp/yao/openapi"
 	"github.com/yaoapp/yao/pack"
 	"github.com/yaoapp/yao/pipe"
 	"github.com/yaoapp/yao/plugin"
 	"github.com/yaoapp/yao/query"
 	"github.com/yaoapp/yao/runtime"
+	sandbox "github.com/yaoapp/yao/sandbox/v2"
 	"github.com/yaoapp/yao/schedule"
 	"github.com/yaoapp/yao/script"
 	"github.com/yaoapp/yao/share"
-	"github.com/yaoapp/yao/socket"
 	"github.com/yaoapp/yao/store"
 	sui "github.com/yaoapp/yao/sui/api"
+	"github.com/yaoapp/yao/tai"
 	"github.com/yaoapp/yao/task"
-	"github.com/yaoapp/yao/websocket"
 	"github.com/yaoapp/yao/widget"
 	"github.com/yaoapp/yao/widgets"
+
+	_ "github.com/yaoapp/yao/trace" // register trace handler/listener via init()
 )
 
 // LoadHooks used to load custom widgets/processes
@@ -123,6 +131,24 @@ func Load(cfg config.Config, options LoadOption, progressCallback ...func(string
 		warnings = append(warnings, Warning{Widget: "DB", Error: err})
 	}
 
+	// Initialize the Tai registry, register local host node, then start the
+	// Sandbox manager (container recovery + cleanup loop).
+	err = loadStep("Registry", func() error {
+		dataDir := filepath.Join(cfg.DataRoot, "workspaces")
+		caps := tai.InitLocal(config.LogOutput, cfg.LogMode, dataDir)
+		if !caps.Docker {
+			log.Println("[Registry] Docker not available")
+		}
+		if caps.HostExec {
+			log.Println("[Registry] Host execution enabled (YAO_HOST_EXEC=true)")
+		}
+		sandbox.Init()
+		return sandbox.M().Start(context.Background())
+	}, callback)
+	if err != nil {
+		warnings = append(warnings, Warning{Widget: "Registry", Error: err})
+	}
+
 	// Load Certs
 	err = loadStep("Cert", func() error {
 		return cert.Load(cfg)
@@ -138,6 +164,12 @@ func Load(cfg config.Config, options LoadOption, progressCallback ...func(string
 	if err != nil {
 		warnings = append(warnings, Warning{Widget: "Connector", Error: err})
 	}
+
+	// Inspect external tools (silent, non-fatal)
+	loadStep("ExtTools", func() error {
+		InspectExtTools()
+		return nil
+	}, callback)
 
 	// Load FileSystem
 	err = loadStep("FileSystem", func() error {
@@ -203,6 +235,22 @@ func Load(cfg config.Config, options LoadOption, progressCallback ...func(string
 		warnings = append(warnings, Warning{Widget: "Store", Error: err})
 	}
 
+	// Start Event Service (handlers registered via init(), e.g. trace)
+	err = loadStep("Event", func() error {
+		return event.Start()
+	}, callback)
+	if err != nil {
+		warnings = append(warnings, Warning{Widget: "Event", Error: err})
+	}
+
+	// Start Monitor Service (watchers registered via init())
+	err = loadStep("Monitor", func() error {
+		return monitor.Start(context.Background())
+	}, callback)
+	if err != nil {
+		warnings = append(warnings, Warning{Widget: "Monitor", Error: err})
+	}
+
 	// Load Uploaders
 	err = loadStep("Uploader", func() error {
 		return attachment.Load(cfg)
@@ -252,22 +300,6 @@ func Load(cfg config.Config, options LoadOption, progressCallback ...func(string
 		warnings = append(warnings, Warning{Widget: "API", Error: err})
 	}
 
-	// Load Sockets
-	err = loadStep("Socket", func() error {
-		return socket.Load(cfg)
-	}, callback)
-	if err != nil {
-		warnings = append(warnings, Warning{Widget: "Socket", Error: err})
-	}
-
-	// Load websockets (client mode)
-	err = loadStep("WebSocket", func() error {
-		return websocket.Load(cfg)
-	}, callback)
-	if err != nil {
-		warnings = append(warnings, Warning{Widget: "WebSocket", Error: err})
-	}
-
 	// Load tasks
 	err = loadStep("Task", func() error {
 		return task.Load(cfg)
@@ -314,14 +346,6 @@ func Load(cfg config.Config, options LoadOption, progressCallback ...func(string
 	}, callback)
 	if err != nil {
 		warnings = append(warnings, Warning{Widget: "SUI", Error: err})
-	}
-
-	// Load Moapi
-	err = loadStep("Moapi", func() error {
-		return moapi.Load(cfg)
-	}, callback)
-	if err != nil {
-		warnings = append(warnings, Warning{Widget: "Moapi", Error: err})
 	}
 
 	// Load Pipe
@@ -416,6 +440,12 @@ func Unload() (err error) {
 		}
 	}
 
+	// Stop Monitor Service (before event, so watchers can still push events)
+	monitor.Stop()
+
+	// Stop Event Service (before runtime, so in-flight handlers can still use V8)
+	event.Stop(context.Background())
+
 	// Stop Runtime
 	err = runtime.Stop()
 
@@ -442,8 +472,6 @@ func Unload() (err error) {
 	// importers
 	// tasks
 	// schedules
-	// sockets
-	// websockets
 	// widgets
 	// custom widget
 
@@ -549,18 +577,6 @@ func Reload(cfg config.Config, options LoadOption) (err error) {
 	err = api.Load(cfg) // 加载业务接口 API
 	if err != nil {
 		printErr(cfg.Mode, "API", err)
-	}
-
-	// Load Sockets
-	err = socket.Load(cfg) // Load sockets
-	if err != nil {
-		printErr(cfg.Mode, "Socket", err)
-	}
-
-	// Load websockets (client mode)
-	err = websocket.Load(cfg)
-	if err != nil {
-		printErr(cfg.Mode, "WebSocket", err)
 	}
 
 	// Load tasks
@@ -753,6 +769,146 @@ func loadApp(root string) error {
 	}
 
 	return nil
+}
+
+// InspectExtTools performs silent detection of external tools (ffmpeg, pdf converters, docker)
+// and stores the results in share.Tools for later access via Inspect / settings API.
+// Exported so it can be called from both engine.Load() and cmd/inspect.go.
+func InspectExtTools() {
+	tools := &share.ExtTools{}
+
+	// Inspect ffmpeg/ffprobe
+	ffmpegStatus := ffmpeg.Inspect()
+	if s, ok := ffmpegStatus["ffmpeg"]; ok {
+		tools.FFmpeg = &share.ExtToolInfo{
+			Name:      s.Name,
+			Available: s.Available,
+			Path:      s.Path,
+			Version:   s.Version,
+			EnvVar:    s.EnvVar,
+			Error:     s.Error,
+		}
+	}
+	if s, ok := ffmpegStatus["ffprobe"]; ok {
+		tools.FFprobe = &share.ExtToolInfo{
+			Name:      s.Name,
+			Available: s.Available,
+			Path:      s.Path,
+			Version:   s.Version,
+			EnvVar:    s.EnvVar,
+			Error:     s.Error,
+		}
+	}
+
+	// Inspect PDF tools
+	pdfStatus := pdf.Inspect()
+	if s, ok := pdfStatus["pdftoppm"]; ok {
+		tools.Pdftoppm = &share.ExtToolInfo{
+			Name:      s.Name,
+			Available: s.Available,
+			Path:      s.Path,
+			Version:   s.Version,
+			EnvVar:    s.EnvVar,
+			Error:     s.Error,
+		}
+	}
+	if s, ok := pdfStatus["mutool"]; ok {
+		tools.Mutool = &share.ExtToolInfo{
+			Name:      s.Name,
+			Available: s.Available,
+			Path:      s.Path,
+			Version:   s.Version,
+			EnvVar:    s.EnvVar,
+			Error:     s.Error,
+		}
+	}
+	if s, ok := pdfStatus["imagemagick"]; ok {
+		tools.ImageMagick = &share.ExtToolInfo{
+			Name:      s.Name,
+			Available: s.Available,
+			Path:      s.Path,
+			Version:   s.Version,
+			EnvVar:    s.EnvVar,
+			Error:     s.Error,
+		}
+	}
+
+	// Inspect Docker
+	tools.Docker = inspectDocker()
+
+	share.Tools = tools
+}
+
+// inspectDocker silently detects Docker availability, version, and host configuration.
+// Returns real runtime info: what Docker is actually connected to, not just env vars.
+func inspectDocker() *share.DockerInfo {
+	sandboxHost := os.Getenv("YAO_SANDBOX_HOST")
+	sandboxMode := os.Getenv("YAO_SANDBOX_MODE")
+
+	info := &share.DockerInfo{}
+
+	// Try to find docker CLI path
+	dockerPath, err := exec.LookPath("docker")
+	if err != nil {
+		info.Available = false
+		info.Error = "docker not found in PATH"
+		return info
+	}
+	info.Path = dockerPath
+
+	// Get real Docker context info: actual daemon address from docker info
+	cmd := exec.Command(dockerPath, "info", "--format", "{{.ClientInfo.Context}}")
+	ctxOutput, _ := cmd.Output()
+	dockerContext := strings.TrimSpace(string(ctxOutput))
+
+	// Get the actual daemon host from docker context inspect
+	var actualHost string
+	if dockerContext != "" {
+		cmd = exec.Command(dockerPath, "context", "inspect", dockerContext, "--format", "{{.Endpoints.docker.Host}}")
+		hostOutput, err := cmd.Output()
+		if err == nil {
+			actualHost = strings.TrimSpace(string(hostOutput))
+		}
+	}
+	// Fallback: DOCKER_HOST env or let docker figure it out
+	if actualHost == "" {
+		actualHost = os.Getenv("DOCKER_HOST")
+	}
+	info.Host = actualHost
+
+	// Get docker server version (also verifies daemon is reachable)
+	cmd = exec.Command(dockerPath, "version", "--format", "{{.Server.Version}}")
+	output, err := cmd.Output()
+	if err != nil {
+		info.Available = false
+		if actualHost != "" {
+			info.Error = fmt.Sprintf("docker daemon not reachable at %s", actualHost)
+		} else {
+			info.Error = "docker daemon not reachable"
+		}
+		return info
+	}
+	info.Available = true
+	info.Version = strings.TrimSpace(string(output))
+
+	// Determine sandbox mode from real host
+	if sandboxMode != "" {
+		info.Mode = sandboxMode
+	} else if actualHost == "" || strings.HasPrefix(actualHost, "unix://") || strings.HasPrefix(actualHost, "ssh://") || strings.HasPrefix(actualHost, "npipe://") {
+		info.Mode = "local"
+	} else if strings.HasPrefix(actualHost, "tcp://") {
+		info.Mode = "remote"
+	} else {
+		info.Mode = "local"
+	}
+
+	// Yao sandbox env vars
+	info.EnvVars = map[string]string{
+		"YAO_SANDBOX_HOST": sandboxHost,
+		"YAO_SANDBOX_MODE": sandboxMode,
+	}
+
+	return info
 }
 
 func printErr(mode, widget string, err error) {

@@ -5,12 +5,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yaoapp/gou/connector/openai"
+	"github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/gou/store"
 	"github.com/yaoapp/yao/agent/memory"
 	"github.com/yaoapp/yao/agent/output"
 	"github.com/yaoapp/yao/agent/output/message"
 	"github.com/yaoapp/yao/openapi/oauth/types"
+	infraV2 "github.com/yaoapp/yao/sandbox/v2"
+	"github.com/yaoapp/yao/tai/workspace"
 	traceTypes "github.com/yaoapp/yao/trace/types"
 )
 
@@ -251,9 +253,11 @@ type Context struct {
 	trace           traceTypes.Manager    `json:"-"` // Trace manager, lazy initialized on first access
 	messageMetadata *messageMetadataStore `json:"-"` // Thread-safe message metadata store for delta operations
 	sandboxExecutor SandboxExecutor       `json:"-"` // Sandbox executor for hooks (set by assistant when sandbox is configured)
+	computer        infraV2.Computer      `json:"-"` // V2 sandbox computer (set by assistant when V2 sandbox is configured)
+	workspace       workspace.FS          `json:"-"` // V2 workspace FS (derived from computer.Workplace())
 
 	// Model capabilities (set by assistant, used by output adapters)
-	Capabilities *openai.Capabilities `json:"-"` // Model capabilities for the current connector
+	Capabilities *llm.Capabilities `json:"-"` // Model capabilities for the current connector
 
 	// Interrupt control (all interrupt-related logic is encapsulated in InterruptController)
 	Interrupt *InterruptController `json:"-"` // Interrupt controller for handling user interrupts during streaming
@@ -318,6 +322,11 @@ type Options struct {
 
 	// Metadata for passing custom data to hooks (e.g., scenario selection)
 	Metadata map[string]any `json:"metadata,omitempty"` // Custom metadata passed to Create/Next hooks
+
+	// HistorySize controls the max number of history messages loaded for LLM context.
+	// Priority: HistorySize > StoreSetting.MaxSize > default (20)
+	// 0 means use StoreSetting or default.
+	HistorySize int `json:"history_size,omitempty"`
 
 	// OnMessage is called for each message sent via ctx.Send()
 	// Used by ctx.agent.Call with onChunk callback to receive SSE messages

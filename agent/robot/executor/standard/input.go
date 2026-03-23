@@ -179,6 +179,10 @@ func (f *InputFormatter) FormatAvailableResourcesWithLocale(robot *robottypes.Ro
 			if description != "" {
 				sb.WriteString(fmt.Sprintf("  - %s\n", description))
 			}
+			if ast.Capabilities != "" {
+				capabilities := i18n.Translate(agentID, locale, ast.Capabilities).(string)
+				sb.WriteString(fmt.Sprintf("  - **Capabilities**: %s\n", capabilities))
+			}
 		}
 		sb.WriteString("\n")
 	}

@@ -27,6 +27,7 @@ var memberFields = []interface{}{
 	"agents",
 	"mcp_servers",
 	"manager_id",
+	"language_model",
 }
 
 // SetMemberModel sets the member model name

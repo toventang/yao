@@ -331,8 +331,9 @@ func TestAutoCompleteParentEvents(t *testing.T) {
 			defer trace.Remove(ctx, d.DriverType, traceID, d.DriverOptions...)
 
 			// Subscribe to updates
-			updates, err := manager.Subscribe()
+			updates, cancel, err := manager.Subscribe()
 			assert.NoError(t, err)
+			defer cancel()
 
 			// Collect updates in background
 			var receivedUpdates []*types.TraceUpdate

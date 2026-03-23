@@ -291,6 +291,9 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 	if description, ok := data["description"].(string); ok {
 		model.Description = description
 	}
+	if capabilities, ok := data["capabilities"].(string); ok {
+		model.Capabilities = capabilities
+	}
 	if share, ok := data["share"].(string); ok {
 		model.Share = share
 	}
@@ -421,6 +424,14 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 		}
 	}
 
+	// Sandbox
+	if sandbox, ok := data["sandbox"]; ok && sandbox != nil {
+		sb, err := ToSandbox(sandbox)
+		if err == nil {
+			model.Sandbox = sb
+		}
+	}
+
 	// Placeholder
 	if placeholder, ok := data["placeholder"]; ok && placeholder != nil {
 		raw, err := jsoniter.Marshal(placeholder)
@@ -439,6 +450,17 @@ func ToAssistantModel(v interface{}) (*AssistantModel, error) {
 			var loc i18n.Map
 			if err := jsoniter.Unmarshal(raw, &loc); err == nil {
 				model.Locales = loc
+			}
+		}
+	}
+
+	// Dependencies
+	if deps, ok := data["dependencies"]; ok && deps != nil {
+		raw, err := jsoniter.Marshal(deps)
+		if err == nil {
+			var d map[string]string
+			if err := jsoniter.Unmarshal(raw, &d); err == nil {
+				model.Dependencies = d
 			}
 		}
 	}

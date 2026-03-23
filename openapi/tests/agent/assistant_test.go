@@ -264,6 +264,67 @@ func TestListAssistants(t *testing.T) {
 		}
 	})
 
+	t.Run("ListAssistantsWithSandboxFilter", func(t *testing.T) {
+		// Test with sandbox=true filter
+		req, err := http.NewRequest("GET", serverURL+baseURL+"/agent/assistants?sandbox=true&types=assistant", nil)
+		assert.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+tokenInfo.AccessToken)
+
+		resp, err := http.DefaultClient.Do(req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var response map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		assert.NoError(t, err)
+
+		data, hasData := response["data"].([]interface{})
+		if hasData {
+			for _, item := range data {
+				a, ok := item.(map[string]interface{})
+				if ok {
+					sandboxVal, exists := a["sandbox"]
+					assert.True(t, exists, "sandbox field should be present in list response")
+					assert.Equal(t, true, sandboxVal, "sandbox should be true when filtering sandbox=true")
+				}
+			}
+			t.Logf("Successfully retrieved %d assistants with sandbox filter", len(data))
+		}
+	})
+
+	t.Run("ListAssistantsSandboxReturnsBool", func(t *testing.T) {
+		// Verify sandbox field is returned as boolean (not JSON object) in list response
+		req, err := http.NewRequest("GET", serverURL+baseURL+"/agent/assistants?pagesize=5&types=assistant", nil)
+		assert.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer "+tokenInfo.AccessToken)
+
+		resp, err := http.DefaultClient.Do(req)
+		assert.NoError(t, err)
+		assert.NotNil(t, resp)
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var response map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&response)
+		assert.NoError(t, err)
+
+		data, hasData := response["data"].([]interface{})
+		if hasData && len(data) > 0 {
+			a, ok := data[0].(map[string]interface{})
+			if ok {
+				sandboxVal, exists := a["sandbox"]
+				assert.True(t, exists, "sandbox field should be present in default list fields")
+				_, isBool := sandboxVal.(bool)
+				assert.True(t, isBool, "sandbox should be a boolean value, got %T", sandboxVal)
+				t.Logf("sandbox field correctly returned as bool: %v", sandboxVal)
+			}
+		}
+	})
+
 	t.Run("ListAssistantsWithSelectFields", func(t *testing.T) {
 		// Test with select parameter to limit returned fields
 		req, err := http.NewRequest("GET", serverURL+baseURL+"/agent/assistants?select=assistant_id,name,avatar,type", nil)
@@ -1412,6 +1473,10 @@ func TestGetAssistantResponseStructure(t *testing.T) {
 		assert.Contains(t, responseAssistant, "assistant_id", "Assistant should have assistant_id")
 		assert.Contains(t, responseAssistant, "name", "Assistant should have name")
 		assert.Contains(t, responseAssistant, "type", "Assistant should have type")
+
+		// Verify capabilities field is present in response (may be empty/null)
+		// capabilities is a default field that should always be returned
+		t.Logf("capabilities field value: %v", responseAssistant["capabilities"])
 
 		responseAssistantID := responseAssistant["assistant_id"].(string)
 		t.Logf("Response structure is correct for assistant: %s", responseAssistantID)

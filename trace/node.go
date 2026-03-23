@@ -1,6 +1,7 @@
 package trace
 
 import (
+	"context"
 	"time"
 
 	"github.com/yaoapp/yao/trace/types"
@@ -60,7 +61,7 @@ func (n *node) log(level string, message string, args ...any) *types.TraceLog {
 		NodeID:    n.data.ID,
 	}
 	// Save log (ignore errors for non-critical logging)
-	_ = n.manager.driver.SaveLog(n.manager.ctx, n.manager.traceID, log)
+	_ = n.manager.driver.SaveLog(context.Background(), n.manager.traceID, log)
 	return log
 }
 
@@ -85,10 +86,10 @@ func (n *node) Add(input types.TraceInput, option types.TraceNodeOption) (types.
 	n.data.Children = append(n.data.Children, childNodeData)
 
 	// Save both nodes
-	if err := n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, childNodeData); err != nil {
+	if err := n.manager.driver.SaveNode(context.Background(), n.manager.traceID, childNodeData); err != nil {
 		return nil, err
 	}
-	if err := n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data); err != nil {
+	if err := n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data); err != nil {
 		return nil, err
 	}
 
@@ -120,7 +121,7 @@ func (n *node) Parallel(parallelInputs []types.TraceParallelInput) ([]types.Node
 		n.data.Children = append(n.data.Children, childNodeData)
 
 		// Save node
-		if err := n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, childNodeData); err != nil {
+		if err := n.manager.driver.SaveNode(context.Background(), n.manager.traceID, childNodeData); err != nil {
 			return nil, err
 		}
 
@@ -132,7 +133,7 @@ func (n *node) Parallel(parallelInputs []types.TraceParallelInput) ([]types.Node
 	}
 
 	// Save parent node
-	if err := n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data); err != nil {
+	if err := n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data); err != nil {
 		return nil, err
 	}
 
@@ -165,7 +166,7 @@ func (n *node) Join(nodes []*types.TraceNode, input types.TraceInput, option typ
 	}
 
 	// Save join node
-	if err := n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, joinNodeData); err != nil {
+	if err := n.manager.driver.SaveNode(context.Background(), n.manager.traceID, joinNodeData); err != nil {
 		return nil, err
 	}
 
@@ -185,7 +186,7 @@ func (n *node) ID() string {
 func (n *node) SetOutput(output types.TraceOutput) error {
 	n.data.Output = output
 	n.data.UpdatedAt = time.Now().UnixMilli()
-	return n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data)
+	return n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data)
 }
 
 // SetMetadata sets node metadata
@@ -195,14 +196,14 @@ func (n *node) SetMetadata(key string, value any) error {
 	}
 	n.data.Metadata[key] = value
 	n.data.UpdatedAt = time.Now().UnixMilli()
-	return n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data)
+	return n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data)
 }
 
 // SetStatus sets the node status
 func (n *node) SetStatus(status string) error {
 	n.data.Status = types.NodeStatus(status)
 	n.data.UpdatedAt = time.Now().UnixMilli()
-	return n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data)
+	return n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data)
 }
 
 // Complete marks the node as completed (public method, broadcasts event)
@@ -236,7 +237,7 @@ func (n *node) complete(output ...types.TraceOutput) error {
 	n.data.Status = types.StatusCompleted
 	n.data.EndTime = now
 	n.data.UpdatedAt = now
-	return n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data)
+	return n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data)
 }
 
 // Fail marks the node as failed (public method, broadcasts event)
@@ -269,5 +270,5 @@ func (n *node) fail(err error) error {
 	n.data.EndTime = now
 	n.data.UpdatedAt = now
 
-	return n.manager.driver.SaveNode(n.manager.ctx, n.manager.traceID, n.data)
+	return n.manager.driver.SaveNode(context.Background(), n.manager.traceID, n.data)
 }

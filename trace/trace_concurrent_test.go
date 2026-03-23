@@ -179,6 +179,7 @@ func TestConcurrentSubscribers(t *testing.T) {
 			var wg sync.WaitGroup
 			numSubscribers := 5
 			subscribers := make([]<-chan *types.TraceUpdate, numSubscribers)
+			cancels := make([]func(), numSubscribers)
 			var mu sync.Mutex
 
 			for i := 0; i < numSubscribers; i++ {
@@ -186,14 +187,22 @@ func TestConcurrentSubscribers(t *testing.T) {
 				go func(idx int) {
 					defer wg.Done()
 
-					sub, err := manager.Subscribe()
+					sub, cancelSub, err := manager.Subscribe()
 					assert.NoError(t, err)
 
 					mu.Lock()
 					subscribers[idx] = sub
+					cancels[idx] = cancelSub
 					mu.Unlock()
 				}(i)
 			}
+			defer func() {
+				for _, c := range cancels {
+					if c != nil {
+						c()
+					}
+				}
+			}()
 			wg.Wait()
 
 			// Verify all subscriptions were created

@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+
 	"github.com/gin-gonic/gin"
 	"github.com/yaoapp/gou/model"
 	"github.com/yaoapp/xun/dbal/query"
@@ -150,9 +152,49 @@ func FilterBuiltInAssistant(assistant *agenttypes.AssistantModel) {
 		assistant.Prompts = nil
 		assistant.PromptPresets = nil
 		assistant.Workflow = nil
+		assistant.Sandbox = nil
 		assistant.KB = nil
 		assistant.MCP = nil
 		assistant.Options = nil
 		assistant.Source = ""
 	}
+}
+
+// AssistantToResponse converts an AssistantModel to a response map,
+// replacing the sandbox JSON object with a boolean indicating whether sandbox is configured.
+// hasSandbox must be captured before FilterBuiltInAssistant clears the Sandbox field.
+func AssistantToResponse(assistant *agenttypes.AssistantModel, hasSandbox bool) map[string]interface{} {
+	if assistant == nil {
+		return nil
+	}
+
+	raw, err := json.Marshal(assistant)
+	if err != nil {
+		return nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil
+	}
+
+	result["sandbox"] = hasSandbox
+	return result
+}
+
+// AssistantsToResponse converts a slice of AssistantModel to response maps,
+// replacing sandbox with a boolean for each assistant.
+// Captures sandbox state before filtering, then applies FilterBuiltInAssistant.
+func AssistantsToResponse(assistants []*agenttypes.AssistantModel) []map[string]interface{} {
+	if assistants == nil {
+		return nil
+	}
+
+	result := make([]map[string]interface{}, 0, len(assistants))
+	for _, a := range assistants {
+		hasSandbox := a.Sandbox != nil
+		FilterBuiltInAssistant(a)
+		result = append(result, AssistantToResponse(a, hasSandbox))
+	}
+	return result
 }

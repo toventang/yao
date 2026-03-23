@@ -202,16 +202,15 @@ func TestRunExecutionTaskStatus(t *testing.T) {
 		assert.NotNil(t, exec.Tasks[0].EndTime)
 	})
 
-	t.Run("marks remaining tasks as skipped on failure", func(t *testing.T) {
+	t.Run("marks remaining tasks as skipped on failure with ContinueOnFailure=false", func(t *testing.T) {
 		robot := createRunTestRobot(t)
 		exec := createRunTestExecution(robot)
 
-		// First task uses a non-existent assistant to guarantee failure
 		exec.Tasks = []types.Task{
 			{
 				ID:           "task-001",
 				ExecutorType: types.ExecutorAssistant,
-				ExecutorID:   "non.existent.assistant.xyz123", // Non-existent assistant
+				ExecutorID:   "non.existent.assistant.xyz123",
 				Messages: []agentcontext.Message{
 					{Role: agentcontext.RoleUser, Content: "This will fail"},
 				},
@@ -240,19 +239,55 @@ func TestRunExecutionTaskStatus(t *testing.T) {
 			},
 		}
 
+		config := &standard.RunConfig{ContinueOnFailure: false}
 		e := standard.New()
-		err := e.RunExecution(ctx, exec, nil)
+		err := e.RunExecution(ctx, exec, config)
 
-		// Should return error because first task failed
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task-001")
 
-		// First task should be failed
 		assert.Equal(t, types.TaskFailed, exec.Tasks[0].Status)
-
-		// Remaining tasks should be skipped
 		assert.Equal(t, types.TaskSkipped, exec.Tasks[1].Status)
 		assert.Equal(t, types.TaskSkipped, exec.Tasks[2].Status)
+	})
+
+	t.Run("continues on failure with default V2 config", func(t *testing.T) {
+		robot := createRunTestRobot(t)
+		exec := createRunTestExecution(robot)
+
+		exec.Tasks = []types.Task{
+			{
+				ID:           "task-001",
+				ExecutorType: types.ExecutorAssistant,
+				ExecutorID:   "non.existent.assistant.xyz123",
+				Messages: []agentcontext.Message{
+					{Role: agentcontext.RoleUser, Content: "This will fail"},
+				},
+				Order:  0,
+				Status: types.TaskPending,
+			},
+			{
+				ID:           "task-002",
+				ExecutorType: types.ExecutorAssistant,
+				ExecutorID:   "experts.text-writer",
+				Messages: []agentcontext.Message{
+					{Role: agentcontext.RoleUser, Content: "Say hello"},
+				},
+				Order:  1,
+				Status: types.TaskPending,
+			},
+		}
+
+		e := standard.New()
+		err := e.RunExecution(ctx, exec, nil)
+
+		require.NoError(t, err, "V2 default ContinueOnFailure=true should not return error")
+
+		assert.Equal(t, types.TaskFailed, exec.Tasks[0].Status)
+		assert.Equal(t, types.TaskCompleted, exec.Tasks[1].Status)
+		assert.Len(t, exec.Results, 2)
+		assert.False(t, exec.Results[0].Success)
+		assert.True(t, exec.Results[1].Success)
 	})
 }
 
@@ -295,7 +330,7 @@ func TestRunExecutionErrorHandling(t *testing.T) {
 		assert.Contains(t, err.Error(), "no tasks")
 	})
 
-	t.Run("returns error for non-existent assistant", func(t *testing.T) {
+	t.Run("records failure for non-existent assistant", func(t *testing.T) {
 		robot := createRunTestRobot(t)
 		exec := createRunTestExecution(robot)
 
@@ -315,9 +350,12 @@ func TestRunExecutionErrorHandling(t *testing.T) {
 		e := standard.New()
 		err := e.RunExecution(ctx, exec, nil)
 
-		assert.Error(t, err)
-		// Task should be marked as failed
+		// V2 default ContinueOnFailure=true, so no error is returned
+		assert.NoError(t, err)
 		assert.Equal(t, types.TaskFailed, exec.Tasks[0].Status)
+		assert.Len(t, exec.Results, 1)
+		assert.False(t, exec.Results[0].Success)
+		assert.NotEmpty(t, exec.Results[0].Error)
 	})
 }
 
@@ -335,7 +373,6 @@ func TestRunExecutionContinueOnFailure(t *testing.T) {
 		robot := createRunTestRobot(t)
 		exec := createRunTestExecution(robot)
 
-		// First task will fail (non-existent assistant), second should be skipped
 		exec.Tasks = []types.Task{
 			{
 				ID:           "task-001",
@@ -359,24 +396,15 @@ func TestRunExecutionContinueOnFailure(t *testing.T) {
 			},
 		}
 
-		// Use default config (ContinueOnFailure = false)
-		config := standard.DefaultRunConfig()
-		assert.False(t, config.ContinueOnFailure)
+		config := &standard.RunConfig{ContinueOnFailure: false}
 
 		e := standard.New()
 		err := e.RunExecution(ctx, exec, config)
 
-		// Should return error
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task-001")
-
-		// Only first task should have a result
 		assert.Len(t, exec.Results, 1)
-
-		// First task failed
 		assert.Equal(t, types.TaskFailed, exec.Tasks[0].Status)
-
-		// Second task should be skipped (not executed)
 		assert.Equal(t, types.TaskSkipped, exec.Tasks[1].Status)
 	})
 
@@ -420,12 +448,9 @@ func TestRunExecutionContinueOnFailure(t *testing.T) {
 			},
 		}
 
-		// Enable ContinueOnFailure
-		config := standard.DefaultRunConfig()
-		config.ContinueOnFailure = true
-
+		// V2 default ContinueOnFailure=true
 		e := standard.New()
-		err := e.RunExecution(ctx, exec, config)
+		err := e.RunExecution(ctx, exec, nil)
 
 		// Should NOT return error when ContinueOnFailure is true
 		assert.NoError(t, err)
@@ -497,11 +522,9 @@ func TestRunExecutionContinueOnFailure(t *testing.T) {
 			},
 		}
 
-		config := standard.DefaultRunConfig()
-		config.ContinueOnFailure = true
-
+		// V2 default ContinueOnFailure=true
 		e := standard.New()
-		err := e.RunExecution(ctx, exec, config)
+		err := e.RunExecution(ctx, exec, nil)
 
 		assert.NoError(t, err)
 		assert.Len(t, exec.Results, 4)
@@ -527,7 +550,7 @@ func TestRunExecutionContinueOnFailure(t *testing.T) {
 	})
 }
 
-func TestRunExecutionValidation(t *testing.T) {
+func TestRunExecutionNoValidation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test")
 	}
@@ -537,7 +560,7 @@ func TestRunExecutionValidation(t *testing.T) {
 
 	ctx := types.NewContext(context.Background(), testAuth())
 
-	t.Run("validates output with rule-based validation", func(t *testing.T) {
+	t.Run("V2 runner does not set Validation on results", func(t *testing.T) {
 		robot := createRunTestRobot(t)
 		exec := createRunTestExecution(robot)
 
@@ -550,40 +573,6 @@ func TestRunExecutionValidation(t *testing.T) {
 					{Role: agentcontext.RoleUser, Content: "Return a JSON object with fields: name (string), count (number). Example: {\"name\": \"test\", \"count\": 5}"},
 				},
 				ExpectedOutput: "JSON object with name and count fields",
-				ValidationRules: []string{
-					"output must be valid JSON",
-					`{"type": "type", "value": "object"}`,
-				},
-				Order:  0,
-				Status: types.TaskPending,
-			},
-		}
-
-		e := standard.New()
-		err := e.RunExecution(ctx, exec, nil)
-
-		require.NoError(t, err)
-		require.Len(t, exec.Results, 1)
-
-		result := exec.Results[0]
-		assert.True(t, result.Success)
-		assert.NotNil(t, result.Validation)
-		assert.True(t, result.Validation.Passed)
-	})
-
-	t.Run("validates output with semantic validation", func(t *testing.T) {
-		robot := createRunTestRobot(t)
-		exec := createRunTestExecution(robot)
-
-		exec.Tasks = []types.Task{
-			{
-				ID:           "task-001",
-				ExecutorType: types.ExecutorAssistant,
-				ExecutorID:   "experts.text-writer",
-				Messages: []agentcontext.Message{
-					{Role: agentcontext.RoleUser, Content: "Write a professional email greeting for a business context. Start with 'Dear' and end with a comma."},
-				},
-				ExpectedOutput: "A professional email greeting starting with 'Dear'",
 				Order:          0,
 				Status:         types.TaskPending,
 			},
@@ -596,11 +585,11 @@ func TestRunExecutionValidation(t *testing.T) {
 		require.Len(t, exec.Results, 1)
 
 		result := exec.Results[0]
-		assert.True(t, result.Success)
-		assert.NotNil(t, result.Validation)
+		assert.True(t, result.Success, "task should succeed if assistant call returns")
+		assert.NotNil(t, result.Output, "output should be present")
+		assert.Nil(t, result.Validation, "V2 runner does not run validation")
 
 		t.Logf("Output: %v", result.Output)
-		t.Logf("Validation: passed=%v, score=%.2f", result.Validation.Passed, result.Validation.Score)
 	})
 }
 

@@ -1,10 +1,11 @@
 package oauth
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,16 @@ import (
 	"github.com/yaoapp/yao/openapi/oauth/types"
 	"github.com/yaoapp/yao/openapi/response"
 )
+
+var (
+	errRefreshInProgress  = errors.New("refresh in progress")
+	errRefreshAlreadyDone = errors.New("refresh already done")
+	refreshGates          sync.Map // refreshToken → *refreshGate
+)
+
+type refreshGate struct {
+	done chan struct{} // closed when rotation completes
+}
 
 // Guard is the OAuth guard middleware
 func (s *Service) Guard(c *gin.Context) {
@@ -48,36 +59,48 @@ func (s *Service) Guard(c *gin.Context) {
 // This method only performs authentication without ACL checks
 // Returns true if authentication succeeded, false otherwise
 func (s *Service) Authenticate(c *gin.Context) bool {
-	// Get the token from the request
 	token := s.getAccessToken(c)
-
-	// Validate the token
 	if token == "" {
 		response.RespondWithError(c, http.StatusUnauthorized, types.ErrTokenMissing)
 		c.Abort()
 		return false
 	}
 
-	// Validate the token
+	// Try strict verification first (signature + expiration)
 	claims, err := s.VerifyToken(token)
 	if err != nil {
-		response.RespondWithError(c, http.StatusUnauthorized, types.ErrInvalidToken)
-		c.Abort()
-		return false
-	}
+		// Token invalid — check if it's just expired (signature still valid)
+		expiredClaims, expErr := s.VerifyTokenAllowExpired(token)
+		if expErr != nil || expiredClaims == nil {
+			response.RespondWithError(c, http.StatusUnauthorized, types.ErrInvalidToken)
+			c.Abort()
+			return false
+		}
 
-	// Auto refresh the token
-	if claims.ExpiresAt.Before(time.Now()) {
-		s.tryAutoRefreshToken(c, claims)
-		if c.IsAborted() {
+		// Signature valid but expired — attempt auto refresh
+		if !expiredClaims.ExpiresAt.IsZero() && expiredClaims.ExpiresAt.Before(time.Now()) {
+			newClaims, refreshErr := s.TryRefreshToken(c, expiredClaims)
+			if refreshErr != nil {
+				if errors.Is(refreshErr, errRefreshInProgress) || errors.Is(refreshErr, errRefreshAlreadyDone) {
+					claims = expiredClaims
+				} else {
+					log.Error("[OAuth] Token refresh failed: %v", refreshErr)
+					response.RespondWithError(c, http.StatusUnauthorized, types.ErrInvalidRefreshToken)
+					c.Abort()
+					return false
+				}
+			} else {
+				claims = newClaims
+			}
+		} else {
+			response.RespondWithError(c, http.StatusUnauthorized, types.ErrInvalidToken)
+			c.Abort()
 			return false
 		}
 	}
 
-	// Set Authorized Info in context
 	sessionID := s.getSessionID(c)
 	authorized.SetInfo(c, claims, sessionID, s.UserID)
-
 	return true
 }
 
@@ -87,29 +110,138 @@ func GetAuthorizedInfo(c *gin.Context) *types.AuthorizedInfo {
 	return authorized.GetInfo(c)
 }
 
-func (s *Service) tryAutoRefreshToken(c *gin.Context, _ *types.TokenClaims) {
+// TryRefreshToken reads the refresh token from the request, verifies it,
+// rotates the refresh token (revoke old, issue new), issues a new access token,
+// writes both cookies, and returns the new claims.
+// expiredClaims may be nil; in that case the identity is derived from the refresh token itself.
+// Returns (nil, error) on any failure — the caller decides how to respond.
+func (s *Service) TryRefreshToken(c *gin.Context, expiredClaims *types.TokenClaims) (*types.TokenClaims, error) {
 	refreshToken := s.getRefreshToken(c)
 	if refreshToken == "" {
-		response.RespondWithError(c, http.StatusUnauthorized, types.ErrRefreshTokenMissing)
-		c.Abort()
-		return
+		return nil, fmt.Errorf("refresh token missing")
 	}
 
-	// Verify the refresh token
-	_, err := s.VerifyToken(refreshToken)
+	gate := &refreshGate{done: make(chan struct{})}
+	if actual, loaded := refreshGates.LoadOrStore(refreshToken, gate); loaded {
+		// Another goroutine owns the rotation for this refresh token.
+		// It may still be running or already finished.
+		existing := actual.(*refreshGate)
+		select {
+		case <-existing.done:
+			return nil, errRefreshAlreadyDone
+		default:
+			return nil, errRefreshInProgress
+		}
+	}
+
+	// We own the gate — clean up when finished.
+	defer func() {
+		close(gate.done)
+		// Keep the gate in the map for 30 s so late arrivals see "done"
+		// instead of starting a new rotation with the now-revoked token.
+		time.AfterFunc(30*time.Second, func() {
+			refreshGates.CompareAndDelete(refreshToken, gate)
+		})
+	}()
+
+	refreshClaims, err := s.VerifyRefreshToken(refreshToken)
 	if err != nil {
-		response.RespondWithError(c, http.StatusUnauthorized, types.ErrInvalidRefreshToken)
-		c.Abort()
-		return
+		return nil, fmt.Errorf("invalid or expired refresh token: %w", err)
 	}
 
-	// @Todo: Auto refresh the token
+	// Derive access token TTL from the expired token's own iat/exp so the refreshed
+	// token keeps the same lifetime that was originally configured at login time.
+	var accessTTL time.Duration
+	if expiredClaims != nil && !expiredClaims.IssuedAt.IsZero() && !expiredClaims.ExpiresAt.IsZero() {
+		accessTTL = expiredClaims.ExpiresAt.Sub(expiredClaims.IssuedAt)
+	}
+	if accessTTL <= 0 {
+		accessTTL = s.config.Token.AccessTokenLifetime
+	}
+	if accessTTL <= 0 {
+		accessTTL = time.Hour
+	}
+
+	// Prefer the expired access token claims; fall back to refresh token claims
+	sourceClaims := expiredClaims
+	if sourceClaims == nil {
+		sourceClaims = refreshClaims
+	}
+
+	extraClaims := sourceClaims.Extra
+	if extraClaims == nil {
+		extraClaims = make(map[string]interface{})
+	}
+	if sourceClaims.TeamID != "" {
+		extraClaims["team_id"] = sourceClaims.TeamID
+	}
+	if sourceClaims.TenantID != "" {
+		extraClaims["tenant_id"] = sourceClaims.TenantID
+	}
+
+	// --- Refresh Token Rotation ---
+	// Revoke the old refresh token so it can never be reused.
+	s.revokeRefreshToken(refreshToken)
+
+	// Calculate remaining refresh lifetime for the new refresh token.
+	var refreshRemainingSeconds int
+	if !refreshClaims.ExpiresAt.IsZero() {
+		refreshRemainingSeconds = int(time.Until(refreshClaims.ExpiresAt).Seconds())
+		if refreshRemainingSeconds <= 0 {
+			return nil, fmt.Errorf("refresh token already expired after revocation")
+		}
+	} else {
+		refreshTTL := s.config.Token.RefreshTokenLifetime
+		if refreshTTL == 0 {
+			refreshTTL = 24 * time.Hour
+		}
+		refreshRemainingSeconds = int(refreshTTL.Seconds())
+	}
+
+	newRefreshToken, err := s.MakeRefreshToken(
+		sourceClaims.ClientID,
+		sourceClaims.Scope,
+		sourceClaims.Subject,
+		refreshRemainingSeconds,
+		extraClaims,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to issue new refresh token: %w", err)
+	}
+
+	// Issue new access token
+	newTokenStr, err := s.MakeAccessToken(
+		sourceClaims.ClientID,
+		sourceClaims.Scope,
+		sourceClaims.Subject,
+		int(accessTTL.Seconds()),
+		extraClaims,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to issue access token: %w", err)
+	}
+
+	// Cookie lifetime = new refresh token lifetime
+	cookieExpires := time.Now().Add(time.Duration(refreshRemainingSeconds) * time.Second)
+
+	cookieValue := fmt.Sprintf("Bearer %s", newTokenStr)
+	response.SendAccessTokenCookieWithExpiry(c, cookieValue, cookieExpires)
+	response.SendRefreshTokenCookieWithExpiry(c, newRefreshToken, cookieExpires)
+
+	newClaims, err := s.VerifyToken(newTokenStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify refreshed token: %w", err)
+	}
+
+	log.Info("[OAuth] Token rotated for subject %s (access + refresh)", sourceClaims.Subject)
+	return newClaims, nil
 }
 
 func (s *Service) getAccessToken(c *gin.Context) string {
 	token := c.GetHeader("Authorization")
 	if token == "" {
-		cookie, err := c.Cookie("__Host-access_token")
+		cookieName := response.GetCookieName("access_token")
+		cookie, err := c.Cookie(cookieName)
 		if err != nil {
 			return ""
 		}
@@ -118,53 +250,14 @@ func (s *Service) getAccessToken(c *gin.Context) string {
 
 	// Get the access token
 	accessToken := strings.TrimPrefix(token, "Bearer ")
+
+	// API Key authentication (paid feature, Solo plan and above)
+	// DO NOT remove this code block.
+	// Pricing: https://yaoagents.com/pricing
+	// License: https://github.com/YaoApp/yao/blob/main/openapi/COMMERCIAL.md
 	if s.isAPIKey(accessToken) {
 		return s.getAccessTokenFromAPIKey(accessToken)
 	}
-	return accessToken
-}
-
-// isAPIKey checks if the token is a API Key
-func (s *Service) isAPIKey(token string) bool {
-	if strings.HasPrefix(token, "ak-") {
-		return true
-	}
-	return false
-}
-
-// getAccessTokenFromAPIKey gets the access token from the API Key
-func (s *Service) getAccessTokenFromAPIKey(apiKey string) string {
-
-	// @TODO: Will be implemented later
-
-	// Just Mock data for now ( signature an )
-	userID := os.Getenv("APIKEY_TEST_USER_ID")
-	teamID := os.Getenv("APIKEY_TEST_TEAM_ID")
-	clientID := os.Getenv("YAO_CLIENT_ID")
-
-	// Get or create subject
-	subject, err := OAuth.Subject(clientID, userID)
-	if err != nil {
-		log.Warn("Failed to store user fingerprint: %s", err.Error())
-	}
-
-	extraClaims := make(map[string]interface{})
-	extraClaims["team_id"] = teamID
-	extraClaims["user_id"] = userID
-	extraClaims["token_type"] = "Bearer"
-	extraClaims["expires_in"] = 3600
-	extraClaims["issued_at"] = time.Now().Unix()
-	extraClaims["expires_at"] = time.Now().Unix() + 3600
-	extraClaims["api_key"] = apiKey
-	accessToken, err := OAuth.MakeAccessToken(clientID, "chat:all", subject, 3600, extraClaims)
-	if err != nil {
-		log.Warn("Failed to make access token: %s", err.Error())
-	}
-
-	// fmt.Println("========== Access Token From API Key ==========")
-	// fmt.Println("accessToken: ", accessToken)
-	// fmt.Println("extraClaims: ", extraClaims)
-	// fmt.Println("===============================================")
 	return accessToken
 }
 
@@ -176,7 +269,8 @@ func (s *Service) GetAccessToken(c *gin.Context) string {
 func (s *Service) getRefreshToken(c *gin.Context) string {
 	token := c.GetHeader("Authorization")
 	if token == "" {
-		cookie, err := c.Cookie("__Host-refresh_token")
+		cookieName := response.GetCookieName("refresh_token")
+		cookie, err := c.Cookie(cookieName)
 		if err != nil {
 			return ""
 		}
@@ -190,6 +284,17 @@ func (s *Service) GetRefreshToken(c *gin.Context) string {
 	return s.getRefreshToken(c)
 }
 
+// IsRefreshInProgress checks whether an error signals that another goroutine
+// is already rotating (or has just rotated) the same refresh token.
+func IsRefreshInProgress(err error) bool {
+	return errors.Is(err, errRefreshInProgress) || errors.Is(err, errRefreshAlreadyDone)
+}
+
+// GetSessionID gets the session ID from the request (public method)
+func (s *Service) GetSessionID(c *gin.Context) string {
+	return s.getSessionID(c)
+}
+
 // Get Session ID from cookies, headers, or query string
 func (s *Service) getSessionID(c *gin.Context) string {
 
@@ -200,7 +305,8 @@ func (s *Service) getSessionID(c *gin.Context) string {
 	}
 
 	// 1. Try to get Session ID from cookies first
-	if sid, err := c.Cookie("__Host-session_id"); err == nil && sid != "" {
+	cookieName := response.GetCookieName("session_id")
+	if sid, err := c.Cookie(cookieName); err == nil && sid != "" {
 		return sid
 	}
 

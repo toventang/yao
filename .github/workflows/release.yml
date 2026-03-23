@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Release Linux", "Release macOS"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  # ===================================================================
+  # Wait for both workflows to succeed, then create a unified release
+  # ===================================================================
+  release:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Get Version
+        id: version
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "TAG=${TAG} VERSION=${VERSION}"
+
+      - name: Wait for Both Workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          echo "Waiting for both Release Linux and Release macOS to complete for $TAG..."
+
+          for i in $(seq 1 60); do
+            LINUX_STATUS=$(gh run list --workflow="Release Linux" --branch="$TAG" --limit=1 --json conclusion --jq '.[0].conclusion // "pending"')
+            MACOS_STATUS=$(gh run list --workflow="Release macOS" --branch="$TAG" --limit=1 --json conclusion --jq '.[0].conclusion // "pending"')
+
+            echo "Attempt $i: Linux=$LINUX_STATUS macOS=$MACOS_STATUS"
+
+            if [ "$LINUX_STATUS" = "success" ] && [ "$MACOS_STATUS" = "success" ]; then
+              echo "Both workflows completed successfully."
+              exit 0
+            fi
+
+            if [ "$LINUX_STATUS" = "failure" ] || [ "$MACOS_STATUS" = "failure" ]; then
+              echo "::error::One or both workflows failed (Linux=$LINUX_STATUS macOS=$MACOS_STATUS)"
+              exit 1
+            fi
+
+            sleep 60
+          done
+
+          echo "::error::Timed out waiting for workflows"
+          exit 1
+
+      - name: Download Linux Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          LINUX_RUN_ID=$(gh run list --workflow="Release Linux" --branch="$TAG" --limit=1 --json databaseId --jq '.[0].databaseId')
+          mkdir -p dist/linux
+          gh run download "$LINUX_RUN_ID" --name yao-linux --dir dist/linux
+
+      - name: Download macOS Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          MACOS_RUN_ID=$(gh run list --workflow="Release macOS" --branch="$TAG" --limit=1 --json databaseId --jq '.[0].databaseId')
+          mkdir -p dist/macos
+          gh run download "$MACOS_RUN_ID" --name yao-darwin-arm64 --dir dist/macos/arm64-prod
+          gh run download "$MACOS_RUN_ID" --name yao-darwin-arm64-dev --dir dist/macos/arm64-dev
+          gh run download "$MACOS_RUN_ID" --name yao-darwin-amd64 --dir dist/macos/amd64-prod
+          gh run download "$MACOS_RUN_ID" --name yao-darwin-amd64-dev --dir dist/macos/amd64-dev
+          gh run download "$MACOS_RUN_ID" --name yao-darwin-checksums --dir dist/macos/checksums
+
+      - name: Prepare Release Files
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p release
+
+          # Linux artifacts (already named correctly from build.sh)
+          cp dist/linux/* release/ 2>/dev/null || true
+
+          # macOS prod binaries
+          cp dist/macos/arm64-prod/yao "release/yao-${VERSION}-darwin-arm64"
+          cp dist/macos/amd64-prod/yao "release/yao-${VERSION}-darwin-amd64"
+
+          # macOS dev binaries
+          cp dist/macos/arm64-dev/yao "release/yao-${VERSION}-darwin-arm64-dev"
+          cp dist/macos/amd64-dev/yao "release/yao-${VERSION}-darwin-amd64-dev"
+
+          # Checksums
+          cp dist/macos/checksums/*.sha256 release/ 2>/dev/null || true
+
+          chmod +x release/yao-* 2>/dev/null || true
+          echo "=== Release files ==="
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Yao v${{ steps.version.outputs.version }}
+          files: release/*
+          generate_release_notes: true

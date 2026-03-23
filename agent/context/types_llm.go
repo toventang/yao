@@ -1,7 +1,7 @@
 package context
 
 import (
-	"github.com/yaoapp/gou/connector/openai"
+	"github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/yao/agent/output/message"
 )
 
@@ -38,7 +38,7 @@ const (
 )
 
 // GetVisionSupport returns whether vision is supported and the format
-func GetVisionSupport(cap *openai.Capabilities) (bool, VisionFormat) {
+func GetVisionSupport(cap *llm.Capabilities) (bool, VisionFormat) {
 	if cap == nil || cap.Vision == nil {
 		return false, VisionFormatNone
 	}
@@ -70,7 +70,7 @@ func GetVisionSupport(cap *openai.Capabilities) (bool, VisionFormat) {
 type CompletionOptions struct {
 	// Model capabilities (used by LLM to select appropriate provider)
 	// nil means capabilities are not specified/checked
-	Capabilities *openai.Capabilities `json:"capabilities,omitempty"`
+	Capabilities *llm.Capabilities `json:"capabilities,omitempty"`
 
 	// User-specified tools for vision, audio, search, and fetch processing
 	Uses *Uses `json:"uses,omitempty"`

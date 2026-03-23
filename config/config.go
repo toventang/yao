@@ -5,15 +5,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/caarlos0/env/v6"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/yaoapp/kun/exception"
 	"github.com/yaoapp/kun/log"
-	"github.com/yaoapp/yao/crypto"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -138,21 +135,23 @@ func LoadWithRoot(root string) Config {
 		cfg.AppSource = cfg.Root
 	}
 
-	// Studio Secret
-	if cfg.Studio.Secret == "" {
-		v, err := crypto.Hash(crypto.HashTypes["SHA256"], uuid.New().String())
-		if err != nil {
-			exception.New("Can't gengrate studio secret %s", 500, err.Error()).Throw()
-		}
-		cfg.Studio.Secret = strings.ToUpper(v)
-		cfg.Studio.Auto = true
-	}
-
 	// DataRoot
 	if cfg.DataRoot == "" {
 		cfg.DataRoot = filepath.Join(cfg.Root, "data")
-		if !filepath.IsAbs(cfg.DataRoot) {
-			cfg.DataRoot, _ = filepath.Abs(cfg.DataRoot)
+	}
+	if !filepath.IsAbs(cfg.DataRoot) {
+		cfg.DataRoot = filepath.Join(cfg.Root, cfg.DataRoot)
+	}
+
+	// Resolve DB relative paths based on Root
+	for i, dsn := range cfg.DB.Primary {
+		if !filepath.IsAbs(dsn) && (cfg.DB.Driver == "sqlite3" || cfg.DB.Driver == "") {
+			cfg.DB.Primary[i] = filepath.Join(cfg.Root, dsn)
+		}
+	}
+	for i, dsn := range cfg.DB.Secondary {
+		if !filepath.IsAbs(dsn) && (cfg.DB.Driver == "sqlite3" || cfg.DB.Driver == "") {
+			cfg.DB.Secondary[i] = filepath.Join(cfg.Root, dsn)
 		}
 	}
 

@@ -9,21 +9,20 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/spf13/cast"
 	"github.com/yaoapp/gou/application"
-	gouOpenAI "github.com/yaoapp/gou/connector/openai"
 	"github.com/yaoapp/gou/fs"
 	"github.com/yaoapp/yao/agent/context"
 	"github.com/yaoapp/yao/agent/i18n"
+	sandboxTypes "github.com/yaoapp/yao/agent/sandbox/v2/types"
 	searchTypes "github.com/yaoapp/yao/agent/search/types"
 	store "github.com/yaoapp/yao/agent/store/types"
-	"github.com/yaoapp/yao/openai"
+	"github.com/yaoapp/yao/config"
 	"gopkg.in/yaml.v3"
 )
 
 // loaded the loaded assistant
 var loaded = NewCache(200) // 200 is the default capacity
 var storage store.Store = nil
-var storeSetting *store.Setting = nil // store setting from agent.yml
-var modelCapabilities map[string]gouOpenAI.Capabilities = map[string]gouOpenAI.Capabilities{}
+var storeSetting *store.Setting = nil            // store setting from agent.yml
 var defaultConnector string = ""                 // default connector
 var globalUses *context.Uses = nil               // global uses configuration from agent.yml
 var globalPrompts []store.Prompt = nil           // global prompts from agent/prompts.yml
@@ -139,11 +138,6 @@ func SetStorage(s store.Store) {
 // GetStorage returns the storage (for testing purposes)
 func GetStorage() store.Store {
 	return storage
-}
-
-// SetModelCapabilities set the model capabilities configuration
-func SetModelCapabilities(capabilities map[string]gouOpenAI.Capabilities) {
-	modelCapabilities = capabilities
 }
 
 // SetConnector set the connector
@@ -386,7 +380,51 @@ func LoadPath(path string) (*Assistant, error) {
 		return nil, err
 	}
 	data["locales"] = locales
-	return loadMap(data)
+
+	// V2 sandbox: load standalone sandbox.yao if present (Path A).
+	sandboxFile := filepath.Join(path, "sandbox.yao")
+	if has, _ := app.Exists(sandboxFile); has {
+		absFile := filepath.Join(config.Conf.AppSource, sandboxFile)
+		sbCfg, sbErr := store.LoadSandboxConfig(absFile)
+		if sbErr != nil {
+			return nil, fmt.Errorf("load sandbox.yao: %w", sbErr)
+		}
+		data["__sandbox_v2"] = sbCfg
+	}
+
+	ast, err := loadMap(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// If V2 sandbox was loaded via Path A, assign it now.
+	if sbCfg, ok := data["__sandbox_v2"].(*sandboxTypes.SandboxConfig); ok && sbCfg != nil {
+		ast.SandboxV2 = sbCfg
+	}
+
+	// Extract Sandbox flag and ComputerFilter from V2 sandbox config.
+	if ast.SandboxV2 != nil {
+		ast.IsSandbox = true
+		ast.ComputerFilter = ast.SandboxV2.Filter
+	}
+
+	// Compute config hash for V2 sandbox.
+	if ast.SandboxV2 != nil {
+		var mcpServers []store.MCPServerConfig
+		if ast.MCP != nil {
+			mcpServers = ast.MCP.Servers
+		}
+		skillsDir := ""
+		if ast.Path != "" {
+			dir := filepath.Join(config.Conf.AppSource, ast.Path, "skills")
+			if info, e := os.Stat(dir); e == nil && info.IsDir() {
+				skillsDir = dir
+			}
+		}
+		ast.ConfigHash = store.ComputeConfigHash(ast.SandboxV2, mcpServers, skillsDir)
+	}
+
+	return ast, nil
 }
 
 func loadMap(data map[string]interface{}) (*Assistant, error) {
@@ -565,6 +603,11 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 		assistant.Description = v
 	}
 
+	// capabilities
+	if v, ok := data["capabilities"].(string); ok {
+		assistant.Capabilities = v
+	}
+
 	// locales
 	if locales, ok := data["locales"].(i18n.Map); ok {
 		assistant.Locales = locales
@@ -576,30 +619,39 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 			if i18nObj.Messages == nil {
 				i18nObj.Messages = make(map[string]any)
 			}
-			// Add name and description if not already present
+			// Add name, description, and capabilities if not already present
 			if _, exists := i18nObj.Messages["name"]; !exists && assistant.Name != "" {
 				i18nObj.Messages["name"] = assistant.Name
 			}
 			if _, exists := i18nObj.Messages["description"]; !exists && assistant.Description != "" {
 				i18nObj.Messages["description"] = assistant.Description
 			}
+			if _, exists := i18nObj.Messages["capabilities"]; !exists && assistant.Capabilities != "" {
+				i18nObj.Messages["capabilities"] = assistant.Capabilities
+			}
 			flattened[locale] = i18nObj
 		}
 
 		i18n.Locales[id] = flattened
 	} else {
-		// No locales defined, create default with name and description for all common locales
-		if assistant.Name != "" || assistant.Description != "" {
+		// No locales defined, create default with name, description, and capabilities for all common locales
+		if assistant.Name != "" || assistant.Description != "" || assistant.Capabilities != "" {
 			defaultLocales := make(map[string]i18n.I18n)
-			// Create entries for all common locales so {{name}} can be resolved
 			commonLocales := []string{"en", "en-us", "zh", "zh-cn", "zh-tw"}
 			for _, locale := range commonLocales {
+				messages := map[string]any{}
+				if assistant.Name != "" {
+					messages["name"] = assistant.Name
+				}
+				if assistant.Description != "" {
+					messages["description"] = assistant.Description
+				}
+				if assistant.Capabilities != "" {
+					messages["capabilities"] = assistant.Capabilities
+				}
 				defaultLocales[locale] = i18n.I18n{
-					Locale: locale,
-					Messages: map[string]any{
-						"name":        assistant.Name,
-						"description": assistant.Description,
-					},
+					Locale:   locale,
+					Messages: messages,
 				}
 			}
 			i18n.Locales[id] = defaultLocales
@@ -715,12 +767,51 @@ func loadMap(data map[string]interface{}) (*Assistant, error) {
 	}
 
 	// sandbox (for coding agents like Claude CLI, Cursor CLI)
-	if sandbox, has := data["sandbox"]; has {
-		sb, err := store.ToSandbox(sandbox)
-		if err != nil {
-			return nil, err
+	// V2 sandbox via independent sandbox.yao is loaded in LoadPath (below).
+	// This block handles the package.yao embedded "sandbox" field with version dispatch.
+	if assistant.SandboxV2 == nil {
+		if sandbox, has := data["sandbox"]; has {
+			version := extractSandboxVersion(sandbox)
+			if version == sandboxTypes.SandboxVersionV2 {
+				sb, err := store.ToSandboxV2(sandbox)
+				if err != nil {
+					return nil, err
+				}
+				assistant.SandboxV2 = sb
+				assistant.IsSandbox = true
+				assistant.ComputerFilter = sb.Filter
+			} else {
+				sb, err := store.ToSandbox(sandbox)
+				if err != nil {
+					return nil, err
+				}
+				assistant.Sandbox = sb
+			}
 		}
-		assistant.Sandbox = sb
+	}
+
+	// dependencies (name -> version constraint, like npm dependencies)
+	if deps, has := data["dependencies"]; has {
+		switch v := deps.(type) {
+		case map[string]string:
+			assistant.Dependencies = v
+		case map[string]interface{}:
+			d := make(map[string]string, len(v))
+			for k, val := range v {
+				d[k] = cast.ToString(val)
+			}
+			assistant.Dependencies = d
+		default:
+			raw, err := jsoniter.Marshal(v)
+			if err != nil {
+				return nil, err
+			}
+			var d map[string]string
+			if err := jsoniter.Unmarshal(raw, &d); err != nil {
+				return nil, err
+			}
+			assistant.Dependencies = d
+		}
 	}
 
 	// uses (wrapper configurations for vision, audio, etc.)
@@ -795,12 +886,6 @@ func (ast *Assistant) initialize() error {
 		conn = ast.Connector
 	}
 	ast.Connector = conn
-
-	api, err := openai.New(conn)
-	if err != nil {
-		return err
-	}
-	ast.openai = api
 
 	// Register scripts as process handlers
 	if len(ast.Scripts) > 0 {
@@ -1011,4 +1096,14 @@ func mergeSearchConfig(base, override *searchTypes.Config) *searchTypes.Config {
 	}
 
 	return &result
+}
+
+// extractSandboxVersion tries to read the "version" field from a sandbox config value.
+func extractSandboxVersion(v any) string {
+	if m, ok := v.(map[string]any); ok {
+		if ver, ok := m["version"].(string); ok {
+			return ver
+		}
+	}
+	return ""
 }

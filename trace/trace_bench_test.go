@@ -266,7 +266,7 @@ func BenchmarkSubscription(b *testing.B) {
 		}
 
 		// Subscribe
-		updates, err := manager.Subscribe()
+		updates, cancel, err := manager.Subscribe()
 		if err != nil {
 			b.Fatalf("Failed to subscribe: %s", err.Error())
 		}
@@ -301,6 +301,7 @@ func BenchmarkSubscription(b *testing.B) {
 			}
 		}
 
+		cancel()
 		trace.Release(traceID)
 		trace.Remove(ctx, trace.Local, traceID)
 	}

@@ -259,10 +259,11 @@ func TestMemoryLeakComplexScenarios(t *testing.T) {
 		{
 			name: "WithSubscription",
 			execute: func(m types.Manager) error {
-				updates, err := m.Subscribe()
+				updates, cancel, err := m.Subscribe()
 				if err != nil {
 					return err
 				}
+				defer cancel()
 
 				// Drain updates in background with timeout
 				done := make(chan bool)
@@ -563,7 +564,7 @@ func TestGoroutineLeak(t *testing.T) {
 		}
 
 		// Subscribe (creates goroutines)
-		updates, err := manager.Subscribe()
+		updates, cancel, err := manager.Subscribe()
 		if err != nil {
 			t.Errorf("Subscribe failed at iteration %d: %s", i, err.Error())
 		}
@@ -598,6 +599,7 @@ func TestGoroutineLeak(t *testing.T) {
 			}
 		}
 
+		cancel()
 		trace.Release(traceID)
 		trace.Remove(ctx, trace.Local, traceID)
 	}

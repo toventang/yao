@@ -30,6 +30,12 @@ type Executor interface {
 	// This is a convenience wrapper around ExecuteWithControl
 	Execute(ctx *robottypes.Context, robot *robottypes.Robot, trigger robottypes.TriggerType, data interface{}) (*robottypes.Execution, error)
 
+	// Resume resumes a suspended execution with human-provided input.
+	// Loads the execution from persistent storage, restores state from ResumeContext,
+	// and continues from where it was suspended.
+	// Returns ErrExecutionSuspended if the execution suspends again during resume.
+	Resume(ctx *robottypes.Context, execID string, reply string) error
+
 	// Metrics and control
 	ExecCount() int    // Total execution count
 	CurrentCount() int // Currently running execution count

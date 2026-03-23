@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -157,17 +158,52 @@ func (page *Page) GetConfig() *core.PageConfig {
 	if fs.IsFile(confFile) {
 		content, err := fs.ReadFile(confFile)
 		if err != nil {
-			return nil
+			return page.mergeTemplateConfig(nil)
 		}
 
 		var config core.PageConfig
 		if err := jsoniter.Unmarshal(content, &config); err == nil {
 			p.Config = &config
-			return p.Config
+			return page.mergeTemplateConfig(p.Config)
 		}
 	}
 
-	return nil
+	return page.mergeTemplateConfig(nil)
+}
+
+// mergeTemplateConfig merges template default config into page config (page config takes priority).
+// Use guard: "-" in page config to explicitly disable guard inheritance.
+func (page *Page) mergeTemplateConfig(cfg *core.PageConfig) *core.PageConfig {
+	tmplConfig := page.tmpl.Template.Config
+	if tmplConfig == nil {
+		return cfg
+	}
+
+	if cfg == nil {
+		cfg = &core.PageConfig{PageSetting: *tmplConfig}
+		page.Page.Config = cfg
+		return cfg
+	}
+
+	// Merge guard (page config takes priority, "-" means explicitly no guard)
+	if cfg.Guard == "" {
+		// Page has no guard, use template's guard (with redirect)
+		cfg.Guard = tmplConfig.Guard
+	} else if !strings.Contains(cfg.Guard, ":") && strings.Contains(tmplConfig.Guard, ":") {
+		// Page has guard without redirect (e.g. "oauth"), template has redirect (e.g. "oauth:/login")
+		// Inherit redirect from template if same guard type
+		tmplParts := strings.SplitN(tmplConfig.Guard, ":", 2)
+		if tmplParts[0] == cfg.Guard {
+			cfg.Guard = tmplConfig.Guard
+		}
+	}
+
+	// Merge API guard config
+	if cfg.API == nil && tmplConfig.API != nil {
+		cfg.API = tmplConfig.API
+	}
+
+	return cfg
 }
 
 // SaveTemp save the page temporarily (not supported for agent pages)
@@ -293,6 +329,9 @@ func (page *Page) Build(globalCtx *core.GlobalBuildContext, option *core.BuildOp
 		}
 	}
 
+	// Merge template default config before compile (page config takes priority)
+	page.GetConfig()
+
 	html, config, warnings, err := page.Page.Compile(ctx, option)
 	if err != nil {
 		return warnings, fmt.Errorf("Compile the page %s error: %s", page.Route, err.Error())
@@ -317,7 +356,7 @@ func (page *Page) Build(globalCtx *core.GlobalBuildContext, option *core.BuildOp
 	}
 
 	// Write locale files from page's __locales directory
-	err = page.writeLocaleFiles(option.Data)
+	err = page.writeLocaleFiles(ctx, option.Data)
 	if err != nil {
 		log.Warn("[Agent] Write locale files error: %s", err.Error())
 		// Don't fail the build for locale errors
@@ -444,6 +483,9 @@ func (page *Page) Trans(globalCtx *core.GlobalBuildContext, option *core.BuildOp
 	warnings := []string{}
 	ctx := core.NewBuildContext(globalCtx)
 
+	// Merge template default config before compile
+	page.GetConfig()
+
 	_, _, messages, err := page.Page.Compile(ctx, option)
 	if err != nil {
 		return warnings, err
@@ -474,8 +516,9 @@ func (page *Page) AssistantID() string {
 	return page.assistantID
 }
 
-// writeLocaleFiles writes locale files from page's __locales directory to public
-func (page *Page) writeLocaleFiles(data map[string]interface{}) error {
+// writeLocaleFiles writes locale files from page's __locales directory to public,
+// merging script translations extracted from __m() calls during build.
+func (page *Page) writeLocaleFiles(ctx *core.BuildContext, data map[string]interface{}) error {
 	fs := page.tmpl.agent.fs
 
 	// Check if page has __locales directory
@@ -483,6 +526,13 @@ func (page *Page) writeLocaleFiles(data map[string]interface{}) error {
 	if !fs.IsDir(localesDir) {
 		return nil
 	}
+
+	// Get translations from build context (includes __m() calls marked as type "script")
+	var translations []core.Translation
+	if ctx != nil {
+		translations = ctx.GetTranslations()
+	}
+	prefix := core.TranslationKeyPrefix(page.Route)
 
 	// Get the public root
 	root, err := page.tmpl.agent.DSL.PublicRoot(data)
@@ -544,13 +594,19 @@ func (page *Page) writeLocaleFiles(data map[string]interface{}) error {
 			}
 		}
 
-		// Extract script_messages
+		// Extract script_messages (if manually specified in source locale)
 		if scriptMessages, ok := localeData["script_messages"].(map[string]interface{}); ok {
 			for k, v := range scriptMessages {
 				if strVal, ok := v.(string); ok {
 					locale.ScriptMessages[k] = strVal
 				}
 			}
+		}
+
+		// Merge translations from build context — this populates ScriptMessages
+		// from __m() calls found in TS/JS scripts during compilation
+		if len(translations) > 0 {
+			locale.MergeTranslations(translations, prefix)
 		}
 
 		// Extract timezone and direction

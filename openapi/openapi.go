@@ -10,20 +10,29 @@ import (
 	"github.com/yaoapp/yao/openapi/app"
 	"github.com/yaoapp/yao/openapi/captcha"
 	"github.com/yaoapp/yao/openapi/chat"
+	openapiComputer "github.com/yaoapp/yao/openapi/computer"
 	"github.com/yaoapp/yao/openapi/dsl"
 	"github.com/yaoapp/yao/openapi/file"
 	"github.com/yaoapp/yao/openapi/hello"
+	openintegrations "github.com/yaoapp/yao/openapi/integrations"
 	"github.com/yaoapp/yao/openapi/job"
 	"github.com/yaoapp/yao/openapi/kb"
 	"github.com/yaoapp/yao/openapi/llm"
 	"github.com/yaoapp/yao/openapi/mcp"
 	"github.com/yaoapp/yao/openapi/messenger"
+	"github.com/yaoapp/yao/openapi/nodes"
 	"github.com/yaoapp/yao/openapi/oauth"
 	"github.com/yaoapp/yao/openapi/oauth/acl"
 	"github.com/yaoapp/yao/openapi/oauth/types"
+	"github.com/yaoapp/yao/openapi/otp"
+	"github.com/yaoapp/yao/openapi/response"
+	"github.com/yaoapp/yao/openapi/sandbox"
+	openapiTai "github.com/yaoapp/yao/openapi/tai"
 	"github.com/yaoapp/yao/openapi/team"
 	openapiTrace "github.com/yaoapp/yao/openapi/trace"
 	"github.com/yaoapp/yao/openapi/user"
+	openapiWorkspace "github.com/yaoapp/yao/openapi/workspace"
+	taiapi "github.com/yaoapp/yao/tai/api"
 )
 
 // Server is the OpenAPI server
@@ -63,6 +72,10 @@ func Load(appConfig config.Config) (*OpenAPI, error) {
 		return nil, err
 	}
 
+	// Set the secure cookie configuration for the response package
+	// This determines whether to use __Host- prefix and Secure flag for cookies
+	response.SetSecureCookieEnabled(oauthConfig.Security.SecureCookie)
+
 	// Load user configurations
 	err = user.Load(appConfig)
 	if err != nil {
@@ -79,6 +92,9 @@ func Load(appConfig config.Config) (*OpenAPI, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Initialize OTP service (shares the OAuth store)
+	otp.NewService(oauthService.GetStore(), oauthService.GetKeyPrefix())
 
 	// Create the OpenAPI server
 	Server = &OpenAPI{Config: &config, OAuth: oauthService}
@@ -139,6 +155,9 @@ func (openapi *OpenAPI) Attach(router *gin.Engine) {
 	// Messenger webhook handlers
 	messenger.Attach(group.Group("/messenger"), openapi.OAuth)
 
+	// Integrations webhook handlers (public, no OAuth - external platforms push here)
+	openintegrations.Attach(group.Group("/integrations"))
+
 	// Agent handlers
 	agent.Attach(group.Group("/agent"), openapi.OAuth)
 
@@ -153,6 +172,32 @@ func (openapi *OpenAPI) Attach(router *gin.Engine) {
 
 	// App handlers (menu, etc.)
 	app.Attach(group.Group("/app"), openapi.OAuth)
+
+	// OTP handlers (passwordless authentication)
+	otp.Attach(group.Group("/otp"), openapi.OAuth)
+
+	// Sandbox handlers (VNC proxy + management CRUD)
+	sandbox.SetPathPrefix(baseURL)
+	sandboxGroup := group.Group("/sandbox")
+	sandbox.Attach(sandboxGroup, openapi.OAuth)
+	sandbox.AttachManage(sandboxGroup, openapi.OAuth)
+
+	// Computer option handlers (for InputArea selector)
+	openapiComputer.Attach(group.Group("/computer"), openapi.OAuth)
+
+	// Workspace handlers
+	openapiWorkspace.Attach(group.Group("/workspace"), openapi.OAuth)
+
+	// Tai nodes handlers
+	nodes.Attach(group.Group("/nodes"), openapi.OAuth)
+
+	// Tai forward handlers (proxy + VNC, dispatches tunnel vs local)
+	openapiTai.Attach(group)
+
+	// Tai direct registration API (uses /tai-nodes/ prefix to avoid routing conflict with /tai/:taiID/)
+	group.POST("/tai-nodes/register", taiapi.HandleRegister)
+	group.POST("/tai-nodes/heartbeat", taiapi.HandleHeartbeat)
+	group.DELETE("/tai-nodes/register/:tai_id", taiapi.HandleUnregister)
 
 	// Custom handlers (Defined by developer)
 

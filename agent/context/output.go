@@ -3,7 +3,7 @@ package context
 import (
 	"time"
 
-	"github.com/yaoapp/gou/connector/openai"
+	"github.com/yaoapp/gou/llm"
 	"github.com/yaoapp/yao/agent/output"
 	"github.com/yaoapp/yao/agent/output/message"
 )
@@ -571,9 +571,8 @@ func (ctx *Context) getOutput() (*output.Output, error) {
 		Accept:  string(ctx.Accept),
 	}
 
-	// Set ModelCapabilities (now using openai.Capabilities directly)
 	if ctx.Capabilities != nil {
-		caps := openai.Capabilities(*ctx.Capabilities)
+		caps := llm.Capabilities(*ctx.Capabilities)
 		options.Capabilities = &caps
 	}
 

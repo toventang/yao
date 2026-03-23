@@ -40,6 +40,13 @@ type ExecutionRecord struct {
 	Delivery    *types.DeliveryResult    `json:"delivery,omitempty"`
 	Learning    []types.LearningEntry    `json:"learning,omitempty"`
 
+	// V2: Conversation and suspend-resume fields
+	ChatID          string               `json:"chat_id,omitempty"`
+	WaitingTaskID   string               `json:"waiting_task_id,omitempty"`
+	WaitingQuestion string               `json:"waiting_question,omitempty"`
+	WaitingSince    *time.Time           `json:"waiting_since,omitempty"`
+	ResumeContext   *types.ResumeContext `json:"resume_context,omitempty"`
+
 	// Timestamps
 	StartTime *time.Time `json:"start_time,omitempty"`
 	EndTime   *time.Time `json:"end_time,omitempty"`
@@ -55,13 +62,22 @@ type CurrentState struct {
 
 // ListOptions - options for listing execution records
 type ListOptions struct {
-	MemberID    string            `json:"member_id,omitempty"` // Filter by robot member ID
-	TeamID      string            `json:"team_id,omitempty"`
-	Status      types.ExecStatus  `json:"status,omitempty"`
-	TriggerType types.TriggerType `json:"trigger_type,omitempty"`
-	Limit       int               `json:"limit,omitempty"`
-	Offset      int               `json:"offset,omitempty"`
-	OrderBy     string            `json:"order_by,omitempty"` // e.g., "start_time desc"
+	MemberID        string             `json:"member_id,omitempty"`
+	TeamID          string             `json:"team_id,omitempty"`
+	Status          types.ExecStatus   `json:"status,omitempty"`
+	ExcludeStatuses []types.ExecStatus `json:"exclude_statuses,omitempty"`
+	TriggerType     types.TriggerType  `json:"trigger_type,omitempty"`
+	Page            int                `json:"page,omitempty"`
+	PageSize        int                `json:"pagesize,omitempty"`
+	OrderBy         string             `json:"order_by,omitempty"`
+}
+
+// ListResult wraps paginated list results
+type ListResult struct {
+	Data     []*ExecutionRecord
+	Total    int
+	Page     int
+	PageSize int
 }
 
 // ExecutionStore - persistent storage for robot execution records
@@ -135,17 +151,19 @@ func (s *ExecutionStore) Get(ctx context.Context, executionID string) (*Executio
 	return s.mapToRecord(rows[0])
 }
 
-// List retrieves execution records with filters
-func (s *ExecutionStore) List(ctx context.Context, opts *ListOptions) ([]*ExecutionRecord, error) {
+// List retrieves execution records with pagination using mod.Paginate
+func (s *ExecutionStore) List(ctx context.Context, opts *ListOptions) (*ListResult, error) {
 	mod := model.Select(s.modelID)
 	if mod == nil {
 		return nil, fmt.Errorf("model %s not found", s.modelID)
 	}
 
 	params := model.QueryParam{}
-
-	// Build where conditions
 	var wheres []model.QueryWhere
+
+	page := 1
+	pageSize := 20
+
 	if opts != nil {
 		if opts.MemberID != "" {
 			wheres = append(wheres, model.QueryWhere{Column: "member_id", Value: opts.MemberID})
@@ -156,49 +174,62 @@ func (s *ExecutionStore) List(ctx context.Context, opts *ListOptions) ([]*Execut
 		if opts.Status != "" {
 			wheres = append(wheres, model.QueryWhere{Column: "status", Value: string(opts.Status)})
 		}
+		for _, es := range opts.ExcludeStatuses {
+			wheres = append(wheres, model.QueryWhere{Column: "status", Value: string(es), OP: "ne"})
+		}
 		if opts.TriggerType != "" {
 			wheres = append(wheres, model.QueryWhere{Column: "trigger_type", Value: string(opts.TriggerType)})
 		}
 
-		params.Limit = opts.Limit
-		if params.Limit == 0 {
-			params.Limit = 100 // default limit
+		if opts.Page > 0 {
+			page = opts.Page
 		}
-
-		// Note: model.QueryParam doesn't have Offset, use Page instead
-		if opts.Offset > 0 && opts.Limit > 0 {
-			params.Page = (opts.Offset / opts.Limit) + 1
+		if opts.PageSize > 0 {
+			pageSize = opts.PageSize
+			if pageSize > 100 {
+				pageSize = 100
+			}
 		}
 
 		if opts.OrderBy != "" {
-			// Parse OrderBy: "column desc" or "column asc" or just "column"
 			parts := splitOrderBy(opts.OrderBy)
 			params.Orders = []model.QueryOrder{{Column: parts[0], Option: parts[1]}}
 		} else {
 			params.Orders = []model.QueryOrder{{Column: "start_time", Option: "desc"}}
 		}
 	} else {
-		params.Limit = 100
 		params.Orders = []model.QueryOrder{{Column: "start_time", Option: "desc"}}
 	}
 
 	params.Wheres = wheres
 
-	rows, err := mod.Get(params)
+	res, err := mod.Paginate(params, page, pageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list execution records: %w", err)
 	}
 
-	records := make([]*ExecutionRecord, 0, len(rows))
-	for _, row := range rows {
+	total := 0
+	if v, ok := res["total"].(int64); ok {
+		total = int(v)
+	} else if v, ok := res["total"].(int); ok {
+		total = v
+	}
+
+	records := make([]*ExecutionRecord, 0)
+	for _, row := range toRows(res["data"]) {
 		record, err := s.mapToRecord(row)
 		if err != nil {
-			continue // skip invalid records
+			continue
 		}
 		records = append(records, record)
 	}
 
-	return records, nil
+	return &ListResult{
+		Data:     records,
+		Total:    total,
+		Page:     page,
+		PageSize: pageSize,
+	}, nil
 }
 
 // UpdatePhase updates the current phase and its data
@@ -380,6 +411,68 @@ func (s *ExecutionStore) UpdateUIFields(ctx context.Context, executionID string,
 	return nil
 }
 
+// UpdateSuspendState atomically transitions an execution to waiting status
+// with all suspend-related fields in a single DB write.
+func (s *ExecutionStore) UpdateSuspendState(ctx context.Context, executionID string, waitingTaskID string, question string, resumeCtx *types.ResumeContext) error {
+	mod := model.Select(s.modelID)
+	if mod == nil {
+		return fmt.Errorf("model %s not found", s.modelID)
+	}
+
+	now := time.Now()
+	updateData := map[string]interface{}{
+		"status":           string(types.ExecWaiting),
+		"waiting_task_id":  waitingTaskID,
+		"waiting_question": question,
+		"waiting_since":    now,
+	}
+	if resumeCtx != nil {
+		updateData["resume_context"] = resumeCtx
+	}
+
+	_, err := mod.UpdateWhere(
+		model.QueryParam{
+			Wheres: []model.QueryWhere{
+				{Column: "execution_id", Value: executionID},
+			},
+		},
+		updateData,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update suspend state: %w", err)
+	}
+	return nil
+}
+
+// UpdateResumeState clears waiting fields and transitions execution back to running.
+func (s *ExecutionStore) UpdateResumeState(ctx context.Context, executionID string) error {
+	mod := model.Select(s.modelID)
+	if mod == nil {
+		return fmt.Errorf("model %s not found", s.modelID)
+	}
+
+	updateData := map[string]interface{}{
+		"status":           string(types.ExecRunning),
+		"waiting_task_id":  "",
+		"waiting_question": "",
+		"waiting_since":    nil,
+		"resume_context":   nil,
+	}
+
+	_, err := mod.UpdateWhere(
+		model.QueryParam{
+			Wheres: []model.QueryWhere{
+				{Column: "execution_id", Value: executionID},
+			},
+		},
+		updateData,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update resume state: %w", err)
+	}
+	return nil
+}
+
 // Delete removes an execution record by execution_id
 func (s *ExecutionStore) Delete(ctx context.Context, executionID string) error {
 	mod := model.Select(s.modelID)
@@ -443,6 +536,23 @@ func (s *ExecutionStore) recordToMap(record *ExecutionRecord) map[string]interfa
 	if record.Learning != nil {
 		data["learning"] = record.Learning
 	}
+	// V2 fields
+	if record.ChatID != "" {
+		data["chat_id"] = record.ChatID
+	}
+	if record.WaitingTaskID != "" {
+		data["waiting_task_id"] = record.WaitingTaskID
+	}
+	if record.WaitingQuestion != "" {
+		data["waiting_question"] = record.WaitingQuestion
+	}
+	if record.WaitingSince != nil {
+		data["waiting_since"] = *record.WaitingSince
+	}
+	if record.ResumeContext != nil {
+		data["resume_context"] = record.ResumeContext
+	}
+
 	if record.StartTime != nil {
 		data["start_time"] = *record.StartTime
 	}
@@ -520,6 +630,23 @@ func (s *ExecutionStore) mapToRecord(row map[string]interface{}) (*ExecutionReco
 	}
 	if v := row["learning"]; v != nil {
 		record.Learning = s.parseLearningEntries(v)
+	}
+
+	// V2 fields
+	if v, ok := row["chat_id"].(string); ok {
+		record.ChatID = v
+	}
+	if v, ok := row["waiting_task_id"].(string); ok {
+		record.WaitingTaskID = v
+	}
+	if v, ok := row["waiting_question"].(string); ok {
+		record.WaitingQuestion = v
+	}
+	if v := row["waiting_since"]; v != nil {
+		record.WaitingSince = s.parseTime(v)
+	}
+	if v := row["resume_context"]; v != nil {
+		record.ResumeContext = s.parseResumeContext(v)
 	}
 
 	// Timestamps
@@ -637,6 +764,18 @@ func (s *ExecutionStore) parseLearningEntries(v interface{}) []types.LearningEnt
 	return entries
 }
 
+func (s *ExecutionStore) parseResumeContext(v interface{}) *types.ResumeContext {
+	data, err := s.toJSON(v)
+	if err != nil {
+		return nil
+	}
+	var ctx types.ResumeContext
+	if err := json.Unmarshal(data, &ctx); err != nil {
+		return nil
+	}
+	return &ctx
+}
+
 func (s *ExecutionStore) toJSON(v interface{}) ([]byte, error) {
 	switch data := v.(type) {
 	case []byte:
@@ -652,6 +791,23 @@ func (s *ExecutionStore) toJSON(v interface{}) ([]byte, error) {
 
 // splitOrderBy parses "column desc" or "column asc" or just "column"
 // Returns [column, option] where option defaults to "desc"
+// toRows converts Paginate result data to []map[string]interface{}
+// handles type aliases like maps.MapStrAny via JSON round-trip
+func toRows(data interface{}) []map[string]interface{} {
+	if data == nil {
+		return nil
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil
+	}
+	return rows
+}
+
 func splitOrderBy(orderBy string) [2]string {
 	parts := [2]string{"", "desc"}
 	if orderBy == "" {
@@ -704,12 +860,12 @@ func (s *ExecutionStore) parseTime(v interface{}) *time.Time {
 
 // ResultListOptions - options for listing execution results (deliveries)
 type ResultListOptions struct {
-	MemberID    string            `json:"member_id,omitempty"`    // Filter by robot member ID
-	TeamID      string            `json:"team_id,omitempty"`      // Filter by team ID
-	TriggerType types.TriggerType `json:"trigger_type,omitempty"` // Filter by trigger type
-	Keyword     string            `json:"keyword,omitempty"`      // Search in delivery.content.summary
-	Limit       int               `json:"limit,omitempty"`
-	Offset      int               `json:"offset,omitempty"`
+	MemberID    string            `json:"member_id,omitempty"`
+	TeamID      string            `json:"team_id,omitempty"`
+	TriggerType types.TriggerType `json:"trigger_type,omitempty"`
+	Keyword     string            `json:"keyword,omitempty"`
+	Page        int               `json:"page,omitempty"`
+	PageSize    int               `json:"pagesize,omitempty"`
 }
 
 // ResultListResponse - paginated result list response
@@ -752,52 +908,43 @@ func (s *ExecutionStore) ListResults(ctx context.Context, opts *ResultListOption
 		}
 	}
 
-	// Get total count first
-	total, err := s.countWithWheres(wheres)
-	if err != nil {
-		return nil, fmt.Errorf("failed to count results: %w", err)
-	}
-
-	// Set pagination defaults
-	limit := 20
-	offset := 0
+	page := 1
+	pageSize := 20
 	if opts != nil {
-		if opts.Limit > 0 {
-			limit = opts.Limit
-			if limit > 100 {
-				limit = 100
+		if opts.Page > 0 {
+			page = opts.Page
+		}
+		if opts.PageSize > 0 {
+			pageSize = opts.PageSize
+			if pageSize > 100 {
+				pageSize = 100
 			}
 		}
-		if opts.Offset > 0 {
-			offset = opts.Offset
-		}
-	}
-
-	// Calculate page from offset
-	page := 1
-	if limit > 0 && offset > 0 {
-		page = (offset / limit) + 1
 	}
 
 	params := model.QueryParam{
 		Wheres: wheres,
-		Limit:  limit,
-		Page:   page,
 		Orders: []model.QueryOrder{{Column: "end_time", Option: "desc"}},
 	}
 
-	rows, err := mod.Get(params)
+	res, err := mod.Paginate(params, page, pageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list results: %w", err)
 	}
 
-	records := make([]*ExecutionRecord, 0, len(rows))
-	for _, row := range rows {
+	total := 0
+	if v, ok := res["total"].(int64); ok {
+		total = int(v)
+	} else if v, ok := res["total"].(int); ok {
+		total = v
+	}
+
+	records := make([]*ExecutionRecord, 0)
+	for _, row := range toRows(res["data"]) {
 		record, err := s.mapToRecord(row)
 		if err != nil {
-			continue // skip invalid records
+			continue
 		}
-		// Double check delivery content exists
 		if record.Delivery != nil && record.Delivery.Content != nil {
 			records = append(records, record)
 		}
@@ -807,7 +954,7 @@ func (s *ExecutionStore) ListResults(ctx context.Context, opts *ResultListOption
 		Data:     records,
 		Total:    total,
 		Page:     page,
-		PageSize: limit,
+		PageSize: pageSize,
 	}, nil
 }
 
@@ -1077,6 +1224,11 @@ func FromExecution(exec *types.Execution) *ExecutionRecord {
 		Results:         exec.Results,
 		Delivery:        exec.Delivery,
 		Learning:        exec.Learning,
+		ChatID:          exec.ChatID,
+		WaitingTaskID:   exec.WaitingTaskID,
+		WaitingQuestion: exec.WaitingQuestion,
+		WaitingSince:    exec.WaitingSince,
+		ResumeContext:   exec.ResumeContext,
 	}
 
 	// Convert timestamps
@@ -1117,6 +1269,11 @@ func (r *ExecutionRecord) ToExecution() *types.Execution {
 		Results:         r.Results,
 		Delivery:        r.Delivery,
 		Learning:        r.Learning,
+		ChatID:          r.ChatID,
+		WaitingTaskID:   r.WaitingTaskID,
+		WaitingQuestion: r.WaitingQuestion,
+		WaitingSince:    r.WaitingSince,
+		ResumeContext:   r.ResumeContext,
 	}
 
 	// Convert timestamps

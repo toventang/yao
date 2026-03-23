@@ -65,11 +65,10 @@ func ListResults(ctx *types.Context, memberID string, query *ResultQuery) (*Resu
 	}
 	query.applyDefaults()
 
-	// Build store options
 	opts := &store.ResultListOptions{
 		MemberID: memberID,
-		Limit:    query.PageSize,
-		Offset:   (query.Page - 1) * query.PageSize,
+		Page:     query.Page,
+		PageSize: query.PageSize,
 	}
 
 	if query.TriggerType != "" {

@@ -12,10 +12,10 @@ import (
 )
 
 // ============================================================================
-// Runner Tests - Multi-Turn Conversation Flow
+// Runner Tests - V2 Simplified Execution (single call, no validation loop)
 // ============================================================================
 
-func TestRunnerExecuteWithRetry(t *testing.T) {
+func TestRunnerExecuteTask(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test")
 	}
@@ -25,10 +25,10 @@ func TestRunnerExecuteWithRetry(t *testing.T) {
 
 	ctx := types.NewContext(context.Background(), testAuth())
 
-	t.Run("executes assistant task with multi-turn conversation", func(t *testing.T) {
+	t.Run("executes assistant task successfully", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		task := &types.Task{
 			ID:           "task-001",
@@ -45,26 +45,21 @@ func TestRunnerExecuteWithRetry(t *testing.T) {
 			SystemPrompt: robot.SystemPrompt,
 		}
 
-		result := runner.ExecuteWithRetry(task, taskCtx)
+		result := runner.ExecuteTask(task, taskCtx)
 
 		assert.True(t, result.Success, "task should succeed")
-		assert.NotNil(t, result.Output)
-		assert.NotNil(t, result.Validation)
-		assert.True(t, result.Validation.Complete)
-		assert.Greater(t, result.Duration, int64(0))
+		assert.NotNil(t, result.Output, "output should not be nil")
+		assert.Empty(t, result.Error, "error should be empty on success")
+		assert.Greater(t, result.Duration, int64(0), "duration should be positive")
 
 		t.Logf("Output: %v", result.Output)
-		t.Logf("Validation: passed=%v, complete=%v, score=%.2f",
-			result.Validation.Passed, result.Validation.Complete, result.Validation.Score)
 	})
 
-	t.Run("handles validation failure with multi-turn retry", func(t *testing.T) {
+	t.Run("returns success without validation for assistant tasks", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		config.MaxTurnsPerTask = 3 // Limit turns for test
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
-		// Task with strict validation that may require conversation
 		task := &types.Task{
 			ID:           "task-002",
 			ExecutorType: types.ExecutorAssistant,
@@ -73,63 +68,45 @@ func TestRunnerExecuteWithRetry(t *testing.T) {
 				{Role: agentcontext.RoleUser, Content: "Return a JSON object with exactly these fields: status (string 'ok'), count (number greater than 0)."},
 			},
 			ExpectedOutput: "JSON with status='ok' and count>0",
-			ValidationRules: []string{
-				"output must be valid JSON",
-				`{"type": "type", "value": "object"}`,
-			},
-			Status: types.TaskPending,
+			Status:         types.TaskPending,
 		}
 
 		taskCtx := &standard.RunnerContext{
 			SystemPrompt: robot.SystemPrompt,
 		}
 
-		result := runner.ExecuteWithRetry(task, taskCtx)
+		result := runner.ExecuteTask(task, taskCtx)
 
-		// Should either succeed or fail gracefully
-		assert.NotNil(t, result.Validation)
+		// V2: success is determined by the call succeeding, not by validation
+		assert.True(t, result.Success, "task should succeed if assistant call returns")
+		assert.NotNil(t, result.Output, "output should not be nil")
+		assert.Nil(t, result.Validation, "V2 does not set Validation in runner")
+
 		t.Logf("Success: %v, Output: %v", result.Success, result.Output)
-		t.Logf("Validation: passed=%v, complete=%v, needReply=%v",
-			result.Validation.Passed, result.Validation.Complete, result.Validation.NeedReply)
 	})
 
-	t.Run("respects max turns limit", func(t *testing.T) {
+	t.Run("handles empty messages gracefully", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		config.MaxTurnsPerTask = 1 // Only 1 turn allowed
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
-		// Task that requires multiple turns - asking for something incomplete
-		// then validation will ask for more, but we only allow 1 turn
 		task := &types.Task{
 			ID:           "task-003",
 			ExecutorType: types.ExecutorAssistant,
 			ExecutorID:   "experts.text-writer",
-			Messages: []agentcontext.Message{
-				{Role: agentcontext.RoleUser, Content: "Say 'hello'"},
-			},
-			// Validation will fail because it expects a JSON object
-			ExpectedOutput:  "A JSON object with 'status' and 'data' fields",
-			ValidationRules: []string{`{"type": "type", "value": "object"}`},
-			Status:          types.TaskPending,
+			Messages:     []agentcontext.Message{},
+			Status:       types.TaskPending,
 		}
 
 		taskCtx := &standard.RunnerContext{
 			SystemPrompt: robot.SystemPrompt,
 		}
 
-		result := runner.ExecuteWithRetry(task, taskCtx)
+		result := runner.ExecuteTask(task, taskCtx)
 
-		// With only 1 turn and strict validation, task should not complete successfully
-		// Either it fails validation or hits max turns
-		t.Logf("Result: success=%v, error=%s", result.Success, result.Error)
-		t.Logf("Validation: passed=%v, complete=%v, needReply=%v",
-			result.Validation.Passed, result.Validation.Complete, result.Validation.NeedReply)
-
-		// The test verifies the max turns mechanism works - task either:
-		// 1. Fails validation (expected with "say hello" vs JSON requirement)
-		// 2. Or hits max turns if validation requests retry
-		assert.NotNil(t, result.Validation)
+		assert.False(t, result.Success, "task should fail with empty messages")
+		assert.NotEmpty(t, result.Error, "error should describe the failure")
+		t.Logf("Error: %s", result.Error)
 	})
 }
 
@@ -146,7 +123,7 @@ func TestRunnerBuildTaskContext(t *testing.T) {
 	t.Run("includes previous results in context", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		exec := &types.Execution{
 			ID:       "test-exec",
@@ -183,7 +160,7 @@ func TestRunnerBuildTaskContext(t *testing.T) {
 	t.Run("handles first task with no previous results", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		exec := &types.Execution{
 			ID:       "test-exec",
@@ -205,7 +182,7 @@ func TestRunnerBuildTaskContext(t *testing.T) {
 	t.Run("handles bounds check for task index", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		exec := &types.Execution{
 			ID:       "test-exec",
@@ -238,7 +215,7 @@ func TestRunnerFormatPreviousResultsAsContext(t *testing.T) {
 	t.Run("formats previous results as markdown", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		results := []types.TaskResult{
 			{
@@ -270,7 +247,7 @@ func TestRunnerFormatPreviousResultsAsContext(t *testing.T) {
 	t.Run("returns empty string for no results", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		formatted := runner.FormatPreviousResultsAsContext([]types.TaskResult{})
 
@@ -291,7 +268,7 @@ func TestRunnerBuildAssistantMessages(t *testing.T) {
 	t.Run("builds messages with task content", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		task := &types.Task{
 			ID:           "task-001",
@@ -323,7 +300,7 @@ func TestRunnerBuildAssistantMessages(t *testing.T) {
 	t.Run("includes previous results in messages", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		task := &types.Task{
 			ID:           "task-002",
@@ -363,7 +340,7 @@ func TestRunnerFormatMessagesAsText(t *testing.T) {
 	t.Run("formats string content", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		messages := []agentcontext.Message{
 			{Role: agentcontext.RoleUser, Content: "Hello"},
@@ -379,7 +356,7 @@ func TestRunnerFormatMessagesAsText(t *testing.T) {
 	t.Run("handles multipart content", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		messages := []agentcontext.Message{
 			{
@@ -400,7 +377,7 @@ func TestRunnerFormatMessagesAsText(t *testing.T) {
 	t.Run("handles map content via JSON", func(t *testing.T) {
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		messages := []agentcontext.Message{
 			{
@@ -428,155 +405,25 @@ func TestRunnerExecuteNonAssistantTask(t *testing.T) {
 	testutils.Prepare(t)
 	defer testutils.Clean(t)
 
-	ctx := types.NewContext(context.Background(), testAuth())
-
-	t.Run("executes MCP task (single-call)", func(t *testing.T) {
-		// Note: This test requires MCP server to be running
-		// Skip if MCP is not available
-		t.Skip("MCP server not available in test environment")
-
+	t.Run("executes unsupported type returns error", func(t *testing.T) {
+		ctx := types.NewContext(context.Background(), testAuth())
 		robot := createRunnerTestRobot(t)
 		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
+		runner := standard.NewRunner(ctx, robot, config, "", "test")
 
 		task := &types.Task{
-			ID:           "task-mcp",
-			ExecutorType: types.ExecutorMCP,
-			ExecutorID:   "filesystem.list_directory",
-			Args:         []any{map[string]interface{}{"path": "/tmp"}},
+			ID:           "task-unknown",
+			ExecutorType: "unsupported",
+			ExecutorID:   "anything",
 			Status:       types.TaskPending,
 		}
 
 		taskCtx := &standard.RunnerContext{}
+		result := runner.ExecuteTask(task, taskCtx)
 
-		result := runner.ExecuteWithRetry(task, taskCtx)
-
-		// MCP tasks are single-call, no multi-turn
-		t.Logf("MCP result: success=%v, output=%v", result.Success, result.Output)
-	})
-
-	t.Run("executes Process task (single-call)", func(t *testing.T) {
-		// Note: This test requires a Yao process to be available
-		// Skip if process is not available
-		t.Skip("Yao process not available in test environment")
-
-		robot := createRunnerTestRobot(t)
-		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
-
-		task := &types.Task{
-			ID:           "task-process",
-			ExecutorType: types.ExecutorProcess,
-			ExecutorID:   "utils.env.Get",
-			Args:         []any{"PATH"},
-			Status:       types.TaskPending,
-		}
-
-		taskCtx := &standard.RunnerContext{}
-
-		result := runner.ExecuteWithRetry(task, taskCtx)
-
-		// Process tasks are single-call, no multi-turn
-		t.Logf("Process result: success=%v, output=%v", result.Success, result.Output)
-	})
-}
-
-// ============================================================================
-// MCP Output Validation Tests
-// ============================================================================
-
-func TestRunnerValidateMCPOutput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test")
-	}
-
-	testutils.Prepare(t)
-	defer testutils.Clean(t)
-
-	ctx := types.NewContext(context.Background(), testAuth())
-
-	// Test that MCP tasks use simple structure validation, not semantic validation
-	// This is tested indirectly through the validation result
-
-	t.Run("MCP validation passes with valid map output", func(t *testing.T) {
-		robot := createRunnerTestRobot(t)
-		config := standard.DefaultRunConfig()
-		runner := standard.NewRunner(ctx, robot, config)
-
-		// Create a mock MCP task with validation rules
-		// (normally these rules would trigger semantic validation for assistant tasks)
-		task := &types.Task{
-			ID:           "task-mcp-test",
-			ExecutorType: types.ExecutorMCP,
-			ExecutorID:   "test.tool",
-			MCPServer:    "test",
-			MCPTool:      "tool",
-			// These semantic rules should be IGNORED for MCP tasks
-			ExpectedOutput: "Image with file and content_type",
-			ValidationRules: []string{
-				"file field exists",
-				"content_type is image/jpeg",
-			},
-			Status: types.TaskPending,
-		}
-
-		// Simulate MCP output (normally would come from actual MCP call)
-		output := map[string]interface{}{
-			"file":         "__yao.attachment://abc123",
-			"content_type": "image/jpeg",
-		}
-
-		// Test validateMCPOutput directly through reflection or mock
-		// Since validateMCPOutput is private, we test the behavior indirectly:
-		// MCP validation should only check for non-empty output, not semantic content
-
-		// The validation should pass because:
-		// 1. Output is not nil
-		// 2. Output is a non-empty map
-		// (Semantic validation rules are NOT applied for MCP tasks)
-
-		t.Logf("MCP task configured with validation rules that should be ignored")
-		t.Logf("Task ExpectedOutput: %s", task.ExpectedOutput)
-		t.Logf("Task ValidationRules: %v", task.ValidationRules)
-		t.Logf("MCP output: %v", output)
-
-		// Note: We can't directly call ExecuteWithRetry without an MCP server
-		// This test documents the expected behavior
-		_ = runner
-		_ = task
-		_ = output
-	})
-
-	t.Run("MCP validation fails with nil output", func(t *testing.T) {
-		// MCP validation should fail if output is nil
-		t.Log("MCP validation should fail when output is nil")
-		t.Log("Expected: Passed=false, Issues=['MCP tool returned nil output']")
-	})
-
-	t.Run("MCP validation fails with empty string output", func(t *testing.T) {
-		// MCP validation should fail if output is empty string
-		t.Log("MCP validation should fail when output is empty string")
-		t.Log("Expected: Passed=false, Issues=['MCP tool returned empty string']")
-	})
-
-	t.Run("MCP validation fails with empty map output", func(t *testing.T) {
-		// MCP validation should fail if output is empty map
-		t.Log("MCP validation should fail when output is empty map")
-		t.Log("Expected: Passed=false, Issues=['MCP tool returned empty object']")
-	})
-
-	t.Run("MCP validation fails with empty array output", func(t *testing.T) {
-		// MCP validation should fail if output is empty array
-		t.Log("MCP validation should fail when output is empty array")
-		t.Log("Expected: Passed=false, Issues=['MCP tool returned empty array']")
-	})
-
-	t.Run("MCP validation passes with any non-empty output", func(t *testing.T) {
-		// MCP validation should pass for any non-empty output
-		// regardless of ExpectedOutput or ValidationRules
-		t.Log("MCP validation should pass when output is non-empty")
-		t.Log("Semantic validation (ExpectedOutput, ValidationRules) should NOT be applied")
-		t.Log("Expected: Passed=true, Complete=true, Score=1.0")
+		assert.False(t, result.Success, "unsupported executor type should fail")
+		assert.Contains(t, result.Error, "unsupported executor type")
+		assert.Nil(t, result.Validation, "V2 does not set Validation in runner")
 	})
 }
 
@@ -599,8 +446,7 @@ func createRunnerTestRobot(t *testing.T) *types.Robot {
 			},
 			Resources: &types.Resources{
 				Phases: map[types.Phase]string{
-					types.PhaseRun: "robot.validation",
-					"validation":   "robot.validation", // For semantic validation agent
+					types.PhaseRun: "robot.run",
 				},
 				Agents: []string{
 					"experts.data-analyst",

@@ -1041,6 +1041,11 @@ func TestJsValueStreamingWorkflow(t *testing.T) {
 	}
 	assert.Equal(t, true, result["success"], "Streaming workflow should work correctly")
 
+	// Close SafeWriter to flush all pending async writes before reading buffer.
+	// SafeWriter processes writes in a background goroutine via channel;
+	// without this, the buffer may still be empty on slow CI runners.
+	cxt.CloseSafeWriter()
+
 	// Verify the complete workflow events
 	output := mockWriter.buffer.String()
 	assert.Contains(t, output, "message_start", "Output should contain message_start")
@@ -1276,6 +1281,11 @@ func TestJsValueSendVsSendStream(t *testing.T) {
 			t.Fatalf("Call failed: %v", err)
 		}
 
+		// Close SafeWriter to flush all pending async writes before reading buffer.
+		// SafeWriter processes writes in a background goroutine via channel;
+		// without this, the buffer may still be empty on slow CI runners.
+		cxt.CloseSafeWriter()
+
 		output := mockWriter.buffer.String()
 		assert.Contains(t, output, "message_start", "Send should emit message_start")
 		assert.Contains(t, output, "message_end", "Send should auto-emit message_end")
@@ -1299,6 +1309,9 @@ func TestJsValueSendVsSendStream(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Call failed: %v", err)
 		}
+
+		// Close SafeWriter to flush all pending async writes before reading buffer.
+		cxt.CloseSafeWriter()
 
 		output := mockWriter.buffer.String()
 		assert.Contains(t, output, "message_start", "SendStream should emit message_start")

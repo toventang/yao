@@ -48,10 +48,13 @@ type Manager interface {
 	MarkComplete() error
 
 	// Subscription Operations
-	// Subscribe subscribes to trace updates (replay history + real-time)
-	Subscribe() (<-chan *TraceUpdate, error)
-	// SubscribeFrom subscribes from a specific timestamp (for resume)
-	SubscribeFrom(since int64) (<-chan *TraceUpdate, error)
+	// Subscribe subscribes to trace updates (replay history + real-time).
+	// Returns the update channel and a cancel function. The caller MUST call
+	// cancel when done (e.g., client disconnect) to release the goroutine.
+	Subscribe() (<-chan *TraceUpdate, func(), error)
+	// SubscribeFrom subscribes from a specific timestamp (for resume).
+	// Returns the update channel and a cancel function.
+	SubscribeFrom(since int64) (<-chan *TraceUpdate, func(), error)
 	// IsComplete checks if the trace is completed
 	IsComplete() bool
 

@@ -4,48 +4,37 @@ import (
 	"fmt"
 	"time"
 
+	robotevents "github.com/yaoapp/yao/agent/robot/events"
 	robottypes "github.com/yaoapp/yao/agent/robot/types"
+	"github.com/yaoapp/yao/event"
 )
 
 // RunConfig configures P3 execution behavior
 type RunConfig struct {
-	// ContinueOnFailure continues to next task even if current task fails (default: false)
+	// ContinueOnFailure continues to next task even if current task fails.
+	// V2 default: true — the Robot is an orchestrator, not a judge.
+	// Failed tasks are recorded and evaluated by the Delivery Agent.
 	ContinueOnFailure bool
-
-	// ValidationThreshold is the minimum score to pass validation (default: 0.6)
-	ValidationThreshold float64
-
-	// MaxTurnsPerTask is the maximum conversation turns for multi-turn tasks (default: 10)
-	// This controls how many times the assistant can be called for a single task
-	// (including retries with validation feedback)
-	MaxTurnsPerTask int
 }
 
 // DefaultRunConfig returns the default P3 configuration
 func DefaultRunConfig() *RunConfig {
 	return &RunConfig{
-		ContinueOnFailure:   false,
-		ValidationThreshold: 0.6,
-		MaxTurnsPerTask:     10,
+		ContinueOnFailure: true,
 	}
 }
 
 // RunExecution executes P3: Run phase
-// Executes each task using the appropriate executor (Assistant, MCP, Process)
-// with multi-turn conversation and validation
+// Executes each task using the appropriate executor (Assistant, MCP, Process).
 //
-// Input:
-//   - Tasks (from P2)
+// V2 simplified flow: single call per task, no validation loop.
+// Success is determined by whether the call itself succeeds (no error).
+// The Delivery Agent (P4) evaluates overall quality using expected_output.
 //
-// Output:
-//   - TaskResult for each task with output and validation
+// Supports resume: if exec.ResumeContext is set, execution starts from the
+// suspended task index with previously completed results restored.
 //
-// Execution Flow (per task):
-//  1. Call assistant/MCP/process and get result
-//  2. Validate result using two-layer validation (rule-based + semantic)
-//  3. If validation.NeedReply, continue conversation with validation.ReplyContent
-//  4. Repeat until validation.Complete or max turns exceeded
-//  5. Pass previous task results as context to next task
+// Returns ErrExecutionSuspended if a task signals it needs human input.
 func (e *Executor) RunExecution(ctx *robottypes.Context, exec *robottypes.Execution, data interface{}) error {
 	robot := exec.GetRobot()
 	if robot == nil {
@@ -67,14 +56,20 @@ func (e *Executor) RunExecution(ctx *robottypes.Context, exec *robottypes.Execut
 	// Determine locale for UI messages
 	locale := getEffectiveLocale(robot, exec.Input)
 
-	// Initialize results slice
-	exec.Results = make([]robottypes.TaskResult, 0, len(exec.Tasks))
+	// Determine start index and restore results from resume context
+	startIndex := 0
+	if exec.ResumeContext != nil {
+		startIndex = exec.ResumeContext.TaskIndex
+		exec.Results = exec.ResumeContext.PreviousResults
+	} else {
+		exec.Results = make([]robottypes.TaskResult, 0, len(exec.Tasks))
+	}
 
-	// Create task runner
-	runner := NewRunner(ctx, robot, config)
+	// Create task runner with execution-level chatID (§8.4)
+	runner := NewRunner(ctx, robot, config, exec.ChatID, exec.ID)
 
-	// Execute tasks sequentially
-	for i := range exec.Tasks {
+	// Execute tasks sequentially from startIndex
+	for i := startIndex; i < len(exec.Tasks); i++ {
 		task := &exec.Tasks[i]
 
 		// Update current state for tracking
@@ -99,19 +94,37 @@ func (e *Executor) RunExecution(ctx *robottypes.Context, exec *robottypes.Execut
 		// Build task context with previous results
 		taskCtx := runner.BuildTaskContext(exec, i)
 
-		// Execute task with multi-turn conversation support
-		result := runner.ExecuteWithRetry(task, taskCtx)
+		// Execute task (single call, no validation loop)
+		result := runner.ExecuteTask(task, taskCtx)
+
+		// Task needs human input — suspend execution without recording a half-result
+		if result.NeedInput {
+			return e.Suspend(ctx, exec, i, result.InputQuestion)
+		}
 
 		// Update task status based on result
 		endTime := time.Now()
 		task.EndTime = &endTime
 
-		// Determine task status from result
-		// Note: result.Success is already set to (validation.Complete && validation.Passed) in runner
 		if result.Success {
 			task.Status = robottypes.TaskCompleted
+			event.Push(ctx.Context, robotevents.TaskCompleted, robotevents.TaskPayload{
+				ExecutionID: exec.ID,
+				MemberID:    exec.MemberID,
+				TeamID:      exec.TeamID,
+				TaskID:      task.ID,
+				ChatID:      exec.ChatID,
+			})
 		} else {
 			task.Status = robottypes.TaskFailed
+			event.Push(ctx.Context, robotevents.TaskFailed, robotevents.TaskPayload{
+				ExecutionID: exec.ID,
+				MemberID:    exec.MemberID,
+				TeamID:      exec.TeamID,
+				TaskID:      task.ID,
+				Error:       result.Error,
+				ChatID:      exec.ChatID,
+			})
 		}
 
 		// Store result
@@ -132,8 +145,9 @@ func (e *Executor) RunExecution(ctx *robottypes.Context, exec *robottypes.Execut
 		}
 	}
 
-	// Clear current state
+	// Clear current state and resume context after successful completion
 	exec.Current = nil
+	exec.ResumeContext = nil
 
 	return nil
 }

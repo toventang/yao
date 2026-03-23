@@ -8,8 +8,10 @@ import (
 	gonanoid "github.com/matoous/go-nanoid/v2"
 	"github.com/yaoapp/gou/model"
 	"github.com/yaoapp/kun/maps"
+	robotevents "github.com/yaoapp/yao/agent/robot/events"
 	"github.com/yaoapp/yao/agent/robot/store"
 	"github.com/yaoapp/yao/agent/robot/types"
+	"github.com/yaoapp/yao/event"
 )
 
 // ==================== Robot Query API ====================
@@ -113,15 +115,15 @@ func GetRobotStatus(ctx *types.Context, memberID string) (*RobotState, error) {
 
 	// Get running execution IDs from ExecutionStore (more reliable than in-memory)
 	// This ensures we get accurate status even when robot is loaded from database
-	runningExecs, err := executionStore.List(context.Background(), &store.ListOptions{
+	runningResult, err := executionStore.List(context.Background(), &store.ListOptions{
 		MemberID: memberID,
 		Status:   types.ExecRunning,
-		Limit:    100,
+		PageSize: 100,
 	})
-	if err == nil && len(runningExecs) > 0 {
-		state.Running = len(runningExecs)
-		state.RunningIDs = make([]string, 0, len(runningExecs))
-		for _, exec := range runningExecs {
+	if err == nil && runningResult != nil && len(runningResult.Data) > 0 {
+		state.Running = len(runningResult.Data)
+		state.RunningIDs = make([]string, 0, len(runningResult.Data))
+		for _, exec := range runningResult.Data {
 			state.RunningIDs = append(state.RunningIDs, exec.ExecutionID)
 		}
 		// Update status based on running count
@@ -167,7 +169,7 @@ func loadRobotFromDB(memberID string) (*types.Robot, error) {
 			"id", "member_id", "team_id", "display_name", "bio",
 			"system_prompt", "robot_status", "autonomous_mode",
 			"robot_config", "robot_email", "agents", "mcp_servers",
-			"manager_id",
+			"manager_id", "language_model",
 		},
 		Wheres: []model.QueryWhere{
 			{Column: "member_id", Value: memberID},
@@ -230,6 +232,7 @@ func listRobotsFromDB(query *ListQuery) (*ListResult, error) {
 			"id", "member_id", "team_id", "display_name", "bio",
 			"system_prompt", "robot_status", "autonomous_mode",
 			"robot_config", "robot_email", "agents", "mcp_servers",
+			"language_model",
 		},
 		Wheres: wheres,
 		Orders: orders,
@@ -419,6 +422,12 @@ func CreateRobot(ctx *types.Context, req *CreateRobotRequest) (*RobotResponse, e
 		_ = mgr.Cache().Refresh(ctx, req.MemberID)
 	}
 
+	// Notify integrations of new robot config
+	event.Push(context.Background(), robotevents.RobotConfigCreated, robotevents.RobotConfigPayload{
+		MemberID: req.MemberID,
+		TeamID:   req.TeamID,
+	})
+
 	// Return the created robot as response
 	return GetRobotResponse(ctx, req.MemberID)
 }
@@ -531,6 +540,12 @@ func UpdateRobot(ctx *types.Context, memberID string, req *UpdateRobotRequest) (
 		_ = mgr.Cache().Refresh(ctx, memberID) // Ignore error, database is already saved
 	}
 
+	// Notify integrations of updated robot config
+	event.Push(context.Background(), robotevents.RobotConfigUpdated, robotevents.RobotConfigPayload{
+		MemberID: memberID,
+		TeamID:   existing.TeamID,
+	})
+
 	// Return the updated robot as response
 	return GetRobotResponse(ctx, memberID)
 }
@@ -570,6 +585,12 @@ func RemoveRobot(ctx *types.Context, memberID string) error {
 	if mgr != nil {
 		mgr.Cache().Remove(memberID)
 	}
+
+	// Notify integrations of deleted robot config
+	event.Push(context.Background(), robotevents.RobotConfigDeleted, robotevents.RobotConfigPayload{
+		MemberID: memberID,
+		TeamID:   existing.TeamID,
+	})
 
 	return nil
 }

@@ -6,6 +6,7 @@ package manager_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -545,6 +546,10 @@ func (e *slowExecutor) ExecCount() int {
 
 func (e *slowExecutor) CurrentCount() int {
 	return int(atomic.LoadInt32(&e.current))
+}
+
+func (e *slowExecutor) Resume(ctx *types.Context, execID string, reply string) error {
+	return fmt.Errorf("resume not supported in slow executor")
 }
 
 func (e *slowExecutor) Reset() {

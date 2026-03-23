@@ -181,8 +181,8 @@ func TestHasSandboxMethod(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, astWithSandbox.HasSandbox(), "Assistant with sandbox config should return true")
 
-	// Test assistant without sandbox (fullfields doesn't have sandbox)
-	astWithoutSandbox, err := assistant.LoadPath("/assistants/tests/fullfields")
+	// Test assistant without sandbox
+	astWithoutSandbox, err := assistant.LoadPath("/assistants/tests/simple-greeting")
 	require.NoError(t, err)
 	assert.False(t, astWithoutSandbox.HasSandbox(), "Assistant without sandbox config should return false")
 }

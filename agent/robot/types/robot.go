@@ -21,7 +21,8 @@ type Robot struct {
 	SystemPrompt   string      `json:"system_prompt"`
 	Status         RobotStatus `json:"robot_status"`
 	AutonomousMode bool        `json:"autonomous_mode"`
-	RobotEmail     string      `json:"robot_email"` // Robot's email address for sending emails
+	RobotEmail     string      `json:"robot_email"`    // Robot's email address for sending emails
+	LanguageModel  string      `json:"language_model"` // LLM connector override (from __yao.member.language_model)
 
 	// Manager info (from __yao.member)
 	ManagerID    string `json:"manager_id"`    // Direct manager user_id (who manages this robot)
@@ -109,7 +110,7 @@ func (r *Robot) GetExecution(execID string) *Execution {
 	return r.executions[execID]
 }
 
-// GetExecutions returns all running executions
+// GetExecutions returns all tracked executions
 func (r *Robot) GetExecutions() []*Execution {
 	r.execMu.RLock()
 	defer r.execMu.RUnlock()
@@ -118,6 +119,66 @@ func (r *Robot) GetExecutions() []*Execution {
 		execs = append(execs, exec)
 	}
 	return execs
+}
+
+// ActiveCount returns the number of actively running executions
+func (r *Robot) ActiveCount() int {
+	r.execMu.RLock()
+	defer r.execMu.RUnlock()
+	count := 0
+	for _, exec := range r.executions {
+		if exec.Status == ExecRunning {
+			count++
+		}
+	}
+	return count
+}
+
+// WaitingCount returns the number of executions waiting for human input
+func (r *Robot) WaitingCount() int {
+	r.execMu.RLock()
+	defer r.execMu.RUnlock()
+	count := 0
+	for _, exec := range r.executions {
+		if exec.Status == ExecWaiting {
+			count++
+		}
+	}
+	return count
+}
+
+// ListExecutionBriefs returns brief summaries of all tracked executions
+func (r *Robot) ListExecutionBriefs() []ExecBrief {
+	r.execMu.RLock()
+	defer r.execMu.RUnlock()
+	briefs := make([]ExecBrief, 0, len(r.executions))
+	for _, exec := range r.executions {
+		brief := ExecBrief{
+			ID:        exec.ID,
+			Status:    exec.Status,
+			Phase:     exec.Phase,
+			Name:      exec.Name,
+			StartTime: exec.StartTime,
+			TaskCount: len(exec.Tasks),
+		}
+		for _, result := range exec.Results {
+			if result.Success {
+				brief.DoneCount++
+			} else {
+				brief.FailedCount++
+			}
+		}
+		briefs = append(briefs, brief)
+	}
+	return briefs
+}
+
+// MaxQuota returns the maximum concurrent execution quota
+func (r *Robot) MaxQuota() int {
+	if r.Config == nil {
+		return 2
+	}
+	return r.Config.Quota.GetMax()
 }
 
 // Execution - single execution instance
@@ -134,7 +195,6 @@ type Execution struct {
 	Error       string      `json:"error,omitempty"`
 
 	// UI display fields (updated by executor at each phase)
-	// These provide human-readable status for frontend display
 	Name            string `json:"name,omitempty"`              // Execution title (updated when goals complete)
 	CurrentTaskName string `json:"current_task_name,omitempty"` // Current task description (updated during run phase)
 
@@ -150,10 +210,47 @@ type Execution struct {
 	Delivery    *DeliveryResult    `json:"delivery,omitempty"`
 	Learning    []LearningEntry    `json:"learning,omitempty"`
 
+	// V2: Conversation and suspend-resume fields
+	ChatID          string         `json:"chat_id,omitempty"`          // Unique conversation ID for Host Agent
+	WaitingTaskID   string         `json:"waiting_task_id,omitempty"`  // Task ID that is waiting for input
+	WaitingQuestion string         `json:"waiting_question,omitempty"` // Question posed to human
+	WaitingSince    *time.Time     `json:"waiting_since,omitempty"`    // When execution was suspended
+	ResumeContext   *ResumeContext `json:"resume_context,omitempty"`   // State for resuming suspended execution
+
 	// Runtime (internal, not serialized)
 	ctx    context.Context    `json:"-"`
 	cancel context.CancelFunc `json:"-"`
 	robot  *Robot             `json:"-"`
+}
+
+// ResumeContext holds the state needed to resume a suspended execution
+type ResumeContext struct {
+	TaskIndex       int          `json:"task_index"`       // Index of the task to resume from
+	PreviousResults []TaskResult `json:"previous_results"` // Results from tasks completed before suspend
+}
+
+// ExecBrief is a lightweight summary of an execution for status snapshots
+type ExecBrief struct {
+	ID          string     `json:"id"`
+	Status      ExecStatus `json:"status"`
+	Phase       Phase      `json:"phase"`
+	Name        string     `json:"name,omitempty"`
+	StartTime   time.Time  `json:"start_time"`
+	TaskCount   int        `json:"task_count"`
+	DoneCount   int        `json:"done_count"`
+	FailedCount int        `json:"failed_count"`
+}
+
+// RobotStatusSnapshot provides real-time robot status for the Host Agent
+type RobotStatusSnapshot struct {
+	MemberID     string      `json:"member_id,omitempty"`    // Robot member ID
+	Status       RobotStatus `json:"status,omitempty"`       // Current robot status (idle/working)
+	ActiveCount  int         `json:"active_count"`           // Currently running executions
+	WaitingCount int         `json:"waiting_count"`          // Executions waiting for input
+	QueuedCount  int         `json:"queued_count"`           // Executions in queue (not yet started)
+	MaxQuota     int         `json:"max_quota"`              // Maximum concurrent executions
+	ActiveExecs  []ExecBrief `json:"active_execs,omitempty"` // Currently running execution summaries
+	RecentExecs  []ExecBrief `json:"recent_execs,omitempty"` // Recently completed execution summaries
 }
 
 // GetRobot returns the robot associated with this execution
@@ -256,8 +353,12 @@ type TaskResult struct {
 	Error    string      `json:"error,omitempty"`
 	Duration int64       `json:"duration_ms"`
 
-	// Validation result (populated by P3)
+	// Validation result (populated by Delivery Agent in P4, not by runner in V2)
 	Validation *ValidationResult `json:"validation,omitempty"`
+
+	// V2: Need-input signal from assistant (detected via Next Hook protocol)
+	NeedInput     bool   `json:"need_input,omitempty"`     // Assistant requests human input
+	InputQuestion string `json:"input_question,omitempty"` // Question for the human
 }
 
 // ValidationResult - P3 semantic validation result
@@ -399,6 +500,7 @@ func NewRobotFromMap(m map[string]interface{}) (*Robot, error) {
 		RobotEmail:     getString(m, "robot_email"),
 		ManagerID:      getString(m, "manager_id"),
 		ManagerEmail:   getString(m, "manager_email"),
+		LanguageModel:  getString(m, "language_model"),
 	}
 
 	// Parse robot_status

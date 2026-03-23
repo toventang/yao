@@ -66,12 +66,14 @@
 // 7. Starts V8 JavaScript runtime
 // 8. Registers query engines for database operations
 // 9. Creates temporary data directories for test isolation
+// 10. Starts the Event Service (handlers registered via init(), e.g. trace)
 //
 // WHAT test.Clean() DOES:
-// 1. Stops V8 runtime and releases resources
-// 2. Closes all database connections
-// 3. Removes temporary test data stores
-// 4. Resets global state to prevent test interference
+// 1. Stops the Event Service (drains in-flight events)
+// 2. Stops V8 runtime and releases resources
+// 3. Closes all database connections
+// 4. Removes temporary test data stores
+// 5. Resets global state to prevent test interference
 //
 // WHAT test.Start() DOES:
 // 1. Creates Gin HTTP server with API routes
@@ -159,6 +161,7 @@
 package test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -184,11 +187,14 @@ import (
 	"github.com/yaoapp/xun/capsule"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/data"
+	"github.com/yaoapp/yao/event"
 	"github.com/yaoapp/yao/fs"
 	"github.com/yaoapp/yao/helper"
 	"github.com/yaoapp/yao/runtime"
 	"github.com/yaoapp/yao/share"
 	"github.com/yaoapp/yao/utils"
+
+	_ "github.com/yaoapp/yao/trace" // register trace event handler via init()
 )
 
 var testServer *http.Server = nil
@@ -488,10 +494,15 @@ func Prepare(t *testing.T, cfg config.Config, opts ...interface{}) {
 	load(t, cfg)
 	startRuntime(t, cfg)
 
+	// Start event service (trace handler registered via blank import above)
+	if err := event.Start(); err != nil && err != event.ErrAlreadyStart {
+		t.Fatalf("Failed to start event service: %v", err)
+	}
 }
 
 // Clean the test environment
 func Clean() {
+	event.Stop(context.Background())
 	dbclose()
 	runtime.Stop()
 

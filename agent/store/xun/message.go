@@ -140,19 +140,25 @@ func (store *Xun) GetMessages(chatID string, filter types.MessageFilter) ([]*typ
 		qb.Where("type", filter.Type)
 	}
 
-	// Apply pagination (MySQL requires LIMIT when using OFFSET)
-	if filter.Limit > 0 {
+	// When Limit is specified WITHOUT Offset, we want the N most-recent
+	// messages.  Strategy: query DESC to get the latest rows, then reverse
+	// the slice so the caller receives them in chronological (ASC) order.
+	// When Offset is also present, the caller is doing forward pagination,
+	// so we keep ASC order and apply Limit+Offset normally.
+	needReverse := false
+	if filter.Limit > 0 && filter.Offset <= 0 {
 		qb.Limit(filter.Limit)
+		qb.OrderBy("id", "desc")
+		needReverse = true
+	} else if filter.Limit > 0 && filter.Offset > 0 {
+		qb.Limit(filter.Limit).Offset(filter.Offset)
+		qb.OrderBy("id", "asc")
+	} else {
 		if filter.Offset > 0 {
-			qb.Offset(filter.Offset)
+			qb.Limit(1000000).Offset(filter.Offset)
 		}
-	} else if filter.Offset > 0 {
-		// If only offset is specified, use a large limit
-		qb.Limit(1000000).Offset(filter.Offset)
+		qb.OrderBy("id", "asc")
 	}
-
-	// Order by created_at first, then by sequence within the same request
-	qb.OrderBy("created_at", "asc").OrderBy("sequence", "asc")
 
 	rows, err := qb.Get()
 	if err != nil {
@@ -171,6 +177,12 @@ func (store *Xun) GetMessages(chatID string, filter types.MessageFilter) ([]*typ
 			continue
 		}
 		messages = append(messages, msg)
+	}
+
+	if needReverse {
+		for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+			messages[i], messages[j] = messages[j], messages[i]
+		}
 	}
 
 	return messages, nil

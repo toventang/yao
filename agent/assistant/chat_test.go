@@ -815,6 +815,117 @@ func TestEnsureChat(t *testing.T) {
 	})
 }
 
+// TestEnsureChatMetadata verifies that ctx.Metadata is persisted to the chat record.
+// This is required for Host Agent: robot_id is passed in metadata so that
+// ListChats with chat_id_prefix=robot_{id}_ can filter by robot.
+func TestEnsureChatMetadata(t *testing.T) {
+	testutils.Prepare(t)
+	defer testutils.Clean(t)
+
+	ast, err := assistant.Get("mohe")
+	require.NoError(t, err)
+
+	chatStore := assistant.GetChatStore()
+	if chatStore == nil {
+		t.Skip("Chat store not configured, skipping metadata tests")
+	}
+
+	t.Run("MetadataPersisted", func(t *testing.T) {
+		chatID := fmt.Sprintf("robot_test_meta_%s", uuid.New().String()[:8])
+		ctx := agentcontext.New(context.Background(), &oauthtypes.AuthorizedInfo{
+			UserID: "test_user_meta",
+			TeamID: "test_team_meta",
+		}, chatID)
+		ctx.Metadata = map[string]interface{}{
+			"robot_id": "robot_member_001",
+		}
+
+		err := ast.EnsureChat(ctx)
+		require.NoError(t, err)
+
+		chat, err := chatStore.GetChat(chatID)
+		require.NoError(t, err)
+		require.NotNil(t, chat)
+		require.NotNil(t, chat.Metadata, "Metadata should be persisted")
+		assert.Equal(t, "robot_member_001", chat.Metadata["robot_id"],
+			"robot_id should be stored in chat metadata")
+
+		// Cleanup
+		chatStore.DeleteChat(chatID)
+		t.Logf("✓ Chat metadata persisted: robot_id=%v", chat.Metadata["robot_id"])
+	})
+
+	t.Run("MetadataPersistedWithRobotChatIDPrefix", func(t *testing.T) {
+		// Simulate robot host chat_id format: robot_{member_id}_{timestamp}
+		memberID := "120004485525"
+		chatID := fmt.Sprintf("robot_%s_%d", memberID, time.Now().UnixMilli())
+		ctx := agentcontext.New(context.Background(), &oauthtypes.AuthorizedInfo{
+			UserID: "test_user_robot",
+			TeamID: "test_team_robot",
+		}, chatID)
+		ctx.Metadata = map[string]interface{}{
+			"robot_id": memberID,
+		}
+
+		err := ast.EnsureChat(ctx)
+		require.NoError(t, err)
+
+		chat, err := chatStore.GetChat(chatID)
+		require.NoError(t, err)
+		require.NotNil(t, chat)
+		require.NotNil(t, chat.Metadata)
+		assert.Equal(t, memberID, chat.Metadata["robot_id"])
+
+		// Cleanup
+		chatStore.DeleteChat(chatID)
+		t.Logf("✓ Robot-prefix chat persisted with metadata: chat_id=%s", chatID)
+	})
+
+	t.Run("NilMetadataHandled", func(t *testing.T) {
+		chatID := fmt.Sprintf("test_meta_nil_%s", uuid.New().String()[:8])
+		ctx := agentcontext.New(context.Background(), nil, chatID)
+		ctx.Metadata = nil
+
+		err := ast.EnsureChat(ctx)
+		assert.NoError(t, err)
+
+		chat, err := chatStore.GetChat(chatID)
+		require.NoError(t, err)
+		require.NotNil(t, chat)
+		// Metadata nil is acceptable
+		t.Logf("✓ Nil metadata handled gracefully")
+
+		// Cleanup
+		chatStore.DeleteChat(chatID)
+	})
+
+	t.Run("MetadataMultipleFields", func(t *testing.T) {
+		chatID := fmt.Sprintf("test_meta_multi_%s", uuid.New().String()[:8])
+		ctx := agentcontext.New(context.Background(), &oauthtypes.AuthorizedInfo{
+			UserID: "test_user_multi",
+			TeamID: "test_team_multi",
+		}, chatID)
+		ctx.Metadata = map[string]interface{}{
+			"robot_id": "robot_multi_001",
+			"source":   "mission_control",
+		}
+
+		err := ast.EnsureChat(ctx)
+		require.NoError(t, err)
+
+		chat, err := chatStore.GetChat(chatID)
+		require.NoError(t, err)
+		require.NotNil(t, chat)
+		require.NotNil(t, chat.Metadata)
+		assert.Equal(t, "robot_multi_001", chat.Metadata["robot_id"])
+		assert.Equal(t, "mission_control", chat.Metadata["source"])
+
+		// Cleanup
+		chatStore.DeleteChat(chatID)
+		t.Logf("✓ Multiple metadata fields persisted correctly")
+	})
+}
+
 func TestConvertBufferedTypes(t *testing.T) {
 	t.Run("ConvertBufferedMessages", func(t *testing.T) {
 		// Create buffered messages

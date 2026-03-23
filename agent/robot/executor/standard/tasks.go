@@ -17,6 +17,11 @@ import (
 // Output:
 //   - List of Task objects with executor assignments, expected outputs, and validation rules
 func (e *Executor) RunTasks(ctx *robottypes.Context, exec *robottypes.Execution, _ interface{}) error {
+	// §18.2: confirming phase may have already populated Tasks — skip regeneration
+	if len(exec.Tasks) > 0 {
+		return nil
+	}
+
 	// Get robot for resources
 	robot := exec.GetRobot()
 	if robot == nil {
@@ -48,6 +53,8 @@ func (e *Executor) RunTasks(ctx *robottypes.Context, exec *robottypes.Execution,
 
 	// Call agent
 	caller := NewAgentCaller()
+	caller.log = newExecLogger(robot, exec.ID)
+	caller.Connector = robot.LanguageModel
 	result, err := caller.CallWithMessages(ctx, agentID, userContent)
 	if err != nil {
 		return fmt.Errorf("tasks agent (%s) call failed: %w", agentID, err)
@@ -78,6 +85,11 @@ func (e *Executor) RunTasks(ctx *robottypes.Context, exec *robottypes.Execution,
 	}
 
 	exec.Tasks = tasks
+
+	// Log task overview for developer observability
+	el := newExecLogger(robot, exec.ID)
+	el.logTaskOverview(tasks)
+
 	return nil
 }
 

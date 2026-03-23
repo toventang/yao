@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/yaoapp/yao/agent/assistant"
+	"github.com/yaoapp/yao/agent/types"
 	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/test"
 )
@@ -52,12 +53,6 @@ func TestLoad(t *testing.T) {
 
 		// Content should contain system context info (with variables not yet parsed)
 		assert.Contains(t, agent.GlobalPrompts[0].Content, "$SYS.")
-	})
-
-	t.Run("LoadModelCapabilities", func(t *testing.T) {
-		// Model capabilities should be loaded from agent/models.yml
-		assert.NotNil(t, agent.Models)
-		assert.Greater(t, len(agent.Models), 0)
 	})
 
 	t.Run("LoadKBConfig", func(t *testing.T) {
@@ -214,6 +209,112 @@ func TestGetGlobalPromptsWithDisableFlag(t *testing.T) {
 
 		// Global prompts should still be available
 		// The assistant decides whether to use them based on DisableGlobalPrompts flag
+	})
+}
+
+func TestResolveEnvStrings(t *testing.T) {
+	t.Setenv("TEST_CONNECTOR", "openai.gpt-5")
+	t.Setenv("TEST_ASSISTANT", "my-assistant")
+	t.Setenv("TEST_CACHE", "my-cache")
+
+	t.Run("SystemFields", func(t *testing.T) {
+		setting := &types.DSL{
+			System: &types.System{
+				Default:     "$ENV.TEST_CONNECTOR",
+				Keyword:     "$ENV.TEST_CONNECTOR",
+				QueryDSL:    "$ENV.TEST_CONNECTOR",
+				Title:       "$ENV.TEST_CONNECTOR",
+				Prompt:      "$ENV.TEST_CONNECTOR",
+				RobotPrompt: "$ENV.TEST_CONNECTOR",
+				NeedSearch:  "$ENV.TEST_CONNECTOR",
+				Entity:      "$ENV.TEST_CONNECTOR",
+			},
+		}
+		resolveEnvStrings(setting)
+
+		assert.Equal(t, "openai.gpt-5", setting.System.Default)
+		assert.Equal(t, "openai.gpt-5", setting.System.Keyword)
+		assert.Equal(t, "openai.gpt-5", setting.System.QueryDSL)
+		assert.Equal(t, "openai.gpt-5", setting.System.Title)
+		assert.Equal(t, "openai.gpt-5", setting.System.Prompt)
+		assert.Equal(t, "openai.gpt-5", setting.System.RobotPrompt)
+		assert.Equal(t, "openai.gpt-5", setting.System.NeedSearch)
+		assert.Equal(t, "openai.gpt-5", setting.System.Entity)
+	})
+
+	t.Run("UsesFields", func(t *testing.T) {
+		setting := &types.DSL{
+			Uses: &types.Uses{
+				Default:     "$ENV.TEST_ASSISTANT",
+				Title:       "$ENV.TEST_ASSISTANT",
+				Prompt:      "$ENV.TEST_ASSISTANT",
+				RobotPrompt: "$ENV.TEST_ASSISTANT",
+				Vision:      "$ENV.TEST_ASSISTANT",
+				Audio:       "$ENV.TEST_ASSISTANT",
+				Search:      "$ENV.TEST_ASSISTANT",
+				Fetch:       "$ENV.TEST_ASSISTANT",
+				Web:         "$ENV.TEST_ASSISTANT",
+				Keyword:     "$ENV.TEST_ASSISTANT",
+				QueryDSL:    "$ENV.TEST_ASSISTANT",
+				Rerank:      "$ENV.TEST_ASSISTANT",
+			},
+		}
+		resolveEnvStrings(setting)
+
+		assert.Equal(t, "my-assistant", setting.Uses.Default)
+		assert.Equal(t, "my-assistant", setting.Uses.Title)
+		assert.Equal(t, "my-assistant", setting.Uses.Prompt)
+		assert.Equal(t, "my-assistant", setting.Uses.RobotPrompt)
+		assert.Equal(t, "my-assistant", setting.Uses.Vision)
+		assert.Equal(t, "my-assistant", setting.Uses.Audio)
+		assert.Equal(t, "my-assistant", setting.Uses.Search)
+		assert.Equal(t, "my-assistant", setting.Uses.Fetch)
+		assert.Equal(t, "my-assistant", setting.Uses.Web)
+		assert.Equal(t, "my-assistant", setting.Uses.Keyword)
+		assert.Equal(t, "my-assistant", setting.Uses.QueryDSL)
+		assert.Equal(t, "my-assistant", setting.Uses.Rerank)
+	})
+
+	t.Run("CacheField", func(t *testing.T) {
+		setting := &types.DSL{Cache: "$ENV.TEST_CACHE"}
+		resolveEnvStrings(setting)
+		assert.Equal(t, "my-cache", setting.Cache)
+	})
+
+	t.Run("PlainStringsUnchanged", func(t *testing.T) {
+		setting := &types.DSL{
+			Cache: "plain-cache",
+			System: &types.System{
+				Default: "openai.gpt-5",
+			},
+			Uses: &types.Uses{
+				Default: "mohe",
+				Title:   "__yao.title",
+			},
+		}
+		resolveEnvStrings(setting)
+
+		assert.Equal(t, "plain-cache", setting.Cache)
+		assert.Equal(t, "openai.gpt-5", setting.System.Default)
+		assert.Equal(t, "mohe", setting.Uses.Default)
+		assert.Equal(t, "__yao.title", setting.Uses.Title)
+	})
+
+	t.Run("NilSystemAndUses", func(t *testing.T) {
+		setting := &types.DSL{Cache: "test"}
+		assert.NotPanics(t, func() {
+			resolveEnvStrings(setting)
+		})
+	})
+
+	t.Run("UndefinedEnvReturnsEmpty", func(t *testing.T) {
+		setting := &types.DSL{
+			System: &types.System{
+				Default: "$ENV.UNDEFINED_VAR_12345",
+			},
+		}
+		resolveEnvStrings(setting)
+		assert.Equal(t, "", setting.System.Default)
 	})
 }
 

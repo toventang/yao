@@ -19,6 +19,46 @@ type Config struct {
 	Events        []Event              `json:"events,omitempty"`
 	Executor      *ExecutorConfig      `json:"executor,omitempty"`       // executor mode settings
 	DefaultLocale string               `json:"default_locale,omitempty"` // default language for clock/event triggers ("en", "zh")
+	Integrations  *Integrations        `json:"integrations,omitempty"`   // external channel integrations (telegram, etc.)
+}
+
+// Integrations holds configuration for external platform integrations.
+type Integrations struct {
+	Telegram *TelegramConfig `json:"telegram,omitempty"`
+	Feishu   *FeishuConfig   `json:"feishu,omitempty"`
+	DingTalk *DingTalkConfig `json:"dingtalk,omitempty"`
+	Discord  *DiscordConfig  `json:"discord,omitempty"`
+}
+
+// TelegramConfig holds Telegram Bot integration settings.
+type TelegramConfig struct {
+	Enabled       bool   `json:"enabled"`
+	BotToken      string `json:"bot_token"`
+	Host          string `json:"host,omitempty"`           // custom Bot API server, defaults to https://api.telegram.org
+	AppID         string `json:"app_id,omitempty"`         // auto-generated, used for webhook URL routing
+	ChatID        string `json:"chat_id,omitempty"`        // default reply chat
+	WebhookSecret string `json:"webhook_secret,omitempty"` // sent with SetWebhook, verified on incoming webhooks
+}
+
+// FeishuConfig holds Feishu (Lark) Bot integration settings.
+type FeishuConfig struct {
+	Enabled   bool   `json:"enabled"`
+	AppID     string `json:"app_id"`
+	AppSecret string `json:"app_secret"`
+}
+
+// DingTalkConfig holds DingTalk Bot integration settings.
+type DingTalkConfig struct {
+	Enabled      bool   `json:"enabled"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// DiscordConfig holds Discord Bot integration settings.
+type DiscordConfig struct {
+	Enabled  bool   `json:"enabled"`
+	BotToken string `json:"bot_token"`
+	AppID    string `json:"app_id,omitempty"`
 }
 
 // ExecutorConfig - executor settings

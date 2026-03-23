@@ -1,7 +1,14 @@
 package openapi
 
 import (
+	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/gin-gonic/gin"
+	"github.com/yaoapp/yao/config"
 	"github.com/yaoapp/yao/share"
 )
 
@@ -35,8 +42,14 @@ type YaoMetadata struct {
 	OpenAPI   string `json:"openapi"`              // OpenAPI base URL (e.g., "/v1")
 	IssuerURL string `json:"issuer_url,omitempty"` // OAuth issuer URL
 
+	// Public server URL — the externally accessible base URL for this instance.
+	// Clients, proxies, and integrations should use this to construct API endpoints.
+	// Set via env YAO_SERVER_URL; falls back to issuer_url (stripped of path), then empty.
+	ServerURL string `json:"server_url,omitempty"`
+
 	// Dashboard configuration
 	Dashboard string                 `json:"dashboard,omitempty"` // Admin dashboard root path
+	GRPC      string                 `json:"grpc,omitempty"`      // gRPC server address (e.g., "127.0.0.1:9099")
 	Optional  map[string]interface{} `json:"optional,omitempty"`  // Optional settings
 
 	// Developer information
@@ -57,7 +70,9 @@ func (openapi *OpenAPI) yaoMetadata(c *gin.Context) {
 		Description: share.App.Description,
 		OpenAPI:     openapi.Config.BaseURL,
 		IssuerURL:   openapi.Config.OAuth.IssuerURL,
+		ServerURL:   resolveServerURL(openapi.Config.OAuth.IssuerURL),
 		Dashboard:   "/" + dashboard,
+		GRPC:        resolveGRPCAddr(c),
 		Optional:    share.App.Optional,
 	}
 
@@ -69,8 +84,76 @@ func (openapi *OpenAPI) yaoMetadata(c *gin.Context) {
 	c.JSON(200, metadata)
 }
 
+// resolveServerURL returns the public server URL for this instance.
+// Priority: YAO_SERVER_URL env > issuer_url origin > empty string.
+func resolveServerURL(issuerURL string) string {
+	if v := strings.TrimRight(os.Getenv("YAO_SERVER_URL"), "/"); v != "" {
+		return v
+	}
+	// Strip path from issuer_url to get just the origin (scheme + host + port)
+	if issuerURL != "" {
+		if idx := strings.Index(issuerURL, "://"); idx != -1 {
+			rest := issuerURL[idx+3:]
+			if slash := strings.Index(rest, "/"); slash != -1 {
+				return issuerURL[:idx+3] + rest[:slash]
+			}
+		}
+		return issuerURL
+	}
+	return ""
+}
+
+// resolveGRPCAddr returns the gRPC server address for client discovery.
+//
+// When the listen host includes "internal", "0.0.0.0", or multiple addresses,
+// the returned address uses the IP from the incoming HTTP request — if the
+// client could reach Yao's HTTP port via that IP, gRPC on the same IP should
+// also be reachable. "localhost" is treated as "127.0.0.1".
+func resolveGRPCAddr(c *gin.Context) string {
+	cfg := config.Conf.GRPC
+	if strings.ToLower(cfg.Enabled) == "off" {
+		return ""
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = 9099
+	}
+
+	host := cfg.Host
+	useRequestIP := host == "" || host == "0.0.0.0" ||
+		strings.Contains(host, ",") ||
+		config.HostHasInternal(host)
+
+	if useRequestIP {
+		reqHost := c.Request.Host
+		h, _, err := net.SplitHostPort(reqHost)
+		if err != nil {
+			h = reqHost
+		}
+		if strings.ToLower(h) == "localhost" {
+			h = "127.0.0.1"
+		}
+		host = h
+	} else if strings.ToLower(strings.TrimSpace(host)) == "localhost" {
+		host = "127.0.0.1"
+	}
+
+	return fmt.Sprintf("%s:%s", host, strconv.Itoa(port))
+}
+
 // oauthServerMetadata returns authorization server metadata - RFC 8414
-func (openapi *OpenAPI) oauthServerMetadata(c *gin.Context) {}
+func (openapi *OpenAPI) oauthServerMetadata(c *gin.Context) {
+	if openapi.OAuth == nil {
+		c.JSON(503, gin.H{"error": "OAuth service not available"})
+		return
+	}
+	metadata, err := openapi.OAuth.GetServerMetadata(c.Request.Context())
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, metadata)
+}
 
 // oauthOpenIDConfiguration returns OpenID Connect configuration
 func (openapi *OpenAPI) oauthOpenIDConfiguration(c *gin.Context) {}

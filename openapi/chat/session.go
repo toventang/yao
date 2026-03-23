@@ -456,6 +456,7 @@ func buildChatFilter(c *gin.Context, authInfo *oauthtypes.AuthorizedInfo) storet
 	filter.AssistantID = strings.TrimSpace(c.Query("assistant_id"))
 	filter.Status = strings.TrimSpace(c.Query("status"))
 	filter.Keywords = strings.TrimSpace(c.Query("keywords"))
+	filter.ChatIDPrefix = strings.TrimSpace(c.Query("chat_id_prefix"))
 
 	// Time range filter
 	if startTimeStr := c.Query("start_time"); startTimeStr != "" {

@@ -31,18 +31,23 @@ func processPing(process *process.Process) interface{} {
 	res := map[string]interface{}{
 		"engine":  share.BUILDNAME,
 		"version": share.VERSION,
+		"root":    config.Conf.Root,
 	}
 	return res
 }
 
 // processInspect 返回系统信息
 func processInspect(process *process.Process) interface{} {
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"VERSION":   fmt.Sprintf("%s %s", share.VERSION, share.PRVERSION),
 		"CUI":       fmt.Sprintf("%s %s", share.CUI, share.PRCUI),
 		"BUILDNAME": share.BUILDNAME,
 		"CONFIG":    config.Conf,
 	}
+	if share.Tools != nil {
+		result["TOOLS"] = share.Tools
+	}
+	return result
 }
 
 // processFavicon 运行模型 MustCreate

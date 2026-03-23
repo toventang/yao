@@ -58,13 +58,14 @@ func handleStreamMode(c *gin.Context, manager types.Manager, info *types.TraceIn
 	c.Header("X-Accel-Buffering", "no")
 
 	// Subscribe to trace updates
-	updates, err := manager.Subscribe()
+	updates, cancel, err := manager.Subscribe()
 	if err != nil {
 		// Send error as SSE event
 		fmt.Fprintf(c.Writer, "event: error\ndata: {\"error\":\"Failed to subscribe: %s\"}\n\n", err.Error())
 		c.Writer.Flush()
 		return
 	}
+	defer cancel()
 
 	// Stream events
 	ctx := c.Request.Context()
@@ -73,22 +74,18 @@ func handleStreamMode(c *gin.Context, manager types.Manager, info *types.TraceIn
 	for {
 		select {
 		case <-clientGone:
-			// Client disconnected
 			return
 
 		case update, ok := <-updates:
 			if !ok {
-				// Channel closed
 				return
 			}
 
-			// Format and send SSE event
 			err := sendSSEEvent(c.Writer, *update)
 			if err != nil {
 				return
 			}
 
-			// Check if trace is complete
 			if update.Type == types.UpdateTypeComplete {
 				return
 			}

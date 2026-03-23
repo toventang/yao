@@ -5,8 +5,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yaoapp/gou/connector"
-	"github.com/yaoapp/gou/connector/openai"
-	"github.com/yaoapp/yao/agent"
 	agentllm "github.com/yaoapp/yao/agent/llm"
 	oauthTypes "github.com/yaoapp/yao/openapi/oauth/types"
 	"github.com/yaoapp/yao/openapi/response"
@@ -19,16 +17,6 @@ type Provider struct {
 	Type         string                 `json:"type"`         // "openai"
 	Builtin      bool                   `json:"builtin"`      // true for system built-in, false for user-defined
 	Capabilities map[string]interface{} `json:"capabilities"` // Model capabilities from connector settings
-}
-
-// getModelCapabilities returns user-defined model capabilities from agent DSL
-// Returns nil if agent not initialized or no models configured
-func getModelCapabilities() map[string]openai.Capabilities {
-	agentDSL := agent.GetAgent()
-	if agentDSL != nil && agentDSL.Models != nil {
-		return agentDSL.Models
-	}
-	return nil
 }
 
 // Attach attaches the LLM management handlers to the router with OAuth protection
@@ -56,23 +44,15 @@ func listProviders(c *gin.Context) {
 		}
 	}
 
-	// Get user-defined model capabilities once at the start of request
-	modelCapabilities := getModelCapabilities()
-
-	// Get all OpenAI-compatible LLM connectors from AIConnectors
-	// Note: All openai type connectors are automatically added to AIConnectors during loading
-	// See gou/connector/connector.go LoadSource() for details
 	for _, opt := range connector.AIConnectors {
 		connType := getConnectorType(opt.Value)
-		// Only include OpenAI-compatible LLM connectors
-		if connType == "openai" {
+		if connType == "openai" || connType == "anthropic" {
 			conn, ok := connector.Connectors[opt.Value]
 			if !ok {
 				continue
 			}
 
-			// Get capabilities from connector settings
-			capabilities := getCapabilitiesWithModels(conn, modelCapabilities)
+			capabilities := getCapabilitiesFromConn(conn)
 
 			// Apply capability filters
 			if len(filters) > 0 && !matchesFilters(capabilities, filters) {
@@ -99,31 +79,32 @@ func getConnectorType(id string) string {
 		return "unknown"
 	}
 
-	// Only return openai type (OpenAI-compatible format)
 	if conn.Is(connector.OPENAI) {
 		return "openai"
+	}
+
+	if conn.Is(connector.ANTHROPIC) {
+		return "anthropic"
 	}
 
 	return "unknown"
 }
 
-// getCapabilitiesWithModels extracts capabilities from connector settings
-// Uses the unified capability getter from agent/llm package
-// Takes modelCapabilities as parameter to avoid repeated calls to getModelCapabilities()
-func getCapabilitiesWithModels(conn connector.Connector, modelCapabilities map[string]openai.Capabilities) map[string]interface{} {
+// getCapabilitiesFromConn extracts capabilities from connector settings
+func getCapabilitiesFromConn(conn connector.Connector) map[string]interface{} {
 	if conn == nil {
 		return nil
 	}
 
-	// Use unified capability getter with user-defined model capabilities
-	caps := agentllm.GetCapabilitiesFromConn(conn, modelCapabilities)
+	caps := agentllm.GetCapabilitiesFromConn(conn)
 	return agentllm.ToMap(caps)
 }
 
 // matchesFilters checks if capabilities match all requested filters
 // Filters are matched case-insensitively and support the following capability keys:
 // - vision: true or string value like "openai", "claude"
-// - audio: bool
+// - audio: bool (LLM supports audio input/understanding)
+// - stt: bool (Speech-to-Text / audio transcription model, e.g. Whisper)
 // - tool_calls: bool
 // - reasoning: bool
 // - streaming: bool

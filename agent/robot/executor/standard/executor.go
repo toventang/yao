@@ -6,11 +6,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yaoapp/kun/log"
+	kunlog "github.com/yaoapp/kun/log"
+	agentcontext "github.com/yaoapp/yao/agent/context"
+	robotevents "github.com/yaoapp/yao/agent/robot/events"
 	"github.com/yaoapp/yao/agent/robot/executor/types"
 	"github.com/yaoapp/yao/agent/robot/store"
 	robottypes "github.com/yaoapp/yao/agent/robot/types"
 	"github.com/yaoapp/yao/agent/robot/utils"
+	"github.com/yaoapp/yao/event"
 )
 
 // Executor implements the standard executor with real Agent calls
@@ -84,6 +87,27 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 		Status:      robottypes.ExecPending,
 		Phase:       robottypes.AllPhases[startPhaseIndex],
 		Input:       input,
+		ChatID:      fmt.Sprintf("robot_%s_%s", robot.MemberID, execID),
+	}
+
+	// Load pre-existing Goals/Tasks from store when resuming a confirmed execution.
+	// RunGoals and RunTasks have skip logic when these are already populated.
+	if execID != "" && !e.config.SkipPersistence && e.store != nil {
+		if existing, err := e.store.Get(ctx.Context, execID); err == nil && existing != nil {
+			exec.Goals = existing.Goals
+			exec.Tasks = existing.Tasks
+			if existing.Input != nil {
+				exec.Input = existing.Input
+			}
+		}
+	}
+
+	// If goals are pre-confirmed (passed via Input.Data["goals"]), inject them directly.
+	// RunGoals will skip LLM call when exec.Goals is already populated (§18.2).
+	if exec.Goals == nil && input != nil && input.Data != nil {
+		if goalsStr, ok := input.Data["goals"].(string); ok && goalsStr != "" {
+			exec.Goals = &robottypes.Goals{Content: goalsStr}
+		}
 	}
 
 	// Initialize UI display fields (with i18n support)
@@ -98,29 +122,48 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 		record := store.FromExecution(exec)
 		if err := e.store.Save(ctx.Context, record); err != nil {
 			// Log warning but don't fail execution
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"member_id":    exec.MemberID,
 				"error":        err,
 			}).Warn("Failed to persist execution record: %v", err)
 		}
+
+		// If goals were pre-injected, persist them and update the execution title
+		if exec.Goals != nil && exec.Goals.Content != "" {
+			if err := e.store.UpdatePhase(ctx.Context, exec.ID, robottypes.PhaseGoals, exec.Goals); err != nil {
+				kunlog.With(kunlog.F{
+					"execution_id": exec.ID,
+					"member_id":    exec.MemberID,
+					"error":        err,
+				}).Warn("Failed to persist pre-confirmed goals: %v", err)
+			}
+			if goalName := extractGoalName(exec.Goals); goalName != "" {
+				e.updateUIFields(ctx, exec, goalName, "")
+			}
+		}
+
 	}
 
 	// Acquire execution slot
 	if !robot.TryAcquireSlot(exec) {
-		log.With(log.F{
+		kunlog.With(kunlog.F{
 			"execution_id": exec.ID,
 			"member_id":    exec.MemberID,
 		}).Warn("Execution quota exceeded")
 		return nil, robottypes.ErrQuotaExceeded
 	}
-	// Defer: remove execution from robot's tracking and update robot status if no more executions
+	// Defer: remove execution from robot's tracking (unless suspended) and update robot status
 	defer func() {
+		// Suspended executions stay in tracking — they are still "alive"
+		if exec.Status == robottypes.ExecWaiting {
+			return
+		}
 		robot.RemoveExecution(exec.ID)
 		// Update robot status to idle if no more running executions
 		if robot.RunningCount() == 0 && !e.config.SkipPersistence && e.robotStore != nil {
 			if err := e.robotStore.UpdateStatus(ctx.Context, robot.MemberID, robottypes.RobotIdle); err != nil {
-				log.With(log.F{
+				kunlog.With(kunlog.F{
 					"member_id": robot.MemberID,
 					"error":     err,
 				}).Warn("Failed to update robot status to idle: %v", err)
@@ -143,7 +186,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 
 	// Update status to running
 	exec.Status = robottypes.ExecRunning
-	log.With(log.F{
+	kunlog.With(kunlog.F{
 		"execution_id": exec.ID,
 		"member_id":    exec.MemberID,
 		"trigger_type": string(exec.TriggerType),
@@ -152,7 +195,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	// Persist running status
 	if !e.config.SkipPersistence && e.store != nil {
 		if err := e.store.UpdateStatus(ctx.Context, exec.ID, robottypes.ExecRunning, ""); err != nil {
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"error":        err,
 			}).Warn("Failed to persist running status: %v", err)
@@ -162,7 +205,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	// Update robot status to working (when execution starts)
 	if !e.config.SkipPersistence && e.robotStore != nil {
 		if err := e.robotStore.UpdateStatus(ctx.Context, robot.MemberID, robottypes.RobotWorking); err != nil {
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"member_id": robot.MemberID,
 				"error":     err,
 			}).Warn("Failed to update robot status to working: %v", err)
@@ -173,7 +216,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	if dataStr, ok := data.(string); ok && dataStr == "simulate_failure" {
 		exec.Status = robottypes.ExecFailed
 		exec.Error = "simulated failure"
-		log.With(log.F{
+		kunlog.With(kunlog.F{
 			"execution_id": exec.ID,
 			"member_id":    exec.MemberID,
 		}).Warn("Simulated failure triggered")
@@ -187,10 +230,23 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	// Determine locale for UI messages
 	locale := getEffectiveLocale(robot, exec.Input)
 
-	// Execute phases
+	// Execute phases (PhaseHost is not part of the normal pipeline — it is only for Interact)
 	phases := robottypes.AllPhases[startPhaseIndex:]
 	for _, phase := range phases {
+		if phase == robottypes.PhaseHost {
+			continue
+		}
 		if err := e.runPhase(ctx, exec, phase, data, control); err != nil {
+			// Check if execution was suspended (needs human input)
+			if err == robottypes.ErrExecutionSuspended {
+				kunlog.With(kunlog.F{
+					"execution_id": exec.ID,
+					"member_id":    exec.MemberID,
+					"phase":        string(phase),
+				}).Info("Execution suspended during phase %s", phase)
+				return exec, robottypes.ErrExecutionSuspended
+			}
+
 			// Check if execution was cancelled
 			if err == robottypes.ErrExecutionCancelled {
 				exec.Status = robottypes.ExecCancelled
@@ -201,7 +257,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 				// Update UI field for cancellation with i18n
 				e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "cancelled"))
 
-				log.With(log.F{
+				kunlog.With(kunlog.F{
 					"execution_id": exec.ID,
 					"member_id":    exec.MemberID,
 					"phase":        string(phase),
@@ -219,13 +275,12 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 			exec.Error = err.Error()
 
 			// Update UI field for failure with i18n
-			// Use concise phase name, NOT the full error message (error is in exec.Error)
 			failedPrefix := getLocalizedMessage(locale, "failed_prefix")
 			phaseName := getLocalizedMessage(locale, "phase_"+string(phase))
 			failureMsg := failedPrefix + phaseName
 			e.updateUIFields(ctx, exec, "", failureMsg)
 
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"member_id":    exec.MemberID,
 				"phase":        string(phase),
@@ -248,7 +303,7 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "completed"))
 
 	duration := now.Sub(exec.StartTime)
-	log.With(log.F{
+	kunlog.With(kunlog.F{
 		"execution_id": exec.ID,
 		"member_id":    exec.MemberID,
 		"duration_ms":  duration.Milliseconds(),
@@ -257,12 +312,20 @@ func (e *Executor) ExecuteWithControl(ctx *robottypes.Context, robot *robottypes
 	// Persist completed status
 	if !e.config.SkipPersistence && e.store != nil {
 		if err := e.store.UpdateStatus(ctx.Context, exec.ID, robottypes.ExecCompleted, ""); err != nil {
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"error":        err,
 			}).Warn("Failed to persist completed status: %v", err)
 		}
 	}
+
+	event.Push(ctx.Context, robotevents.ExecCompleted, robotevents.ExecPayload{
+		ExecutionID: exec.ID,
+		MemberID:    exec.MemberID,
+		TeamID:      exec.TeamID,
+		Status:      string(robottypes.ExecCompleted),
+		ChatID:      exec.ChatID,
+	})
 
 	return exec, nil
 }
@@ -285,7 +348,7 @@ func (e *Executor) runPhase(ctx *robottypes.Context, exec *robottypes.Execution,
 
 	exec.Phase = phase
 
-	log.With(log.F{
+	kunlog.With(kunlog.F{
 		"execution_id": exec.ID,
 		"member_id":    exec.MemberID,
 		"phase":        string(phase),
@@ -294,7 +357,7 @@ func (e *Executor) runPhase(ctx *robottypes.Context, exec *robottypes.Execution,
 	// Persist phase change immediately (so frontend sees current phase)
 	if !e.config.SkipPersistence && e.store != nil {
 		if err := e.store.UpdatePhase(ctx.Context, exec.ID, phase, nil); err != nil {
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"phase":        string(phase),
 				"error":        err,
@@ -326,7 +389,15 @@ func (e *Executor) runPhase(ctx *robottypes.Context, exec *robottypes.Execution,
 	}
 
 	if err != nil {
-		log.With(log.F{
+		if err == robottypes.ErrExecutionSuspended {
+			kunlog.With(kunlog.F{
+				"execution_id": exec.ID,
+				"member_id":    exec.MemberID,
+				"phase":        string(phase),
+			}).Info("Phase suspended: %s (waiting for human input)", phase)
+			return err
+		}
+		kunlog.With(kunlog.F{
 			"execution_id": exec.ID,
 			"member_id":    exec.MemberID,
 			"phase":        string(phase),
@@ -341,7 +412,7 @@ func (e *Executor) runPhase(ctx *robottypes.Context, exec *robottypes.Execution,
 		if phaseData != nil {
 			if err := e.store.UpdatePhase(ctx.Context, exec.ID, phase, phaseData); err != nil {
 				// Log warning but don't fail execution
-				log.With(log.F{
+				kunlog.With(kunlog.F{
 					"execution_id": exec.ID,
 					"phase":        string(phase),
 					"error":        err,
@@ -355,7 +426,7 @@ func (e *Executor) runPhase(ctx *robottypes.Context, exec *robottypes.Execution,
 	}
 
 	phaseDuration := time.Since(phaseStart).Milliseconds()
-	log.With(log.F{
+	kunlog.With(kunlog.F{
 		"execution_id": exec.ID,
 		"member_id":    exec.MemberID,
 		"phase":        string(phase),
@@ -542,7 +613,7 @@ func (e *Executor) updateUIFields(ctx *robottypes.Context, exec *robottypes.Exec
 	// Persist to database
 	if !e.config.SkipPersistence && e.store != nil {
 		if err := e.store.UpdateUIFields(ctx.Context, exec.ID, name, currentTaskName); err != nil {
-			log.With(log.F{
+			kunlog.With(kunlog.F{
 				"execution_id": exec.ID,
 				"error":        err,
 			}).Warn("Failed to update UI fields: %v", err)
@@ -567,7 +638,7 @@ func (e *Executor) updateTasksState(ctx *robottypes.Context, exec *robottypes.Ex
 	}
 
 	if err := e.store.UpdateTasks(ctx.Context, exec.ID, exec.Tasks, current); err != nil {
-		log.With(log.F{
+		kunlog.With(kunlog.F{
 			"execution_id": exec.ID,
 			"error":        err,
 		}).Warn("Failed to update tasks state: %v", err)
@@ -662,6 +733,239 @@ func stripMarkdownFormatting(s string) string {
 		s = s[:start] + s[start+1:linkEnd] + s[linkEnd+1:]
 	}
 	return strings.TrimSpace(s)
+}
+
+// Suspend transitions the execution to waiting status, persists state, and returns
+// ErrExecutionSuspended so the caller stops further phase processing.
+func (e *Executor) Suspend(ctx *robottypes.Context, exec *robottypes.Execution, taskIndex int, question string) error {
+	now := time.Now()
+	taskID := ""
+	if taskIndex >= 0 && taskIndex < len(exec.Tasks) {
+		taskID = exec.Tasks[taskIndex].ID
+		exec.Tasks[taskIndex].Status = robottypes.TaskWaitingInput
+	}
+
+	exec.Status = robottypes.ExecWaiting
+	exec.WaitingTaskID = taskID
+	exec.WaitingQuestion = question
+	exec.WaitingSince = &now
+	exec.ResumeContext = &robottypes.ResumeContext{
+		TaskIndex:       taskIndex,
+		PreviousResults: exec.Results,
+	}
+
+	if !e.config.SkipPersistence && e.store != nil {
+		// Persist task state (waiting_input on the specific task)
+		e.updateTasksState(ctx, exec)
+		// Persist P3 results so UI can show completed tasks while waiting (§16.26)
+		if err := e.store.UpdatePhase(ctx.Context, exec.ID, robottypes.PhaseRun, exec.Results); err != nil {
+			kunlog.With(kunlog.F{
+				"execution_id": exec.ID,
+				"error":        err,
+			}).Warn("Failed to persist partial results on suspend: %v", err)
+		}
+		// Persist suspend state atomically
+		if err := e.store.UpdateSuspendState(ctx.Context, exec.ID, taskID, question, exec.ResumeContext); err != nil {
+			kunlog.With(kunlog.F{
+				"execution_id": exec.ID,
+				"task_id":      taskID,
+				"error":        err,
+			}).Warn("Failed to persist suspend state: %v", err)
+		}
+	}
+
+	kunlog.With(kunlog.F{
+		"execution_id": exec.ID,
+		"member_id":    exec.MemberID,
+		"task_id":      taskID,
+		"question":     question,
+	}).Info("Execution suspended, waiting for human input")
+
+	// Fire event (best-effort, errors are ignored)
+	event.Push(ctx.Context, robotevents.ExecWaiting, robotevents.NeedInputPayload{
+		ExecutionID: exec.ID,
+		MemberID:    exec.MemberID,
+		TeamID:      exec.TeamID,
+		TaskID:      taskID,
+		Question:    question,
+		ChatID:      exec.ChatID,
+	})
+
+	return robottypes.ErrExecutionSuspended
+}
+
+// Resume resumes a suspended execution with human-provided input.
+// Loads execution from DB, restores state, injects reply, and continues from the suspended task.
+func (e *Executor) Resume(ctx *robottypes.Context, execID string, reply string) error {
+	if ctx == nil {
+		return fmt.Errorf("context is required for resume")
+	}
+	if execID == "" {
+		return fmt.Errorf("execID cannot be empty")
+	}
+	if e.store == nil {
+		return fmt.Errorf("store is required for resume")
+	}
+
+	// Load execution record from DB
+	record, err := e.store.Get(ctx.Context, execID)
+	if err != nil {
+		return fmt.Errorf("failed to load execution: %w", err)
+	}
+	if record == nil {
+		return fmt.Errorf("execution not found: %s", execID)
+	}
+	if record.Status != robottypes.ExecWaiting {
+		return fmt.Errorf("execution %s is not in waiting status (current: %s)", execID, record.Status)
+	}
+
+	// Restore runtime execution from record
+	exec := record.ToExecution()
+
+	// Load robot from store
+	if e.robotStore == nil {
+		return fmt.Errorf("robot store is required for resume")
+	}
+	robotRecord, err := e.robotStore.Get(ctx.Context, exec.MemberID)
+	if err != nil {
+		return fmt.Errorf("failed to load robot: %w", err)
+	}
+	if robotRecord == nil {
+		return fmt.Errorf("robot not found: %s", exec.MemberID)
+	}
+	robot, err := robotRecord.ToRobot()
+	if err != nil {
+		return fmt.Errorf("failed to convert robot record: %w", err)
+	}
+	exec.SetRobot(robot)
+
+	// Re-add execution to robot's in-memory tracking (skips quota check per §16.30)
+	robot.AddExecution(exec)
+
+	// Maintain executor concurrency count (§16.21)
+	e.currentCount.Add(1)
+	defer e.currentCount.Add(-1)
+
+	// Defer cleanup: mirror ExecuteWithControl's defer logic (§16.21)
+	defer func() {
+		if exec.Status == robottypes.ExecWaiting {
+			return // re-suspended, keep tracking
+		}
+		robot.RemoveExecution(exec.ID)
+		if robot.RunningCount() == 0 && !e.config.SkipPersistence && e.robotStore != nil {
+			if err := e.robotStore.UpdateStatus(ctx.Context, robot.MemberID, robottypes.RobotIdle); err != nil {
+				kunlog.With(kunlog.F{
+					"member_id": robot.MemberID,
+					"error":     err,
+				}).Warn("Failed to update robot status to idle after resume: %v", err)
+			}
+		}
+	}()
+
+	// Handle __skip__: mark waiting task as skipped and advance to next task
+	if reply == "__skip__" && exec.ResumeContext != nil {
+		ti := exec.ResumeContext.TaskIndex
+		if ti >= 0 && ti < len(exec.Tasks) {
+			task := &exec.Tasks[ti]
+			task.Status = robottypes.TaskSkipped
+			exec.ResumeContext.PreviousResults = append(exec.ResumeContext.PreviousResults, robottypes.TaskResult{
+				TaskID:   task.ID,
+				Success:  false,
+				Output:   "skipped",
+				Duration: 0,
+			})
+			exec.ResumeContext.TaskIndex = ti + 1
+			if !e.config.SkipPersistence && e.store != nil {
+				e.updateTasksState(ctx, exec)
+			}
+		}
+		reply = "" // Don't inject __skip__ as a message
+	}
+
+	// Inject reply into the waiting task's messages so the re-executed task gets context
+	if exec.ResumeContext != nil {
+		ti := exec.ResumeContext.TaskIndex
+		if ti >= 0 && ti < len(exec.Tasks) && reply != "" {
+			exec.Tasks[ti].Messages = append(exec.Tasks[ti].Messages, agentcontext.Message{
+				Role:    agentcontext.RoleUser,
+				Content: fmt.Sprintf("[Human reply] %s", reply),
+			})
+		}
+	}
+
+	// Clear waiting fields and transition back to running
+	exec.Status = robottypes.ExecRunning
+	exec.WaitingTaskID = ""
+	exec.WaitingQuestion = ""
+	exec.WaitingSince = nil
+
+	if !e.config.SkipPersistence && e.store != nil {
+		if err := e.store.UpdateResumeState(ctx.Context, exec.ID); err != nil {
+			kunlog.With(kunlog.F{
+				"execution_id": exec.ID,
+				"error":        err,
+			}).Warn("Failed to persist resume state: %v", err)
+		}
+	}
+
+	kunlog.With(kunlog.F{
+		"execution_id": exec.ID,
+		"member_id":    exec.MemberID,
+		"reply_len":    len(reply),
+	}).Info("Execution resumed")
+
+	event.Push(ctx.Context, robotevents.ExecResumed, robotevents.ExecPayload{
+		ExecutionID: exec.ID,
+		MemberID:    exec.MemberID,
+		TeamID:      exec.TeamID,
+		ChatID:      exec.ChatID,
+	})
+
+	// Continue P3 (Run) from where it was suspended
+	if err := e.RunExecution(ctx, exec, nil); err != nil {
+		if err == robottypes.ErrExecutionSuspended {
+			return err
+		}
+		exec.Status = robottypes.ExecFailed
+		exec.Error = err.Error()
+		if !e.config.SkipPersistence && e.store != nil {
+			_ = e.store.UpdateStatus(ctx.Context, exec.ID, robottypes.ExecFailed, err.Error())
+		}
+		return err
+	}
+
+	// Clear resume context after successful P3 completion
+	exec.ResumeContext = nil
+
+	// Continue with P4 (Delivery) and P5 (Learning)
+	locale := getEffectiveLocale(robot, exec.Input)
+	for _, phase := range []robottypes.Phase{robottypes.PhaseDelivery, robottypes.PhaseLearning} {
+		if err := e.runPhase(ctx, exec, phase, nil, nil); err != nil {
+			if err == robottypes.ErrExecutionSuspended {
+				return err
+			}
+			exec.Status = robottypes.ExecFailed
+			exec.Error = err.Error()
+			failedPrefix := getLocalizedMessage(locale, "failed_prefix")
+			phaseName := getLocalizedMessage(locale, "phase_"+string(phase))
+			e.updateUIFields(ctx, exec, "", failedPrefix+phaseName)
+			if !e.config.SkipPersistence && e.store != nil {
+				_ = e.store.UpdateStatus(ctx.Context, exec.ID, robottypes.ExecFailed, err.Error())
+			}
+			return fmt.Errorf("resume phase %s failed: %w", phase, err)
+		}
+	}
+
+	// Mark completed
+	exec.Status = robottypes.ExecCompleted
+	now := time.Now()
+	exec.EndTime = &now
+	e.updateUIFields(ctx, exec, "", getLocalizedMessage(locale, "completed"))
+	if !e.config.SkipPersistence && e.store != nil {
+		_ = e.store.UpdateStatus(ctx.Context, exec.ID, robottypes.ExecCompleted, "")
+	}
+
+	return nil
 }
 
 // Verify Executor implements types.Executor

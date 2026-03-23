@@ -10,18 +10,34 @@ import (
 	"github.com/yaoapp/yao/assert"
 )
 
+// ValidatorConfig configures validation behavior (decoupled from RunConfig)
+type ValidatorConfig struct {
+	// ValidationThreshold is the minimum score to pass validation (default: 0.6)
+	ValidationThreshold float64
+}
+
+// DefaultValidatorConfig returns the default validator configuration
+func DefaultValidatorConfig() *ValidatorConfig {
+	return &ValidatorConfig{
+		ValidationThreshold: 0.6,
+	}
+}
+
 // Validator handles task result validation using a two-layer approach:
 // 1. Rule-based validation: Uses yao/assert for deterministic rules (type, contains, regex, json_path)
 // 2. Semantic validation: Calls Validation Agent for semantic understanding (ExpectedOutput)
 type Validator struct {
 	ctx      *robottypes.Context
 	robot    *robottypes.Robot
-	config   *RunConfig
+	config   *ValidatorConfig
 	asserter *assert.Asserter
 }
 
 // NewValidator creates a new task validator
-func NewValidator(ctx *robottypes.Context, robot *robottypes.Robot, config *RunConfig) *Validator {
+func NewValidator(ctx *robottypes.Context, robot *robottypes.Robot, config *ValidatorConfig) *Validator {
+	if config == nil {
+		config = DefaultValidatorConfig()
+	}
 	v := &Validator{
 		ctx:      ctx,
 		robot:    robot,
@@ -415,6 +431,7 @@ func (v *Validator) validateSemantic(task *robottypes.Task, output interface{}) 
 
 	// Call validation agent
 	caller := NewAgentCaller()
+	caller.Connector = v.robot.LanguageModel
 	result, err := caller.CallWithMessages(v.ctx, validationAgentID, validationPrompt)
 	if err != nil {
 		return &robottypes.ValidationResult{
@@ -621,6 +638,7 @@ func (av *robotAgentValidator) Validate(agentID string, output, input, criteria 
 
 	// Call agent
 	caller := NewAgentCaller()
+	caller.Connector = av.v.robot.LanguageModel
 	callResult, err := caller.CallWithMessages(av.v.ctx, agentID, string(inputJSON))
 	if err != nil {
 		result.Passed = false
